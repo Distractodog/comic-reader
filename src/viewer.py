@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPainter, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
+
+CLICK_ZONE_FRACTION = 0.30  # left/right 30% = nav zones, middle 40% = dead zone
 
 
 class FitMode(Enum):
@@ -17,6 +19,9 @@ class FitMode(Enum):
 
 class ComicViewer(QGraphicsView):
     """Image viewer using QGraphicsView for smooth scrolling and zoom."""
+
+    page_forward = pyqtSignal()
+    page_back = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -42,6 +47,8 @@ class ComicViewer(QGraphicsView):
         self._fit_mode = FitMode.FIT_PAGE
         self._zoom_factor = 1.0
         self._has_image = False
+
+        self.setMouseTracking(True)
 
     def set_image(self, image_bytes: bytes):
         """Load a new page from raw image bytes."""
@@ -72,6 +79,28 @@ class ComicViewer(QGraphicsView):
         self._fit_mode = FitMode.ACTUAL_SIZE
         self._zoom_factor = 1.0
         self._apply_fit()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._has_image:
+            x = event.position().x()
+            w = self.viewport().width()
+            if x < w * CLICK_ZONE_FRACTION:
+                self.page_back.emit()
+                return
+            elif x > w * (1 - CLICK_ZONE_FRACTION):
+                self.page_forward.emit()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._has_image:
+            x = event.position().x()
+            w = self.viewport().width()
+            if x < w * CLICK_ZONE_FRACTION or x > w * (1 - CLICK_ZONE_FRACTION):
+                self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+            else:
+                self.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        super().mouseMoveEvent(event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

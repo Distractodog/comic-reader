@@ -11,10 +11,13 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QProgressDialog,
     QStackedWidget,
     QStatusBar,
     QToolBar,
+    QVBoxLayout,
+    QWidget,
 )
 
 from archive_handler import ComicReader, open_comic
@@ -54,9 +57,28 @@ class MainWindow(QMainWindow):
         self.viewer = ComicViewer()
         self._stack.addWidget(self._bookshelf)  # index 0
         self._stack.addWidget(self.viewer)       # index 1
-        self.setCentralWidget(self._stack)
+
+        self._reader_progress = QProgressBar()
+        self._reader_progress.setRange(0, 100)
+        self._reader_progress.setTextVisible(False)
+        self._reader_progress.setFixedHeight(3)
+        self._reader_progress.setStyleSheet(
+            "QProgressBar { background-color: #2d2d2d; border: none; }"
+            "QProgressBar::chunk { background-color: #4a9eff; }"
+        )
+        self._reader_progress.setVisible(False)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._stack)
+        layout.addWidget(self._reader_progress)
+        self.setCentralWidget(container)
 
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
+        self.viewer.page_forward.connect(self.next_page)
+        self.viewer.page_back.connect(self.prev_page)
 
         self._build_menus()
         self._build_toolbar()
@@ -184,6 +206,7 @@ class MainWindow(QMainWindow):
         self.load_file(path)
 
     def _back_to_library(self):
+        self._reader_progress.setVisible(False)
         self._bookshelf.refresh()
         self._stack.setCurrentIndex(0)
         self.setWindowTitle("Comic Reader")
@@ -237,6 +260,7 @@ class MainWindow(QMainWindow):
             self._current_comic_id = None
             self._current_page = 0
 
+        self._reader_progress.setVisible(True)
         self._stack.setCurrentIndex(1)
         self._show_current_page()
 
@@ -246,11 +270,14 @@ class MainWindow(QMainWindow):
         if not self._reader:
             return
         try:
+            page_count = self._reader.page_count()
             data = self._reader.get_page_bytes(self._current_page)
             self.viewer.set_image(data)
-            self._page_label.setText(
-                f"Page {self._current_page + 1} / {self._reader.page_count()}"
-            )
+            self._page_label.setText(f"Page {self._current_page + 1} / {page_count}")
+            if page_count > 0:
+                self._reader_progress.setValue(
+                    int((self._current_page + 1) / page_count * 100)
+                )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not load page:\n{e}")
 
