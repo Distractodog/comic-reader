@@ -75,18 +75,18 @@ comic-reader/
     ```
 - **Windows build:** push to `main` → GitHub Actions runs → `.exe` appears as workflow artifact. Tag `v1.0.0` etc. to publish a Release.
 
-## Current status (as of 2026-05-21)
+## Current status (as of 2026-05-22)
 
-- Repo pushed to GitHub: `github.com/Distractodog/comic-reader` (commit `6afd2fb`)
-- Phase 1 items done: 1 (SQLite library DB), 2 (folder scanner), 3 (cover thumbnails), 4 (bookshelf grid)
-- Phase 1 items remaining: 5–10 (reading progress tracking, badges, ComicInfo.xml parsing, search, sort)
+- Latest commit: `93eeee7`
+- Phase 1 items done: 1 (SQLite library DB), 2 (folder scanner), 3 (cover thumbnails), 4 (bookshelf grid), 5 (reading progress tracking)
+- Phase 1 items remaining: 6–10 (read/unread badges, ComicInfo.xml parsing, search, sort)
+- Bonus features added (pulled from Phase 3): reader progress bar, click-zone page navigation
 - App launches and runs locally on Mac with the `DYLD_LIBRARY_PATH` workaround
 
 ## Known issues
 
 - **macOS file dialog greys out comic files.** macOS Tahoe requires UTI registration for `.cbz`, `.cbr`, etc. in the file picker. Drag-and-drop and clicking tiles in the bookshelf both work as workarounds.
 - **CBR on Windows:** `rarfile` needs `unrar.exe`. Not yet bundled in the PyInstaller build.
-- **No reading progress tracking yet.** `library.update_progress()` exists but is not yet called from the reader (Phase 1 item 6).
 
 ## Feature roadmap (5 phases, 43 items)
 
