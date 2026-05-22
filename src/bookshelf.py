@@ -134,9 +134,9 @@ class ComicTile(_Tile):
         self._draw_title(painter, title)
 
     def _draw_progress(self, painter: QPainter) -> None:
-        if self._comic.read_status != "in_progress" or self._comic.page_count <= 0:
+        if self._comic.read_status == "unread" or self._comic.page_count <= 0:
             return
-        ratio = min(1.0, self._comic.current_page / self._comic.page_count)
+        ratio = 1.0 if self._comic.read_status == "read" else min(1.0, self._comic.current_page / self._comic.page_count)
         y = COVER_H - PROGRESS_H
         painter.fillRect(0, y, TILE_W, PROGRESS_H, _PROGRESS_TRACK)
         painter.fillRect(0, y, int(TILE_W * ratio), PROGRESS_H, _PROGRESS_FILL)

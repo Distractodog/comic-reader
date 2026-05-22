@@ -11,7 +11,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QProgressDialog,
     QStackedWidget,
     QStatusBar,
@@ -24,7 +23,7 @@ from archive_handler import ComicReader, open_comic
 from bookshelf import BookshelfView
 from library import Library
 from library_scanner import LibraryScanner
-from viewer import ComicViewer, FitMode
+from viewer import ComicViewer, FitMode, SeekBar
 
 SUPPORTED_FILTERS = [
     "Comic files (*.cbz *.cbr *.cb7 *.cbt *.pdf *.zip *.rar *.7z *.tar)",
@@ -58,27 +57,21 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self._bookshelf)  # index 0
         self._stack.addWidget(self.viewer)       # index 1
 
-        self._reader_progress = QProgressBar()
-        self._reader_progress.setRange(0, 100)
-        self._reader_progress.setTextVisible(False)
-        self._reader_progress.setFixedHeight(3)
-        self._reader_progress.setStyleSheet(
-            "QProgressBar { background-color: #2d2d2d; border: none; }"
-            "QProgressBar::chunk { background-color: #4a9eff; }"
-        )
-        self._reader_progress.setVisible(False)
+        self._seek_bar = SeekBar()
+        self._seek_bar.setVisible(False)
 
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._stack)
-        layout.addWidget(self._reader_progress)
+        layout.addWidget(self._seek_bar)
         self.setCentralWidget(container)
 
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
+        self._seek_bar.seeked.connect(self.seek_to_page)
 
         self._build_menus()
         self._build_toolbar()
@@ -206,7 +199,7 @@ class MainWindow(QMainWindow):
         self.load_file(path)
 
     def _back_to_library(self):
-        self._reader_progress.setVisible(False)
+        self._seek_bar.setVisible(False)
         self._bookshelf.refresh()
         self._stack.setCurrentIndex(0)
         self.setWindowTitle("Comic Reader")
@@ -260,7 +253,8 @@ class MainWindow(QMainWindow):
             self._current_comic_id = None
             self._current_page = 0
 
-        self._reader_progress.setVisible(True)
+        self._seek_bar.set_page_count(self._reader.page_count())
+        self._seek_bar.setVisible(True)
         self._stack.setCurrentIndex(1)
         self._show_current_page()
 
@@ -275,9 +269,7 @@ class MainWindow(QMainWindow):
             self.viewer.set_image(data)
             self._page_label.setText(f"Page {self._current_page + 1} / {page_count}")
             if page_count > 0:
-                self._reader_progress.setValue(
-                    int((self._current_page + 1) / page_count * 100)
-                )
+                self._seek_bar.set_progress((self._current_page + 1) / page_count)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not load page:\n{e}")
 
@@ -302,6 +294,12 @@ class MainWindow(QMainWindow):
     def last_page(self):
         if self._reader:
             self._current_page = self._reader.page_count() - 1
+            self._show_current_page()
+            self._save_progress()
+
+    def seek_to_page(self, page: int):
+        if self._reader:
+            self._current_page = max(0, min(page, self._reader.page_count() - 1))
             self._show_current_page()
             self._save_progress()
 
