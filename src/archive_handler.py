@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import os
 import tarfile
+import tempfile
 import zipfile
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -85,19 +86,17 @@ class CBRReader(_ArchiveReader):
 class CB7Reader(_ArchiveReader):
     def __init__(self, file_path: str):
         super().__init__(file_path)
-        self._sz = py7zr.SevenZipFile(file_path, mode="r")
-        all_names = self._sz.getnames()
-        self.pages = self._filter_and_sort(all_names)
+        self._tmpdir = tempfile.TemporaryDirectory()
+        with py7zr.SevenZipFile(file_path, mode="r") as sz:
+            all_names = sz.getnames()
+            self.pages = self._filter_and_sort(all_names)
+            sz.extractall(path=self._tmpdir.name)
 
     def get_page_bytes(self, index: int) -> bytes:
-        target = self.pages[index]
-        # py7zr requires resetting for repeat reads
-        self._sz.reset()
-        result = self._sz.read([target])
-        return result[target].read()
+        return (Path(self._tmpdir.name) / self.pages[index]).read_bytes()
 
     def close(self):
-        self._sz.close()
+        self._tmpdir.cleanup()
 
 
 class CBTReader(_ArchiveReader):

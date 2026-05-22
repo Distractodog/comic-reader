@@ -9,6 +9,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from archive_handler import open_comic
 from library import Library
+from thumbnails import generate_thumbnail, thumbnail_path_for
 
 SCANNABLE_EXTENSIONS = {
     ".cbz", ".cbr", ".cb7", ".cbt", ".pdf",
@@ -58,6 +59,12 @@ class LibraryScanner(QObject):
 
             if self._library.comic_exists(str(path)):
                 result.skipped += 1
+                # Backfill thumbnail if it was missing from a previous scan
+                existing = self._library.get_comic(str(path))
+                if existing and existing.cover_path is None:
+                    thumb_path = thumbnail_path_for(existing.id)
+                    if generate_thumbnail(str(path), thumb_path):
+                        self._library.set_cover_path(existing.id, str(thumb_path))
                 continue
 
             try:
@@ -72,6 +79,10 @@ class LibraryScanner(QObject):
                 )
                 result.added += 1
                 self.comic_added.emit(comic_id)
+
+                thumb_path = thumbnail_path_for(comic_id)
+                if generate_thumbnail(str(path), thumb_path):
+                    self._library.set_cover_path(comic_id, str(thumb_path))
             except Exception as e:
                 result.errors.append((str(path), str(e)))
 

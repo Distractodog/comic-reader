@@ -10,6 +10,14 @@ from pathlib import Path
 
 
 @dataclass
+class Folder:
+    path: str
+    name: str
+    comic_count: int
+    cover_path: str | None
+
+
+@dataclass
 class Comic:
     id: int
     file_path: str
@@ -219,6 +227,12 @@ class Library:
         return row is not None
 
     def remove_comic(self, comic_id: int) -> None:
+        comic = self.get_comic_by_id(comic_id)
+        if comic and comic.cover_path:
+            try:
+                Path(comic.cover_path).unlink(missing_ok=True)
+            except OSError:
+                pass
         with self.transaction() as cur:
             cur.execute("DELETE FROM comics WHERE id = ?", (comic_id,))
 
@@ -279,6 +293,38 @@ class Library:
                 "UPDATE comics SET content_hash = ? WHERE id = ?",
                 (content_hash, comic_id),
             )
+
+    def get_folders(self) -> list[Folder]:
+        """Return one Folder per unique parent directory, sorted alphabetically."""
+        rows = self._conn.execute(
+            "SELECT file_path, cover_path FROM comics ORDER BY file_path"
+        ).fetchall()
+        seen: dict[str, Folder] = {}
+        for row in rows:
+            parent = str(Path(row["file_path"]).parent)
+            if parent not in seen:
+                seen[parent] = Folder(
+                    path=parent,
+                    name=Path(parent).name,
+                    comic_count=0,
+                    cover_path=row["cover_path"] or None,
+                )
+            seen[parent].comic_count += 1
+            if seen[parent].cover_path is None and row["cover_path"]:
+                seen[parent].cover_path = row["cover_path"]
+        return sorted(seen.values(), key=lambda f: f.name.lower())
+
+    def get_comics_in_folder(self, folder_path: str) -> list[Comic]:
+        """Return all comics whose file lives directly in folder_path, sorted by title."""
+        rows = self._conn.execute("SELECT * FROM comics").fetchall()
+        comics = [
+            _row_to_comic(r) for r in rows
+            if str(Path(r["file_path"]).parent) == folder_path
+        ]
+        return sorted(
+            comics,
+            key=lambda c: (c.title or Path(c.file_path).name).lower(),
+        )
 
 
 if __name__ == "__main__":

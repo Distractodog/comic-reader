@@ -12,11 +12,13 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QStackedWidget,
     QStatusBar,
     QToolBar,
 )
 
 from archive_handler import ComicReader, open_comic
+from bookshelf import BookshelfView
 from library import Library
 from library_scanner import LibraryScanner
 from viewer import ComicViewer, FitMode
@@ -36,7 +38,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Comic Reader")
-        self.resize(1000, 1200)
+        self.resize(1100, 1000)
 
         self._reader: ComicReader | None = None
         self._current_page: int = 0
@@ -46,8 +48,14 @@ class MainWindow(QMainWindow):
         self._scanner: LibraryScanner | None = None
         self._scan_progress: QProgressDialog | None = None
 
+        self._stack = QStackedWidget()
+        self._bookshelf = BookshelfView(self._library)
         self.viewer = ComicViewer()
-        self.setCentralWidget(self.viewer)
+        self._stack.addWidget(self._bookshelf)  # index 0
+        self._stack.addWidget(self.viewer)       # index 1
+        self.setCentralWidget(self._stack)
+
+        self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
 
         self._build_menus()
         self._build_toolbar()
@@ -143,11 +151,18 @@ class MainWindow(QMainWindow):
         self._add_folder_action.triggered.connect(self.add_folder_to_library)
         library_menu.addAction(self._add_folder_action)
 
+        back_action = QAction("← &Back to Library", self)
+        back_action.setShortcut("Escape")
+        back_action.triggered.connect(self._back_to_library)
+        library_menu.addAction(back_action)
+
     def _build_toolbar(self):
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
 
+        toolbar.addAction("⌂ Library", self._back_to_library)
+        toolbar.addSeparator()
         toolbar.addAction("Open", self.open_file_dialog)
         toolbar.addSeparator()
         toolbar.addAction("◀ Prev", self.prev_page)
@@ -161,6 +176,17 @@ class MainWindow(QMainWindow):
         sb = QStatusBar()
         sb.addPermanentWidget(self._page_label)
         self.setStatusBar(sb)
+
+    # ----- Library / reader navigation -----
+
+    def _open_comic_from_bookshelf(self, path: str):
+        self.load_file(path)
+
+    def _back_to_library(self):
+        self._bookshelf.refresh()
+        self._stack.setCurrentIndex(0)
+        self.setWindowTitle("Comic Reader")
+        self._page_label.setText("")
 
     # ----- File loading -----
 
@@ -197,6 +223,7 @@ class MainWindow(QMainWindow):
         self._settings.setValue("last_dir", str(Path(path).parent))
         self.setWindowTitle(f"Comic Reader — {Path(path).name}")
         self._current_page = 0
+        self._stack.setCurrentIndex(1)
         self._show_current_page()
 
     # ----- Page navigation -----
@@ -311,6 +338,7 @@ class MainWindow(QMainWindow):
         if self._scan_progress:
             self._scan_progress.close()
         self._cleanup_scan()
+        self._bookshelf.refresh()
 
         msg = QMessageBox(self)
         if result.cancelled:
