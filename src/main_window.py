@@ -42,6 +42,7 @@ class MainWindow(QMainWindow):
 
         self._reader: ComicReader | None = None
         self._current_page: int = 0
+        self._current_comic_id: int | None = None
         self._settings = QSettings("ComicReader", "ComicReader")
         self._library = Library()
         self._scan_thread: QThread | None = None
@@ -187,6 +188,7 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(0)
         self.setWindowTitle("Comic Reader")
         self._page_label.setText("")
+        self._current_comic_id = None
 
     # ----- File loading -----
 
@@ -222,7 +224,19 @@ class MainWindow(QMainWindow):
 
         self._settings.setValue("last_dir", str(Path(path).parent))
         self.setWindowTitle(f"Comic Reader — {Path(path).name}")
-        self._current_page = 0
+
+        # Resume to saved page if this comic is in the library.
+        comic = self._library.get_comic(path)
+        if comic is not None:
+            self._current_comic_id = comic.id
+            if 0 < comic.current_page < self._reader.page_count():
+                self._current_page = comic.current_page
+            else:
+                self._current_page = 0
+        else:
+            self._current_comic_id = None
+            self._current_page = 0
+
         self._stack.setCurrentIndex(1)
         self._show_current_page()
 
@@ -244,21 +258,29 @@ class MainWindow(QMainWindow):
         if self._reader and self._current_page < self._reader.page_count() - 1:
             self._current_page += 1
             self._show_current_page()
+            self._save_progress()
 
     def prev_page(self):
         if self._reader and self._current_page > 0:
             self._current_page -= 1
             self._show_current_page()
+            self._save_progress()
 
     def first_page(self):
         if self._reader:
             self._current_page = 0
             self._show_current_page()
+            self._save_progress()
 
     def last_page(self):
         if self._reader:
             self._current_page = self._reader.page_count() - 1
             self._show_current_page()
+            self._save_progress()
+
+    def _save_progress(self):
+        if self._current_comic_id is not None:
+            self._library.update_progress(self._current_comic_id, self._current_page)
 
     # ----- Window helpers -----
 
