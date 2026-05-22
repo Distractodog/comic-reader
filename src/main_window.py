@@ -4,29 +4,32 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QSettings
+from PyQt6.QtCore import Qt, QSettings, QThread
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QFileDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QStatusBar,
     QToolBar,
 )
 
 from archive_handler import ComicReader, open_comic
+from library import Library
+from library_scanner import LibraryScanner
 from viewer import ComicViewer, FitMode
 
-SUPPORTED_FILTER = (
-    "Comic files (*.cbz *.cbr *.cb7 *.cbt *.pdf *.zip *.rar *.7z *.tar);;"
-    "CBZ files (*.cbz *.zip);;"
-    "CBR files (*.cbr *.rar);;"
-    "CB7 files (*.cb7 *.7z);;"
-    "CBT files (*.cbt *.tar);;"
-    "PDF files (*.pdf);;"
-    "All files (*)"
-)
+SUPPORTED_FILTERS = [
+    "Comic files (*.cbz *.cbr *.cb7 *.cbt *.pdf *.zip *.rar *.7z *.tar)",
+    "CBZ files (*.cbz *.zip)",
+    "CBR files (*.cbr *.rar)",
+    "CB7 files (*.cb7 *.7z)",
+    "CBT files (*.cbt *.tar)",
+    "PDF files (*.pdf)",
+    "All files (*)",
+]
 
 
 class MainWindow(QMainWindow):
@@ -38,6 +41,10 @@ class MainWindow(QMainWindow):
         self._reader: ComicReader | None = None
         self._current_page: int = 0
         self._settings = QSettings("ComicReader", "ComicReader")
+        self._library = Library()
+        self._scan_thread: QThread | None = None
+        self._scanner: LibraryScanner | None = None
+        self._scan_progress: QProgressDialog | None = None
 
         self.viewer = ComicViewer()
         self.setCentralWidget(self.viewer)
@@ -129,6 +136,13 @@ class MainWindow(QMainWindow):
         last.triggered.connect(self.last_page)
         nav_menu.addAction(last)
 
+        library_menu = menubar.addMenu("&Library")
+
+        self._add_folder_action = QAction("&Add Folder to Library...", self)
+        self._add_folder_action.setShortcut("Ctrl+L")
+        self._add_folder_action.triggered.connect(self.add_folder_to_library)
+        library_menu.addAction(self._add_folder_action)
+
     def _build_toolbar(self):
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
@@ -152,11 +166,14 @@ class MainWindow(QMainWindow):
 
     def open_file_dialog(self):
         last_dir = self._settings.value("last_dir", str(Path.home()))
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Comic", last_dir, SUPPORTED_FILTER
-        )
-        if path:
-            self.load_file(path)
+        dialog = QFileDialog(self, "Open Comic", last_dir)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dialog.setNameFilters(SUPPORTED_FILTERS)
+        if dialog.exec():
+            files = dialog.selectedFiles()
+            if files:
+                self.load_file(files[0])
 
     def open_folder_dialog(self):
         last_dir = self._settings.value("last_dir", str(Path.home()))
@@ -241,7 +258,87 @@ class MainWindow(QMainWindow):
             self.load_file(urls[0].toLocalFile())
 
     def closeEvent(self, event):
+        if self._scanner:
+            self._scanner.cancel()
+        if self._scan_thread:
+            self._scan_thread.quit()
+            self._scan_thread.wait()
         self._settings.setValue("geometry", self.saveGeometry())
         if self._reader:
             self._reader.close()
+        self._library.close()
         super().closeEvent(event)
+
+    # ----- Library scanning -----
+
+    def add_folder_to_library(self):
+        last_dir = self._settings.value("last_library_dir", str(Path.home()))
+        folder = QFileDialog.getExistingDirectory(self, "Add Folder to Library", last_dir)
+        if not folder:
+            return
+
+        self._settings.setValue("last_library_dir", folder)
+        self._add_folder_action.setEnabled(False)
+
+        self._scan_thread = QThread(self)
+        self._scanner = LibraryScanner(self._library, Path(folder))
+        self._scanner.moveToThread(self._scan_thread)
+
+        self._scan_progress = QProgressDialog("Finding comic files…", "Cancel", 0, 0, self)
+        self._scan_progress.setWindowTitle("Scanning Library")
+        self._scan_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._scan_progress.setMinimumDuration(0)
+        self._scan_progress.setValue(0)
+
+        self._scan_thread.started.connect(self._scanner.run)
+        self._scanner.progress.connect(self._on_scan_progress)
+        self._scanner.finished.connect(self._on_scan_finished)
+        self._scan_progress.canceled.connect(self._scanner.cancel)
+
+        self._scan_thread.start()
+
+    def _on_scan_progress(self, current: int, total: int, filename: str):
+        if self._scan_progress is None:
+            return
+        if self._scan_progress.maximum() == 0 and total > 0:
+            self._scan_progress.setMaximum(total)
+        self._scan_progress.setValue(current)
+        self._scan_progress.setLabelText(
+            f"Processing {current + 1} of {total}:\n{filename}"
+        )
+
+    def _on_scan_finished(self, result):
+        if self._scan_progress:
+            self._scan_progress.close()
+        self._cleanup_scan()
+
+        msg = QMessageBox(self)
+        if result.cancelled:
+            msg.setWindowTitle("Scan Cancelled")
+            msg.setText(
+                f"Scan cancelled.\n\n"
+                f"Added:   {result.added}\n"
+                f"Skipped: {result.skipped} (already in library)"
+            )
+        else:
+            msg.setWindowTitle("Library Scan Complete")
+            msg.setText(
+                f"Library scan complete.\n\n"
+                f"Added:   {result.added}\n"
+                f"Skipped: {result.skipped} (already in library)\n"
+                f"Errors:  {len(result.errors)}"
+            )
+        if result.errors:
+            msg.setDetailedText(
+                "\n\n".join(f"{path}\n  {err}" for path, err in result.errors)
+            )
+        msg.exec()
+
+    def _cleanup_scan(self):
+        if self._scan_thread:
+            self._scan_thread.quit()
+            self._scan_thread.wait()
+            self._scan_thread = None
+        self._scanner = None
+        self._scan_progress = None
+        self._add_folder_action.setEnabled(True)
