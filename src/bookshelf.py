@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QRect, pyqtSignal
+from PyQt6.QtCore import Qt, QRect, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFontMetrics, QPainter, QPixmap
 from PyQt6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -147,12 +149,22 @@ class ComicTile(_Tile):
 
 class _HeaderBar(QWidget):
     back_clicked = pyqtSignal()
+    search_changed = pyqtSignal(str)
+    sort_changed = pyqtSignal(str, str)  # sort_by, order
+
+    _SORT_OPTIONS = [
+        ("Title A–Z",      "title",      "asc"),
+        ("Title Z–A",      "title",      "desc"),
+        ("Recently Added", "date_added", "desc"),
+        ("Last Read",      "last_read",  "desc"),
+    ]
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedHeight(46)
+        self.setFixedHeight(56)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(8)
 
         self._back_btn = QPushButton("← Library")
         self._back_btn.setFlat(True)
@@ -166,13 +178,56 @@ class _HeaderBar(QWidget):
         layout.addWidget(self._title)
         layout.addStretch()
 
+        self._sort_combo = QComboBox()
+        for label, _, _ in self._SORT_OPTIONS:
+            self._sort_combo.addItem(label)
+        self._sort_combo.setFixedWidth(150)
+        self._sort_combo.setStyleSheet(
+            "QComboBox { background: #2d2d2d; color: #e0e0e0; border: 1px solid #3d3d3d;"
+            " border-radius: 4px; padding: 4px 8px; font-size: 12px; }"
+            "QComboBox::drop-down { border: none; width: 20px; }"
+            "QComboBox QAbstractItemView { background: #2d2d2d; color: #e0e0e0;"
+            " selection-background-color: #3d3d3d; border: 1px solid #3d3d3d; }"
+        )
+        self._sort_combo.currentIndexChanged.connect(self._emit_sort)
+        self._sort_combo.hide()
+        layout.addWidget(self._sort_combo)
+
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Search title, series, author, folder…")
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.setFixedWidth(230)
+        self._search_input.setStyleSheet(
+            "QLineEdit { background: #2d2d2d; color: #e0e0e0; border: 1px solid #3d3d3d;"
+            " border-radius: 4px; padding: 4px 8px; font-size: 13px; }"
+            "QLineEdit:focus { border-color: #4a9eff; }"
+        )
+        self._search_input.textChanged.connect(self.search_changed)
+        layout.addWidget(self._search_input)
+
+    def _emit_sort(self, idx: int):
+        _, sort_by, order = self._SORT_OPTIONS[idx]
+        self.sort_changed.emit(sort_by, order)
+
     def set_folder_mode(self):
         self._back_btn.hide()
         self._title.setText("Library")
+        self._sort_combo.hide()
 
     def set_comic_mode(self, folder_name: str):
         self._back_btn.show()
         self._title.setText(folder_name)
+        self._sort_combo.show()
+
+    def set_search_mode(self):
+        self._back_btn.hide()
+        self._title.setText("Search Results")
+        self._sort_combo.show()
+
+    def clear_search(self) -> None:
+        self._search_input.blockSignals(True)
+        self._search_input.clear()
+        self._search_input.blockSignals(False)
 
 
 class BookshelfView(QWidget):
@@ -184,6 +239,12 @@ class BookshelfView(QWidget):
         self._current_folder: str | None = None
         self._last_n_cols = 0
 
+        self._sort_by = "title"
+        self._sort_order = "asc"
+        self._search_query = ""
+        self._in_search = False
+        self._pre_search_folder: str | None = None
+
         self.setStyleSheet("background-color: #1e1e1e;")
 
         root = QVBoxLayout(self)
@@ -191,8 +252,15 @@ class BookshelfView(QWidget):
         root.setSpacing(0)
 
         self._header = _HeaderBar()
-        self._header.back_clicked.connect(self._show_folders)
+        self._header.back_clicked.connect(self._on_back_clicked)
+        self._header.search_changed.connect(self._on_search_changed)
+        self._header.sort_changed.connect(self._on_sort_changed)
         root.addWidget(self._header)
+
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(200)
+        self._search_timer.timeout.connect(self._apply_search)
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
@@ -209,6 +277,48 @@ class BookshelfView(QWidget):
     def refresh(self):
         """Reload from library — call after scanning or returning from reader."""
         self._last_n_cols = 0
+        self._repopulate()
+
+    def _on_back_clicked(self):
+        self._search_timer.stop()
+        self._search_query = ""
+        self._in_search = False
+        self._pre_search_folder = None
+        self._header.clear_search()
+        self._show_folders()
+
+    def _on_search_changed(self, text: str):
+        query = text.strip()
+        if query and not self._in_search:
+            self._in_search = True
+            self._pre_search_folder = self._current_folder
+        self._search_query = query
+        self._search_timer.start()
+
+    def _apply_search(self):
+        if self._search_query:
+            self._header.set_search_mode()
+            self._repopulate()
+        else:
+            self._in_search = False
+            folder = self._pre_search_folder
+            self._pre_search_folder = None
+            if folder is not None:
+                self._show_comics(folder)
+            else:
+                self._show_folders()
+
+    def _open_folder_from_search(self, folder_path: str):
+        self._search_timer.stop()
+        self._search_query = ""
+        self._in_search = False
+        self._pre_search_folder = None
+        self._header.clear_search()
+        self._show_comics(folder_path)
+
+    def _on_sort_changed(self, sort_by: str, order: str):
+        self._sort_by = sort_by
+        self._sort_order = order
         self._repopulate()
 
     def _show_folders(self):
@@ -243,11 +353,19 @@ class BookshelfView(QWidget):
         layout.setContentsMargins(TILE_SPACING, TILE_SPACING, TILE_SPACING, TILE_SPACING)
         layout.setSpacing(0)
 
-        if self._current_folder is None:
+        if self._search_query:
+            folders, comics = self._library.search_library(
+                self._search_query, self._sort_by, self._sort_order
+            )
+            items = folders + comics
+            empty_msg = f'No results for "{self._search_query}"'
+        elif self._current_folder is None:
             items = self._library.get_folders()
             empty_msg = "No comics yet.\nUse Library → Add Folder to Library to get started."
         else:
-            items = self._library.get_comics_in_folder(self._current_folder)
+            items = self._library.get_comics_in_folder(
+                self._current_folder, sort_by=self._sort_by, order=self._sort_order
+            )
             empty_msg = "No comics found in this folder."
 
         if not items:
@@ -271,7 +389,10 @@ class BookshelfView(QWidget):
 
             if isinstance(item, Folder):
                 tile = FolderTile(item)
-                tile.opened.connect(self._show_comics)
+                if self._search_query:
+                    tile.opened.connect(self._open_folder_from_search)
+                else:
+                    tile.opened.connect(self._show_comics)
             else:
                 tile = ComicTile(item)
                 tile.opened.connect(self.comic_opened)

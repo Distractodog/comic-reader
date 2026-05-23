@@ -71,6 +71,18 @@ def _row_to_comic(row: sqlite3.Row) -> Comic:
     )
 
 
+def _sort_comics(comics: list, sort_by: str, order: str) -> list:
+    reverse = order.lower() == "desc"
+    if sort_by == "title":
+        return sorted(comics, key=lambda c: (c.title or Path(c.file_path).stem).lower(), reverse=reverse)
+    if sort_by == "date_added":
+        return sorted(comics, key=lambda c: c.date_added or "", reverse=reverse)
+    if sort_by == "last_read":
+        has = sorted([c for c in comics if c.last_read], key=lambda c: c.last_read, reverse=reverse)
+        return has + [c for c in comics if not c.last_read]
+    return sorted(comics, key=lambda c: (c.title or Path(c.file_path).stem).lower())
+
+
 def _derive_status(current_page: int, page_count: int) -> str:
     if page_count <= 0:
         return "unread"
@@ -314,17 +326,60 @@ class Library:
                 seen[parent].cover_path = row["cover_path"]
         return sorted(seen.values(), key=lambda f: f.name.lower())
 
-    def get_comics_in_folder(self, folder_path: str) -> list[Comic]:
-        """Return all comics whose file lives directly in folder_path, sorted by title."""
+    def get_comics_in_folder(
+        self, folder_path: str, *, sort_by: str = "title", order: str = "asc"
+    ) -> list[Comic]:
+        """Return all comics whose file lives directly in folder_path."""
+        if sort_by not in _VALID_SORT_COLUMNS:
+            sort_by = "title"
         rows = self._conn.execute("SELECT * FROM comics").fetchall()
         comics = [
             _row_to_comic(r) for r in rows
             if str(Path(r["file_path"]).parent) == folder_path
         ]
-        return sorted(
-            comics,
-            key=lambda c: (c.title or Path(c.file_path).name).lower(),
-        )
+        return _sort_comics(comics, sort_by, order)
+
+    def search_library(
+        self, query: str, sort_by: str = "title", order: str = "asc"
+    ) -> tuple[list[Folder], list[Comic]]:
+        """Search comics by title/series/author and folders by name.
+
+        Returns (matching_folders, matching_comics) where matching_comics includes
+        comics whose metadata matches plus all comics inside any matching folder.
+        """
+        if not query:
+            return [], []
+        if sort_by not in _VALID_SORT_COLUMNS:
+            sort_by = "title"
+        like = f"%{query}%"
+
+        all_folders = self.get_folders()
+        matching_folders = [f for f in all_folders if query.lower() in f.name.lower()]
+        matching_folder_paths = {f.path for f in matching_folders}
+
+        meta_rows = self._conn.execute(
+            """
+            SELECT * FROM comics
+            WHERE title LIKE ? COLLATE NOCASE
+               OR series LIKE ? COLLATE NOCASE
+               OR author LIKE ? COLLATE NOCASE
+            """,
+            (like, like, like),
+        ).fetchall()
+        meta_ids = {r["id"] for r in meta_rows}
+        meta_comics = [_row_to_comic(r) for r in meta_rows]
+
+        folder_comics: list[Comic] = []
+        if matching_folder_paths:
+            all_rows = self._conn.execute("SELECT * FROM comics").fetchall()
+            for r in all_rows:
+                if (
+                    str(Path(r["file_path"]).parent) in matching_folder_paths
+                    and r["id"] not in meta_ids
+                ):
+                    folder_comics.append(_row_to_comic(r))
+
+        return matching_folders, _sort_comics(meta_comics + folder_comics, sort_by, order)
 
 
 if __name__ == "__main__":

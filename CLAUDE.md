@@ -77,11 +77,20 @@ comic-reader/
 
 ## Current status (as of 2026-05-22)
 
-- Latest commit: `93eeee7`
-- Phase 1 items done: 1 (SQLite library DB), 2 (folder scanner), 3 (cover thumbnails), 4 (bookshelf grid), 5 (reading progress tracking)
-- Phase 1 items remaining: 6–10 (read/unread badges, ComicInfo.xml parsing, search, sort)
-- Bonus features added (pulled from Phase 3): reader progress bar, click-zone page navigation
+- Latest commit: `6342774`
+- Phase 1 items done: 1–9 (all items complete)
+  - 1: SQLite library DB
+  - 2: folder scanner
+  - 3: cover thumbnails
+  - 4: bookshelf grid
+  - 5: reading progress tracking
+  - 6: read/unread/in-progress badges
+  - 7: ComicInfo.xml metadata parsing (new `src/comicinfo.py`; backfills existing comics on rescan)
+  - 8: search bar (title, series, author, folder name; folder results include all folder contents)
+  - 9: sort dropdown (Title A–Z/Z–A, Recently Added, Last Read; in comic and search views)
+- Bonus features added (pulled from Phase 3): reader progress bar, click-zone page navigation, seek bar
 - App launches and runs locally on Mac with the `DYLD_LIBRARY_PATH` workaround
+- Phase 1 complete — mini-polish pass next, then Phase 2
 
 ## Known issues
 
@@ -91,6 +100,10 @@ comic-reader/
 ## Feature roadmap (5 phases, 43 items)
 
 See Obsidian note `2026-05-21 - Comic Reader GitHub push and feature roadmap` for the full roadmap.
+
+## Deferred decisions
+
+- **ComicInfo.xml `<Summary>` field:** Decided to skip storing `summary` during item 7 implementation. Would require a schema v3 migration (new `summary` column). No UI to display it yet, and item 9 search only covers title/series/author. Add when a comic detail/info panel is built (Phase 2 or later).
 
 ## Conventions
 

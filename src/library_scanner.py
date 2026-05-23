@@ -8,6 +8,7 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from archive_handler import open_comic
+from comicinfo import parse_comicinfo
 from library import Library
 from thumbnails import generate_thumbnail, thumbnail_path_for
 
@@ -59,23 +60,30 @@ class LibraryScanner(QObject):
 
             if self._library.comic_exists(str(path)):
                 result.skipped += 1
-                # Backfill thumbnail if it was missing from a previous scan
                 existing = self._library.get_comic(str(path))
-                if existing and existing.cover_path is None:
-                    thumb_path = thumbnail_path_for(existing.id)
-                    if generate_thumbnail(str(path), thumb_path):
-                        self._library.set_cover_path(existing.id, str(thumb_path))
+                if existing:
+                    if existing.cover_path is None:
+                        thumb_path = thumbnail_path_for(existing.id)
+                        if generate_thumbnail(str(path), thumb_path):
+                            self._library.set_cover_path(existing.id, str(thumb_path))
+                    # Backfill ComicInfo metadata if not yet populated
+                    if existing.title is None and existing.author is None:
+                        meta = parse_comicinfo(str(path))
+                        if meta:
+                            self._library.update_metadata(existing.id, **meta)
                 continue
 
             try:
                 with open_comic(str(path)) as reader:
                     page_count = reader.page_count()
                 file_size = path.stat().st_size
+                meta = parse_comicinfo(str(path)) or {}
                 comic_id = self._library.add_comic(
                     str(path),
                     page_count=page_count,
                     file_size=file_size,
                     source_folder=str(self._folder),
+                    **meta,
                 )
                 result.added += 1
                 self.comic_added.emit(comic_id)
