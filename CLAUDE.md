@@ -77,7 +77,7 @@ comic-reader/
 
 ## Current status (as of 2026-05-22)
 
-- Latest commit: `6342774`
+- Latest commit: `1eab25d`
 - Phase 1 items done: 1–9 (all items complete)
   - 1: SQLite library DB
   - 2: folder scanner
