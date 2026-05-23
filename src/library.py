@@ -363,8 +363,9 @@ class Library:
             WHERE title LIKE ? COLLATE NOCASE
                OR series LIKE ? COLLATE NOCASE
                OR author LIKE ? COLLATE NOCASE
+               OR file_path LIKE ? COLLATE NOCASE
             """,
-            (like, like, like),
+            (like, like, like, like),
         ).fetchall()
         meta_ids = {r["id"] for r in meta_rows}
         meta_comics = [_row_to_comic(r) for r in meta_rows]
