@@ -4,21 +4,22 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QEasingCurve, QEvent, QPropertyAnimation, QRect, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPixmap
+from PyQt6.QtCore import Qt, QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
     QComboBox,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
-from library import Comic, Folder, Library
+from library import Comic, Folder, Library, Shelf
 
 TILE_W = 200
 COVER_H = 300
@@ -145,10 +146,17 @@ class FolderTile(_Tile):
 
 
 class ComicTile(_Tile):
+    shelf_action_requested = pyqtSignal(int, int, int)  # comic_id, global_x, global_y
+
     def __init__(self, comic: Comic, parent=None):
         super().__init__(parent)
         self._comic = comic
         self._load_pixmap(comic.cover_path)
+
+    def contextMenuEvent(self, event):
+        self.shelf_action_requested.emit(
+            self._comic.id, event.globalPos().x(), event.globalPos().y()
+        )
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -292,6 +300,12 @@ class _HeaderBar(QWidget):
         if not self._search_input.isVisible():
             self._sort_combo.show()
 
+    def set_shelf_mode(self, shelf_name: str):
+        self._in_comic_view = True
+        self._title.setText(shelf_name)
+        if not self._search_input.isVisible():
+            self._sort_combo.show()
+
     def set_search_mode(self):
         self._title.setText("Search Results")
         if not self._search_input.isVisible():
@@ -322,11 +336,14 @@ class _HeaderBar(QWidget):
 class BookshelfView(QWidget):
     comic_opened = pyqtSignal(str)
     folder_entered = pyqtSignal(bool)
+    shelf_changed = pyqtSignal()   # emitted when shelf membership changes
 
     def __init__(self, library: Library, parent=None):
         super().__init__(parent)
         self._library = library
         self._current_folder: str | None = None
+        self._current_shelf_id: int | None = None
+        self._current_shelf_name: str = ""
         self._last_n_cols = 0
 
         self._sort_by = "title"
@@ -334,6 +351,8 @@ class BookshelfView(QWidget):
         self._search_query = ""
         self._in_search = False
         self._pre_search_folder: str | None = None
+        self._pre_search_shelf_id: int | None = None
+        self._pre_search_shelf_name: str = ""
 
         self.setStyleSheet("background-color: #f0e8e8;")
 
@@ -398,6 +417,8 @@ class BookshelfView(QWidget):
         if query and not self._in_search:
             self._in_search = True
             self._pre_search_folder = self._current_folder
+            self._pre_search_shelf_id = self._current_shelf_id
+            self._pre_search_shelf_name = self._current_shelf_name
         self._search_query = query
         self._search_timer.start()
 
@@ -408,9 +429,15 @@ class BookshelfView(QWidget):
         else:
             self._in_search = False
             folder = self._pre_search_folder
+            shelf_id = self._pre_search_shelf_id
+            shelf_name = self._pre_search_shelf_name
             self._pre_search_folder = None
+            self._pre_search_shelf_id = None
+            self._pre_search_shelf_name = ""
             if folder is not None:
                 self._show_comics(folder)
+            elif shelf_id is not None:
+                self.show_shelf(shelf_id, shelf_name)
             else:
                 self._show_folders()
 
@@ -463,6 +490,8 @@ class BookshelfView(QWidget):
     def _show_folders(self):
         def do():
             self._current_folder = None
+            self._current_shelf_id = None
+            self._current_shelf_name = ""
             self._header.set_folder_mode()
             self._last_n_cols = 0
             self._repopulate()
@@ -472,10 +501,23 @@ class BookshelfView(QWidget):
     def _show_comics(self, folder_path: str):
         def do():
             self._current_folder = folder_path
+            self._current_shelf_id = None
+            self._current_shelf_name = ""
             self._header.set_comic_mode(Path(folder_path).name)
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(True)
+        self._nav_transition(do)
+
+    def show_shelf(self, shelf_id: int, shelf_name: str):
+        def do():
+            self._current_folder = None
+            self._current_shelf_id = shelf_id
+            self._current_shelf_name = shelf_name
+            self._header.set_shelf_mode(shelf_name)
+            self._last_n_cols = 0
+            self._repopulate()
+            self.folder_entered.emit(False)
         self._nav_transition(do)
 
     def _n_cols(self) -> int:
@@ -504,6 +546,11 @@ class BookshelfView(QWidget):
             )
             items = folders + comics
             empty_msg = f'No results for "{self._search_query}"'
+        elif self._current_shelf_id is not None:
+            items = self._library.get_comics_in_shelf(
+                self._current_shelf_id, sort_by=self._sort_by, order=self._sort_order
+            )
+            empty_msg = "This shelf is empty."
         elif self._current_folder is None:
             items = self._library.get_folders()
             empty_msg = "No comics yet.\nUse Library → Add Folder to Library to get started."
@@ -541,6 +588,7 @@ class BookshelfView(QWidget):
             else:
                 tile = ComicTile(item)
                 tile.opened.connect(self.comic_opened)
+                tile.shelf_action_requested.connect(self._on_comic_context_menu)
 
             row_layout.addWidget(tile)
 
@@ -548,6 +596,53 @@ class BookshelfView(QWidget):
             row_layout.addStretch()
 
         layout.addStretch()
+
+    def _on_comic_context_menu(self, comic_id: int, gx: int, gy: int):
+        shelves = self._library.get_shelves()
+        manual_shelves = [s for s in shelves if s.kind == "manual"]
+        if not manual_shelves and self._current_shelf_id is None:
+            return
+
+        comic_shelf_ids = {s.id for s in self._library.get_shelves_for_comic(comic_id)}
+
+        menu = QMenu(self)
+
+        if manual_shelves:
+            add_menu = menu.addMenu("Add to shelf")
+            for shelf in manual_shelves:
+                action = QAction(shelf.name, add_menu)
+                action.setCheckable(True)
+                action.setChecked(shelf.id in comic_shelf_ids)
+                sid = shelf.id
+                action.triggered.connect(
+                    lambda checked, cid=comic_id, s=sid: self._toggle_comic_in_shelf(cid, s, checked)
+                )
+                add_menu.addAction(action)
+
+        if self._current_shelf_id is not None:
+            shelf_obj = next((s for s in shelves if s.id == self._current_shelf_id), None)
+            if shelf_obj and shelf_obj.kind == "manual":
+                menu.addSeparator()
+                remove_action = menu.addAction("Remove from this shelf")
+                remove_action.triggered.connect(
+                    lambda: self._remove_comic_from_current_shelf(comic_id)
+                )
+
+        if menu.actions():
+            menu.exec(QPoint(gx, gy))
+
+    def _toggle_comic_in_shelf(self, comic_id: int, shelf_id: int, add: bool):
+        if add:
+            self._library.add_comic_to_shelf(comic_id, shelf_id)
+        else:
+            self._library.remove_comic_from_shelf(comic_id, shelf_id)
+        self.shelf_changed.emit()
+
+    def _remove_comic_from_current_shelf(self, comic_id: int):
+        if self._current_shelf_id is not None:
+            self._library.remove_comic_from_shelf(comic_id, self._current_shelf_id)
+            self._repopulate()
+            self.shelf_changed.emit()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

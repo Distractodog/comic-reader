@@ -18,6 +18,15 @@ class Folder:
 
 
 @dataclass
+class Shelf:
+    id: int
+    name: str
+    kind: str        # 'manual' | 'smart'
+    smart_key: str | None
+    sort_order: int
+
+
+@dataclass
 class Comic:
     id: int
     file_path: str
@@ -122,7 +131,27 @@ CREATE INDEX IF NOT EXISTS idx_comics_date_added ON comics(date_added);
 
 _SCHEMA_V2_MIGRATION = "ALTER TABLE comics ADD COLUMN source_folder TEXT;"
 
-_CURRENT_VERSION = 2
+_SCHEMA_V3_MIGRATION = """
+CREATE TABLE IF NOT EXISTS shelves (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    kind        TEXT    NOT NULL DEFAULT 'manual'
+                CHECK(kind IN ('manual', 'smart')),
+    smart_key   TEXT,
+    cover_path  TEXT,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL
+);
+CREATE TABLE IF NOT EXISTS comic_shelves (
+    comic_id    INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+    shelf_id    INTEGER NOT NULL REFERENCES shelves(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (comic_id, shelf_id)
+);
+CREATE INDEX IF NOT EXISTS idx_comic_shelves_shelf ON comic_shelves(shelf_id);
+"""
+
+_CURRENT_VERSION = 3
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -150,6 +179,52 @@ class Library:
             self._conn.execute(_SCHEMA_V2_MIGRATION)
             self._conn.execute("PRAGMA user_version = 2")
             self._conn.commit()
+            version = 2
+        if version < 3:
+            self._conn.executescript(_SCHEMA_V3_MIGRATION)
+            self._seed_smart_shelves()
+            self._conn.execute("PRAGMA user_version = 3")
+            self._conn.commit()
+
+    def _seed_smart_shelves(self):
+        now = datetime.now(timezone.utc).isoformat()
+        for order, (name, key) in enumerate([
+            ("Recently Added",    "recently_added"),
+            ("Currently Reading", "currently_reading"),
+            ("Unread",            "unread"),
+            ("Finished",          "finished"),
+        ]):
+            self._conn.execute(
+                "INSERT OR IGNORE INTO shelves (name, kind, smart_key, sort_order, created_at)"
+                " VALUES (?, 'smart', ?, ?, ?)",
+                (name, key, order, now),
+            )
+        self._conn.commit()
+
+    def _get_smart_shelf_comics(
+        self, smart_key: str, sort_by: str, order: str
+    ) -> list[Comic]:
+        from datetime import timedelta
+        if smart_key == "recently_added":
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+            rows = self._conn.execute(
+                "SELECT * FROM comics WHERE date_added >= ?", (cutoff,)
+            ).fetchall()
+        elif smart_key == "currently_reading":
+            rows = self._conn.execute(
+                "SELECT * FROM comics WHERE read_status = 'in_progress'"
+            ).fetchall()
+        elif smart_key == "unread":
+            rows = self._conn.execute(
+                "SELECT * FROM comics WHERE read_status = 'unread'"
+            ).fetchall()
+        elif smart_key == "finished":
+            rows = self._conn.execute(
+                "SELECT * FROM comics WHERE read_status = 'read'"
+            ).fetchall()
+        else:
+            return []
+        return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
 
     def close(self) -> None:
         self._conn.close()
@@ -171,7 +246,7 @@ class Library:
             self._conn.rollback()
             raise
 
-    # ----- CRUD -----
+    # ----- Comics CRUD -----
 
     def add_comic(
         self,
@@ -248,7 +323,7 @@ class Library:
         with self.transaction() as cur:
             cur.execute("DELETE FROM comics WHERE id = ?", (comic_id,))
 
-    # ----- Updates -----
+    # ----- Comic updates -----
 
     def update_progress(self, comic_id: int, current_page: int) -> None:
         """Update current page, auto-derive read_status, and stamp last_read."""
@@ -305,6 +380,8 @@ class Library:
                 "UPDATE comics SET content_hash = ? WHERE id = ?",
                 (content_hash, comic_id),
             )
+
+    # ----- Folder queries -----
 
     def get_folders(self) -> list[Folder]:
         """Return one Folder per unique parent directory, sorted alphabetically."""
@@ -382,6 +459,97 @@ class Library:
 
         return matching_folders, _sort_comics(meta_comics + folder_comics, sort_by, order)
 
+    # ----- Shelf CRUD -----
+
+    def create_shelf(self, name: str) -> int:
+        """Create a manual shelf and return its id."""
+        now = datetime.now(timezone.utc).isoformat()
+        new_id = None
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO shelves (name, kind, sort_order, created_at) VALUES (?, 'manual', 999, ?)",
+                (name.strip(), now),
+            )
+            new_id = cur.lastrowid
+        return new_id
+
+    def rename_shelf(self, shelf_id: int, name: str) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE shelves SET name = ? WHERE id = ? AND kind = 'manual'",
+                (name.strip(), shelf_id),
+            )
+
+    def delete_shelf(self, shelf_id: int) -> None:
+        with self.transaction() as cur:
+            cur.execute("DELETE FROM shelves WHERE id = ? AND kind = 'manual'", (shelf_id,))
+
+    def get_shelves(self) -> list[Shelf]:
+        """Return all shelves: smart shelves first (by sort_order), then manual alphabetically."""
+        rows = self._conn.execute(
+            "SELECT * FROM shelves ORDER BY"
+            " CASE kind WHEN 'smart' THEN 0 ELSE 1 END,"
+            " sort_order, name COLLATE NOCASE"
+        ).fetchall()
+        return [
+            Shelf(
+                id=row["id"],
+                name=row["name"],
+                kind=row["kind"],
+                smart_key=row["smart_key"],
+                sort_order=row["sort_order"],
+            )
+            for row in rows
+        ]
+
+    def add_comic_to_shelf(self, comic_id: int, shelf_id: int) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO comic_shelves (comic_id, shelf_id) VALUES (?, ?)",
+                (comic_id, shelf_id),
+            )
+
+    def remove_comic_from_shelf(self, comic_id: int, shelf_id: int) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM comic_shelves WHERE comic_id = ? AND shelf_id = ?",
+                (comic_id, shelf_id),
+            )
+
+    def get_comics_in_shelf(
+        self, shelf_id: int, *, sort_by: str = "title", order: str = "asc"
+    ) -> list[Comic]:
+        shelf_row = self._conn.execute(
+            "SELECT * FROM shelves WHERE id = ?", (shelf_id,)
+        ).fetchone()
+        if shelf_row is None:
+            return []
+        if shelf_row["kind"] == "smart":
+            return self._get_smart_shelf_comics(shelf_row["smart_key"], sort_by, order)
+        if sort_by not in _VALID_SORT_COLUMNS:
+            sort_by = "title"
+        comic_rows = self._conn.execute(
+            "SELECT c.* FROM comics c"
+            " JOIN comic_shelves cs ON c.id = cs.comic_id"
+            " WHERE cs.shelf_id = ?",
+            (shelf_id,),
+        ).fetchall()
+        return _sort_comics([_row_to_comic(r) for r in comic_rows], sort_by, order)
+
+    def get_shelves_for_comic(self, comic_id: int) -> list[Shelf]:
+        """Return manual shelves this comic belongs to."""
+        rows = self._conn.execute(
+            "SELECT s.* FROM shelves s"
+            " JOIN comic_shelves cs ON s.id = cs.shelf_id"
+            " WHERE cs.comic_id = ? AND s.kind = 'manual'",
+            (comic_id,),
+        ).fetchall()
+        return [
+            Shelf(id=r["id"], name=r["name"], kind=r["kind"],
+                  smart_key=r["smart_key"], sort_order=r["sort_order"])
+            for r in rows
+        ]
+
 
 if __name__ == "__main__":
     # Smoke test — in-memory DB, no real comic files needed.
@@ -418,6 +586,29 @@ if __name__ == "__main__":
 
     lib.remove_comic(id2)
     assert len(lib.get_all_comics()) == 1
+
+    # Shelf tests
+    shelves = lib.get_shelves()
+    assert any(s.kind == "smart" and s.smart_key == "recently_added" for s in shelves)
+
+    shelf_id = lib.create_shelf("Favorites")
+    assert lib.get_shelves()[-1].name == "Favorites"
+
+    lib.add_comic_to_shelf(id1, shelf_id)
+    shelf_comics = lib.get_comics_in_shelf(shelf_id)
+    assert len(shelf_comics) == 1 and shelf_comics[0].id == id1
+
+    comic_shelves = lib.get_shelves_for_comic(id1)
+    assert any(s.id == shelf_id for s in comic_shelves)
+
+    lib.remove_comic_from_shelf(id1, shelf_id)
+    assert len(lib.get_comics_in_shelf(shelf_id)) == 0
+
+    lib.rename_shelf(shelf_id, "Classics")
+    assert lib.get_shelves()[-1].name == "Classics"
+
+    lib.delete_shelf(shelf_id)
+    assert all(s.kind == "smart" for s in lib.get_shelves())
 
     lib.close()
     print("library.py smoke test: OK")

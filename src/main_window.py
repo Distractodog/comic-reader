@@ -8,13 +8,17 @@ from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPropertyAni
 from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -69,10 +73,233 @@ class _ReaderBar(QWidget):
 
 from archive_handler import ComicReader, open_comic
 from bookshelf import BookshelfView
-from library import Library
+from library import Library, Shelf
 from library_scanner import LibraryScanner
 from viewer import ComicViewer, FitMode, SeekBar
 import themes
+
+
+class _Sidebar(QWidget):
+    """Left sidebar — action buttons + library/shelf navigation list."""
+
+    show_folders_clicked = pyqtSignal()
+    show_shelf_clicked = pyqtSignal(int, str)   # shelf_id, shelf_name
+    add_folder_clicked = pyqtSignal()
+    new_shelf_clicked = pyqtSignal()
+    rename_shelf_requested = pyqtSignal(int, str)  # shelf_id, current_name
+    delete_shelf_requested = pyqtSignal(int)        # shelf_id
+    back_to_root_clicked = pyqtSignal()
+
+    WIDTH = 180
+
+    def __init__(self, library: Library, parent=None):
+        super().__init__(parent)
+        self._library = library
+        self._active_id: int = -1   # -1 = Folders, int = shelf id
+        self._shelf_btns: list[tuple[int, QPushButton]] = []
+        self._folders_btn: QPushButton | None = None
+        self._theme: dict = themes.DARK
+
+        self.setFixedWidth(self.WIDTH)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Top action row
+        top_row = QWidget()
+        top_row.setFixedHeight(56)
+        top_layout = QHBoxLayout(top_row)
+        top_layout.setContentsMargins(4, 0, 4, 0)
+        top_layout.setSpacing(0)
+
+        self._btn_back = QPushButton("←")
+        self._btn_back.setFixedSize(44, 56)
+        self._btn_back.setFlat(True)
+        self._btn_back.setToolTip("Back to folder list")
+        self._btn_back.clicked.connect(self.back_to_root_clicked)
+        self._btn_back.hide()
+        top_layout.addWidget(self._btn_back)
+        top_layout.addStretch()
+
+        self._btn_add = QPushButton("+")
+        self._btn_add.setFixedSize(44, 56)
+        self._btn_add.setFlat(True)
+        self._btn_add.setToolTip("Add Folder to Library (Ctrl+L)")
+        self._btn_add.clicked.connect(self.add_folder_clicked)
+        top_layout.addWidget(self._btn_add)
+
+        outer.addWidget(top_row)
+
+        # Scrollable shelf list
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer.addWidget(self._scroll)
+
+        self._list_widget = QWidget()
+        self._list_layout = QVBoxLayout(self._list_widget)
+        self._list_layout.setContentsMargins(0, 4, 0, 8)
+        self._list_layout.setSpacing(0)
+        self._scroll.setWidget(self._list_widget)
+
+        self._build_list()
+        self._apply_btn_styles()
+
+    # ----- Internal builders -----
+
+    def _section_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            "QLabel { color: rgba(255,255,255,0.30); font-size: 10px;"
+            " letter-spacing: 1px; padding: 10px 12px 2px; background: transparent; }"
+        )
+        return lbl
+
+    def _nav_btn(self, text: str) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setFlat(True)
+        btn.setCheckable(True)
+        btn.setStyleSheet(self._nav_btn_css())
+        return btn
+
+    def _nav_btn_css(self) -> str:
+        c = self._theme
+        return (
+            f"QPushButton {{ text-align: left; padding: 5px 14px; border: none;"
+            f" background: transparent; color: {c['text']}; font-size: 13px;"
+            f" font-family: 'Libre Baskerville'; border-radius: 4px; margin: 1px 6px; }}"
+            f"QPushButton:hover {{ background: rgba(255,255,255,0.07); }}"
+            f"QPushButton:checked {{ background: rgba(255,255,255,0.13); }}"
+        )
+
+    def _build_list(self):
+        while self._list_layout.count():
+            item = self._list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._shelf_btns.clear()
+        self._folders_btn = None
+
+        # LIBRARY section
+        self._list_layout.addWidget(self._section_label("LIBRARY"))
+        self._folders_btn = self._nav_btn("  Folders")
+        self._folders_btn.setChecked(self._active_id == -1)
+        self._folders_btn.clicked.connect(self._on_folders_clicked)
+        self._list_layout.addWidget(self._folders_btn)
+
+        # SHELVES section
+        self._list_layout.addWidget(self._section_label("SHELVES"))
+
+        shelves = self._library.get_shelves()
+        smart = [s for s in shelves if s.kind == "smart"]
+        manual = [s for s in shelves if s.kind == "manual"]
+
+        for shelf in smart:
+            btn = self._nav_btn(f"  {shelf.name}")
+            btn.setChecked(self._active_id == shelf.id)
+            sid, sname = shelf.id, shelf.name
+            btn.clicked.connect(lambda checked, s=sid, n=sname: self._on_shelf_clicked(s, n))
+            self._shelf_btns.append((shelf.id, btn))
+            self._list_layout.addWidget(btn)
+
+        if manual:
+            div = QFrame()
+            div.setFrameShape(QFrame.Shape.HLine)
+            div.setStyleSheet("QFrame { color: rgba(255,255,255,0.10); margin: 4px 12px; }")
+            self._list_layout.addWidget(div)
+
+            for shelf in manual:
+                btn = self._nav_btn(f"  {shelf.name}")
+                btn.setChecked(self._active_id == shelf.id)
+                sid, sname = shelf.id, shelf.name
+                btn.clicked.connect(lambda checked, s=sid, n=sname: self._on_shelf_clicked(s, n))
+                btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                btn.customContextMenuRequested.connect(
+                    lambda pos, s=sid, n=sname, b=btn: self._on_shelf_right_click(s, n, b.mapToGlobal(pos))
+                )
+                self._shelf_btns.append((shelf.id, btn))
+                self._list_layout.addWidget(btn)
+
+        self._list_layout.addStretch()
+
+        new_btn = QPushButton("  + New Shelf")
+        new_btn.setFlat(True)
+        new_btn.setStyleSheet(
+            "QPushButton { text-align: left; padding: 8px 14px; border: none;"
+            " background: transparent; color: rgba(255,255,255,0.40); font-size: 12px;"
+            " font-family: 'Libre Baskerville'; border-radius: 4px; margin: 1px 6px; }"
+            "QPushButton:hover { color: rgba(255,255,255,0.80); background: rgba(255,255,255,0.07); }"
+        )
+        new_btn.clicked.connect(self.new_shelf_clicked)
+        self._list_layout.addWidget(new_btn)
+
+    def _apply_btn_styles(self):
+        c = self._theme
+        btn_css = (
+            f"QPushButton {{ background: transparent; color: {c['btn_color']}; border: none;"
+            f" border-radius: 4px; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }}"
+            f"QPushButton:hover {{ color: {c['btn_hover_color']}; background: {c['btn_hover_bg']}; }}"
+            f"QPushButton:pressed {{ color: {c['btn_pressed']}; }}"
+            f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
+        )
+        add_css = (
+            f"QPushButton {{ background: transparent; color: {c['btn_color']}; border: none;"
+            f" border-radius: 4px; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }}"
+            f"QPushButton:hover {{ color: {c['btn_hover_color']}; background: {c['btn_hover_bg']};"
+            f" border: 1px solid white; }}"
+            f"QPushButton:pressed {{ color: {c['btn_pressed']}; }}"
+            f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
+        )
+        self._btn_back.setStyleSheet(btn_css)
+        self._btn_add.setStyleSheet(add_css)
+
+    # ----- Slots -----
+
+    def _on_folders_clicked(self):
+        self.set_active(-1)
+        self.show_folders_clicked.emit()
+
+    def _on_shelf_clicked(self, shelf_id: int, shelf_name: str):
+        self.set_active(shelf_id)
+        self.show_shelf_clicked.emit(shelf_id, shelf_name)
+
+    def _on_shelf_right_click(self, shelf_id: int, shelf_name: str, pos):
+        menu = QMenu(self)
+        rename_action = menu.addAction("Rename…")
+        delete_action = menu.addAction("Delete shelf")
+        action = menu.exec(pos)
+        if action == rename_action:
+            self.rename_shelf_requested.emit(shelf_id, shelf_name)
+        elif action == delete_action:
+            self.delete_shelf_requested.emit(shelf_id)
+
+    # ----- Public API -----
+
+    def set_active(self, active_id: int):
+        self._active_id = active_id
+        if self._folders_btn:
+            self._folders_btn.setChecked(active_id == -1)
+        for sid, btn in self._shelf_btns:
+            btn.setChecked(sid == active_id)
+
+    def refresh_shelves(self):
+        self._build_list()
+
+    def set_back_visible(self, visible: bool):
+        self._btn_back.setVisible(visible)
+
+    def set_add_enabled(self, enabled: bool):
+        self._btn_add.setEnabled(enabled)
+
+    def apply_theme(self, c: dict):
+        self._theme = c
+        self.setStyleSheet(f"QWidget {{ background: {c['sidebar_bg']}; }}")
+        self._apply_btn_styles()
+        self._build_list()
 
 SUPPORTED_FILTERS = [
     "Comic files (*.cbz *.cbr *.cb7 *.cbt *.pdf *.zip *.rar *.7z *.tar)",
@@ -141,7 +368,14 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._stack)
         content_layout.addWidget(self._seek_bar)
 
-        self._sidebar = self._build_sidebar()
+        self._sidebar = _Sidebar(self._library)
+        self._sidebar.show_folders_clicked.connect(self._bookshelf.go_to_root)
+        self._sidebar.show_shelf_clicked.connect(self._bookshelf.show_shelf)
+        self._sidebar.add_folder_clicked.connect(self.add_folder_to_library)
+        self._sidebar.new_shelf_clicked.connect(self._create_new_shelf)
+        self._sidebar.rename_shelf_requested.connect(self._rename_shelf)
+        self._sidebar.delete_shelf_requested.connect(self._delete_shelf)
+        self._sidebar.back_to_root_clicked.connect(self._bookshelf.go_to_root)
 
         container = QWidget()
         h_layout = QHBoxLayout(container)
@@ -165,6 +399,7 @@ class MainWindow(QMainWindow):
 
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
         self._bookshelf.folder_entered.connect(self._on_folder_level_changed)
+        self._bookshelf.shelf_changed.connect(self._sidebar.refresh_shelves)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
         self.viewer.mouse_moved.connect(self._on_viewer_mouse_y)
@@ -269,56 +504,6 @@ class MainWindow(QMainWindow):
         back_action.triggered.connect(self._on_escape)
         library_menu.addAction(back_action)
 
-    @staticmethod
-    def _sidebar_btn_css(c: dict) -> str:
-        return (
-            f"QPushButton {{ background: transparent; color: {c['btn_color']}; border: none;"
-            f" border-radius: 0; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }}"
-            f"QPushButton:hover {{ color: {c['btn_hover_color']}; background: {c['btn_hover_bg']}; }}"
-            f"QPushButton:pressed {{ color: {c['btn_pressed']}; }}"
-            f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
-        )
-
-    @staticmethod
-    def _add_btn_css(c: dict) -> str:
-        return (
-            f"QPushButton {{ background: transparent; color: {c['btn_color']}; border: none;"
-            f" border-radius: 4px; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }}"
-            f"QPushButton:hover {{ color: {c['btn_hover_color']}; background: {c['btn_hover_bg']};"
-            f" border: 1px solid white; }}"
-            f"QPushButton:pressed {{ color: {c['btn_pressed']}; }}"
-            f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
-        )
-
-    def _build_sidebar(self) -> QWidget:
-        sidebar = QWidget()
-        sidebar.setFixedWidth(56)
-        sidebar.setStyleSheet(f"QWidget {{ background: {themes.DARK['sidebar_bg']}; }}")
-
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        btn_css = self._sidebar_btn_css(themes.DARK)
-
-        self._btn_back = QPushButton("←")
-        self._btn_back.setFixedSize(56, 56)
-        self._btn_back.setToolTip("Back to library")
-        self._btn_back.setStyleSheet(btn_css)
-        self._btn_back.clicked.connect(self._bookshelf.go_to_root)
-        self._btn_back.hide()
-        layout.addWidget(self._btn_back)
-
-        self._btn_add = QPushButton("+")
-        self._btn_add.setFixedSize(56, 56)
-        self._btn_add.setToolTip("Add Folder to Library (Ctrl+L)")
-        self._btn_add.setStyleSheet(self._add_btn_css(themes.DARK))
-        self._btn_add.clicked.connect(self.add_folder_to_library)
-        layout.addWidget(self._btn_add)
-
-        layout.addStretch()
-
-        return sidebar
 
     def _fade_switch(self, switch_fn):
         """Capture the current stack view, run switch_fn, then fade the capture out."""
@@ -357,15 +542,14 @@ class MainWindow(QMainWindow):
             self._toggle_fullscreen()
 
     def _on_folder_level_changed(self, in_folder: bool):
-        self._btn_back.setVisible(in_folder)
+        self._sidebar.set_back_visible(in_folder)
+        if not in_folder:
+            self._sidebar.set_active(-1)
 
     def apply_theme(self, c: dict):
         from PyQt6.QtWidgets import QApplication
         QApplication.instance().setStyleSheet(themes.app_stylesheet(c))
-        self._sidebar.setStyleSheet(f"QWidget {{ background: {c['sidebar_bg']}; }}")
-        btn_css = self._sidebar_btn_css(c)
-        self._btn_back.setStyleSheet(btn_css)
-        self._btn_add.setStyleSheet(self._add_btn_css(c))
+        self._sidebar.apply_theme(c)
         self._reader_bar.apply_theme(c)
         self._bookshelf.apply_theme(c)
 
@@ -569,6 +753,38 @@ class MainWindow(QMainWindow):
         self._library.close()
         super().closeEvent(event)
 
+    # ----- Shelf management -----
+
+    def _create_new_shelf(self):
+        name, ok = QInputDialog.getText(self, "New Shelf", "Shelf name:")
+        if ok and name.strip():
+            shelf_id = self._library.create_shelf(name.strip())
+            self._sidebar.refresh_shelves()
+            self._sidebar.set_active(shelf_id)
+            self._bookshelf.show_shelf(shelf_id, name.strip())
+
+    def _rename_shelf(self, shelf_id: int, current_name: str):
+        name, ok = QInputDialog.getText(self, "Rename Shelf", "New name:", text=current_name)
+        if ok and name.strip() and name.strip() != current_name:
+            self._library.rename_shelf(shelf_id, name.strip())
+            self._sidebar.refresh_shelves()
+            if self._bookshelf._current_shelf_id == shelf_id:
+                self._bookshelf._current_shelf_name = name.strip()
+                self._bookshelf._header.set_shelf_mode(name.strip())
+
+    def _delete_shelf(self, shelf_id: int):
+        reply = QMessageBox.question(
+            self, "Delete Shelf",
+            "Delete this shelf? Comics will not be removed from your library.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._library.delete_shelf(shelf_id)
+            if self._bookshelf._current_shelf_id == shelf_id:
+                self._bookshelf.go_to_root()
+                self._sidebar.set_active(-1)
+            self._sidebar.refresh_shelves()
+
     # ----- Library scanning -----
 
     def add_folder_to_library(self):
@@ -579,7 +795,7 @@ class MainWindow(QMainWindow):
 
         self._settings.setValue("last_library_dir", folder)
         self._add_folder_action.setEnabled(False)
-        self._btn_add.setEnabled(False)
+        self._sidebar.set_add_enabled(False)
 
         self._scan_thread = QThread(self)
         self._scanner = LibraryScanner(self._library, Path(folder))
@@ -644,4 +860,4 @@ class MainWindow(QMainWindow):
         self._scanner = None
         self._scan_progress = None
         self._add_folder_action.setEnabled(True)
-        self._btn_add.setEnabled(True)
+        self._sidebar.set_add_enabled(True)
