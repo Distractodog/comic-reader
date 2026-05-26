@@ -29,7 +29,7 @@ class _ReaderBar(QWidget):
         self.setObjectName("ReaderBar")
         self.setFixedHeight(48)
         self.setStyleSheet(
-            "#ReaderBar { background: #1e1e1e; border-bottom: 2px solid #404040; }"
+            "#ReaderBar { background: #ecdede; border-bottom: 2px solid #c4aeae; }"
         )
         layout = QHBoxLayout(self)
         layout.setContentsMargins(16, 0, 16, 0)
@@ -37,12 +37,12 @@ class _ReaderBar(QWidget):
 
         btn = QPushButton("←")
         btn.setFlat(True)
-        btn.setStyleSheet("color: #4a9eff; border: none; padding: 4px 8px;")
+        btn.setStyleSheet("color: #8b2a2a; border: none; padding: 4px 8px;")
         btn.clicked.connect(self.back_clicked)
         layout.addWidget(btn)
 
         self._title = QLabel()
-        self._title.setStyleSheet("color: #888888;")
+        self._title.setStyleSheet("color: #7a5858;")
         layout.addWidget(self._title)
         layout.addStretch()
         self.hide()
@@ -108,13 +108,13 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._stack)
         content_layout.addWidget(self._seek_bar)
 
-        sidebar = self._build_sidebar()
+        self._sidebar = self._build_sidebar()
 
         container = QWidget()
         h_layout = QHBoxLayout(container)
         h_layout.setContentsMargins(0, 0, 0, 0)
         h_layout.setSpacing(0)
-        h_layout.addWidget(sidebar)
+        h_layout.addWidget(self._sidebar)
         h_layout.addWidget(content)
         self.setCentralWidget(container)
 
@@ -131,6 +131,7 @@ class MainWindow(QMainWindow):
         self._trans_anim.finished.connect(self._trans_overlay.hide)
 
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
+        self._bookshelf.folder_entered.connect(self._on_folder_level_changed)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
         self.viewer.mouse_moved.connect(self._on_viewer_mouse_y)
@@ -236,7 +237,7 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
         sidebar.setFixedWidth(56)
-        sidebar.setStyleSheet("QWidget { background: #1a1a1a; }")
+        sidebar.setStyleSheet("QWidget { background: #e4d8d8; }")
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -245,23 +246,24 @@ class MainWindow(QMainWindow):
         logo = QLabel("◉")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo.setFixedHeight(48)
-        logo.setStyleSheet("background: #4a9eff; color: #fff; font-size: 18px; font-family: 'Libre Baskerville';")
+        logo.setStyleSheet("background: #8b2a2a; color: #fff; font-size: 18px; font-family: 'Libre Baskerville';")
         layout.addWidget(logo)
 
         btn_css = (
-            "QPushButton { background: transparent; color: #555; border: none;"
+            "QPushButton { background: transparent; color: #5a4040; border: none;"
             " border-radius: 0; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }"
-            "QPushButton:hover { color: #fff; background: #252525; }"
-            "QPushButton:pressed { color: #4a9eff; }"
-            "QPushButton:disabled { color: #2a2a2a; }"
+            "QPushButton:hover { color: #2a1818; background: #d8cccc; }"
+            "QPushButton:pressed { color: #8b2a2a; }"
+            "QPushButton:disabled { color: #b8aaaa; }"
         )
 
-        btn_lib = QPushButton("⌂")
-        btn_lib.setFixedSize(56, 52)
-        btn_lib.setToolTip("Library")
-        btn_lib.setStyleSheet(btn_css)
-        btn_lib.clicked.connect(self._back_to_library)
-        layout.addWidget(btn_lib)
+        self._btn_back = QPushButton("←")
+        self._btn_back.setFixedSize(56, 52)
+        self._btn_back.setToolTip("Back to library")
+        self._btn_back.setStyleSheet(btn_css)
+        self._btn_back.clicked.connect(self._bookshelf.go_to_root)
+        self._btn_back.hide()
+        layout.addWidget(self._btn_back)
 
         self._btn_add = QPushButton("+")
         self._btn_add.setFixedSize(56, 52)
@@ -301,6 +303,7 @@ class MainWindow(QMainWindow):
             self._seek_bar.setVisible(False)
             self._bookshelf.refresh()
             self._stack.setCurrentIndex(0)
+            self._sidebar.show()
         self._fade_switch(do_switch)
         self.setWindowTitle("Comic Reader")
         self._current_comic_id = None
@@ -310,6 +313,9 @@ class MainWindow(QMainWindow):
             self._toggle_fullscreen()
         else:
             self._back_to_library()
+
+    def _on_folder_level_changed(self, in_folder: bool):
+        self._btn_back.setVisible(in_folder)
 
     # ----- File loading -----
 
@@ -371,6 +377,7 @@ class MainWindow(QMainWindow):
         def do_switch():
             self._seek_bar.setVisible(True)
             self._stack.setCurrentIndex(1)
+            self._sidebar.hide()
         QTimer.singleShot(180, lambda: self._fade_switch(do_switch))
 
     # ----- Page navigation -----

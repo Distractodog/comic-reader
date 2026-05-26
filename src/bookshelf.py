@@ -28,14 +28,14 @@ TILE_H = COVER_H + TITLE_H + STATUS_H
 TILE_SPACING = 18
 PROGRESS_H = 3  # overlaid on bottom of cover
 
-_BG = QColor("#0d0d0d")
-_COVER_BG = QColor("#1a1a1a")
-_TITLE_FG = QColor("#ffffff")
-_STATUS_FG = QColor("#777777")
-_HOVER_OVERLAY = QColor(255, 255, 255, 18)
-_PROGRESS_TRACK = QColor("#333333")
-_PROGRESS_FILL = QColor("#4a9eff")
-_PLACEHOLDER_FG = QColor("#333333")
+_BG = QColor("#f0e8e8")
+_COVER_BG = QColor("#d8cccc")
+_TITLE_FG = QColor("#2a1818")
+_STATUS_FG = QColor("#7a5858")
+_HOVER_OVERLAY = QColor(100, 30, 30, 22)
+_PROGRESS_TRACK = QColor("#c4aeae")
+_PROGRESS_FILL = QColor("#8b2a2a")
+_PLACEHOLDER_FG = QColor("#b0a0a0")
 
 
 class _Tile(QWidget):
@@ -195,7 +195,7 @@ class _HeaderBar(QWidget):
         self.setObjectName("HeaderBar")
         self.setFixedHeight(56)
         self.setStyleSheet(
-            "#HeaderBar { background: #111111; border-bottom: 1px solid #222222; }"
+            "#HeaderBar { background: #ecdede; border-bottom: 1px solid #c4aeae; }"
         )
         self._in_comic_view = False
 
@@ -203,9 +203,10 @@ class _HeaderBar(QWidget):
         layout.setContentsMargins(16, 0, 16, 0)
         layout.setSpacing(8)
 
-        self._back_btn = QPushButton("← Library")
+        self._back_btn = QPushButton("←")
         self._back_btn.setFlat(True)
-        self._back_btn.setStyleSheet("color: #4a9eff; padding: 4px 8px;")
+        self._back_btn.setToolTip("Back to library")
+        self._back_btn.setStyleSheet("color: #8b2a2a; padding: 4px 8px;")
         self._back_btn.clicked.connect(self.back_clicked)
         self._back_btn.hide()
         layout.addWidget(self._back_btn)
@@ -215,7 +216,7 @@ class _HeaderBar(QWidget):
         title_font.setPixelSize(22)
         title_font.setWeight(QFont.Weight.DemiBold)
         self._title.setFont(title_font)
-        self._title.setStyleSheet("color: #ffffff;")
+        self._title.setStyleSheet("color: #2a1818;")
         layout.addWidget(self._title)
         layout.addStretch()
 
@@ -234,7 +235,7 @@ class _HeaderBar(QWidget):
         self._search_input.setPlaceholderText("Search title, series, author, folder…")
         self._search_input.setClearButtonEnabled(True)
         self._search_input.setFixedWidth(250)
-        self._search_input.setStyleSheet("QLineEdit:focus { border-color: #4a9eff; }")
+        self._search_input.setStyleSheet("QLineEdit:focus { border-color: #8b2a2a; }")
         self._search_input.textChanged.connect(self.search_changed)
         self._search_input.hide()
         self._search_input.installEventFilter(self)
@@ -245,9 +246,9 @@ class _HeaderBar(QWidget):
         self._search_btn.setToolTip("Search")
         self._search_btn.setFixedSize(34, 34)
         self._search_btn.setStyleSheet(
-            "QPushButton { color: #777; border: none; font-size: 18px;"
+            "QPushButton { color: #7a5858; border: none; font-size: 18px;"
             " font-family: 'Libre Baskerville'; background: transparent; }"
-            "QPushButton:hover { color: #fff; }"
+            "QPushButton:hover { color: #2a1818; }"
         )
         self._search_btn.clicked.connect(self._toggle_search)
         layout.addWidget(self._search_btn)
@@ -318,6 +319,7 @@ class _HeaderBar(QWidget):
 
 class BookshelfView(QWidget):
     comic_opened = pyqtSignal(str)
+    folder_entered = pyqtSignal(bool)
 
     def __init__(self, library: Library, parent=None):
         super().__init__(parent)
@@ -331,7 +333,7 @@ class BookshelfView(QWidget):
         self._in_search = False
         self._pre_search_folder: str | None = None
 
-        self.setStyleSheet("background-color: #0d0d0d;")
+        self.setStyleSheet("background-color: #f0e8e8;")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -351,7 +353,7 @@ class BookshelfView(QWidget):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet("QScrollArea { border: none; background: #0d0d0d; }")
+        self._scroll.setStyleSheet("QScrollArea { border: none; background: #f0e8e8; }")
         root.addWidget(self._scroll)
 
         self._nav_overlay = QLabel(self._scroll)
@@ -367,7 +369,7 @@ class BookshelfView(QWidget):
         self._nav_anim.finished.connect(self._nav_overlay.hide)
 
         self._grid_widget = QWidget()
-        self._grid_widget.setStyleSheet("background: #0d0d0d;")
+        self._grid_widget.setStyleSheet("background: #f0e8e8;")
         self._scroll.setWidget(self._grid_widget)
 
         self._show_folders()
@@ -436,12 +438,16 @@ class BookshelfView(QWidget):
         self._nav_opacity.setOpacity(1.0)
         self._nav_anim.start()
 
+    def go_to_root(self):
+        self._on_back_clicked()
+
     def _show_folders(self):
         def do():
             self._current_folder = None
             self._header.set_folder_mode()
             self._last_n_cols = 0
             self._repopulate()
+            self.folder_entered.emit(False)
         self._nav_transition(do)
 
     def _show_comics(self, folder_path: str):
@@ -450,6 +456,7 @@ class BookshelfView(QWidget):
             self._header.set_comic_mode(Path(folder_path).name)
             self._last_n_cols = 0
             self._repopulate()
+            self.folder_entered.emit(True)
         self._nav_transition(do)
 
     def _n_cols(self) -> int:
@@ -465,7 +472,7 @@ class BookshelfView(QWidget):
         old.deleteLater()
 
         self._grid_widget = QWidget()
-        self._grid_widget.setStyleSheet("background: #0d0d0d;")
+        self._grid_widget.setStyleSheet("background: #f0e8e8;")
         self._scroll.setWidget(self._grid_widget)
 
         layout = QVBoxLayout(self._grid_widget)
@@ -490,7 +497,7 @@ class BookshelfView(QWidget):
         if not items:
             lbl = QLabel(empty_msg)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color: #666;")
+            lbl.setStyleSheet("color: #7a5858;")
             layout.addWidget(lbl)
             layout.addStretch()
             return
