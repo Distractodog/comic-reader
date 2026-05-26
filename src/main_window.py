@@ -164,6 +164,7 @@ class MainWindow(QMainWindow):
         self._trans_anim.finished.connect(self._trans_overlay.hide)
 
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
+        self._bookshelf.folder_entered.connect(self._on_folder_level_changed)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
         self.viewer.mouse_moved.connect(self._on_viewer_mouse_y)
@@ -298,6 +299,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        btn_css = self._sidebar_btn_css(themes.DARK)
+
+        self._btn_back = QPushButton("←")
+        self._btn_back.setFixedSize(56, 56)
+        self._btn_back.setToolTip("Back to library")
+        self._btn_back.setStyleSheet(btn_css)
+        self._btn_back.clicked.connect(self._bookshelf.go_to_root)
+        self._btn_back.hide()
+        layout.addWidget(self._btn_back)
+
         self._btn_add = QPushButton("+")
         self._btn_add.setFixedSize(56, 56)
         self._btn_add.setToolTip("Add Folder to Library (Ctrl+L)")
@@ -345,10 +356,15 @@ class MainWindow(QMainWindow):
         elif self.isFullScreen():
             self._toggle_fullscreen()
 
+    def _on_folder_level_changed(self, in_folder: bool):
+        self._btn_back.setVisible(in_folder)
+
     def apply_theme(self, c: dict):
         from PyQt6.QtWidgets import QApplication
         QApplication.instance().setStyleSheet(themes.app_stylesheet(c))
         self._sidebar.setStyleSheet(f"QWidget {{ background: {c['sidebar_bg']}; }}")
+        btn_css = self._sidebar_btn_css(c)
+        self._btn_back.setStyleSheet(btn_css)
         self._btn_add.setStyleSheet(self._add_btn_css(c))
         self._reader_bar.apply_theme(c)
         self._bookshelf.apply_theme(c)

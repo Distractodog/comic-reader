@@ -204,16 +204,6 @@ class _HeaderBar(QWidget):
         layout.setContentsMargins(16, 0, 16, 0)
         layout.setSpacing(8)
 
-        self._back_btn = QPushButton("←")
-        self._back_btn.setFlat(True)
-        self._back_btn.setToolTip("Back to library")
-        self._back_btn.setStyleSheet(
-            "background: transparent; color: #8b2a2a; border: none; padding: 4px 8px;"
-        )
-        self._back_btn.clicked.connect(self.back_clicked)
-        self._back_btn.hide()
-        layout.addWidget(self._back_btn)
-
         self._title = QLabel("Library")
         title_font = QFont("Libre Baskerville")
         title_font.setPixelSize(22)
@@ -290,7 +280,6 @@ class _HeaderBar(QWidget):
 
     def set_folder_mode(self):
         self._in_comic_view = False
-        self._back_btn.hide()
         self._title.setText("Library")
         self._sort_combo.hide()
         if self._search_input.isVisible():
@@ -299,13 +288,11 @@ class _HeaderBar(QWidget):
 
     def set_comic_mode(self, folder_name: str):
         self._in_comic_view = True
-        self._back_btn.show()
         self._title.setText(folder_name)
         if not self._search_input.isVisible():
             self._sort_combo.show()
 
     def set_search_mode(self):
-        self._back_btn.hide()
         self._title.setText("Search Results")
         if not self._search_input.isVisible():
             self._sort_combo.show()
@@ -322,9 +309,6 @@ class _HeaderBar(QWidget):
     def apply_theme(self, c: dict):
         self.setStyleSheet(
             f"#HeaderBar {{ background: {c['header_bg']}; border: none; }}"
-        )
-        self._back_btn.setStyleSheet(
-            f"background: transparent; color: {c['accent']}; border: none; padding: 4px 8px;"
         )
         self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
         self._search_input.setStyleSheet(f"QLineEdit:focus {{ border-color: {c['accent']}; }}")
