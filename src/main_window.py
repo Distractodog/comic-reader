@@ -4,20 +4,52 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QSettings, QThread
+from PyQt6.QtCore import Qt, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QFileDialog,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QPushButton,
     QStackedWidget,
-    QStatusBar,
-    QToolBar,
     QVBoxLayout,
     QWidget,
 )
+
+class _ReaderBar(QWidget):
+    """Top bar shown while reading — back button + comic title."""
+    back_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ReaderBar")
+        self.setFixedHeight(48)
+        self.setStyleSheet(
+            "#ReaderBar { background: #1e1e1e; border-bottom: 2px solid #404040; }"
+        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(12)
+
+        btn = QPushButton("←")
+        btn.setFlat(True)
+        btn.setStyleSheet("color: #4a9eff; border: none; padding: 4px 8px;")
+        btn.clicked.connect(self.back_clicked)
+        layout.addWidget(btn)
+
+        self._title = QLabel()
+        self._title.setStyleSheet("color: #888888;")
+        layout.addWidget(self._title)
+        layout.addStretch()
+        self.hide()
+
+    def set_title(self, title: str):
+        self._title.setText(title)
+
 
 from archive_handler import ComicReader, open_comic
 from bookshelf import BookshelfView
@@ -60,22 +92,51 @@ class MainWindow(QMainWindow):
         self._seek_bar = SeekBar()
         self._seek_bar.setVisible(False)
 
+        self._reader_bar = _ReaderBar()
+        self._reader_bar.back_clicked.connect(self._back_to_library)
+
+        self._bar_timer = QTimer(self)
+        self._bar_timer.setSingleShot(True)
+        self._bar_timer.setInterval(2500)
+        self._bar_timer.timeout.connect(self._hide_reader_bar_fullscreen)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        content_layout.addWidget(self._reader_bar)
+        content_layout.addWidget(self._stack)
+        content_layout.addWidget(self._seek_bar)
+
+        sidebar = self._build_sidebar()
+
         container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self._stack)
-        layout.addWidget(self._seek_bar)
+        h_layout = QHBoxLayout(container)
+        h_layout.setContentsMargins(0, 0, 0, 0)
+        h_layout.setSpacing(0)
+        h_layout.addWidget(sidebar)
+        h_layout.addWidget(content)
         self.setCentralWidget(container)
+
+        self._trans_overlay = QLabel(content)
+        self._trans_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._trans_overlay.hide()
+        self._opacity_effect = QGraphicsOpacityEffect(self._trans_overlay)
+        self._trans_overlay.setGraphicsEffect(self._opacity_effect)
+        self._trans_anim = QPropertyAnimation(self._opacity_effect, b"opacity", self)
+        self._trans_anim.setDuration(520)
+        self._trans_anim.setStartValue(1.0)
+        self._trans_anim.setEndValue(0.0)
+        self._trans_anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._trans_anim.finished.connect(self._trans_overlay.hide)
 
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
+        self.viewer.mouse_moved.connect(self._on_viewer_mouse_y)
         self._seek_bar.seeked.connect(self.seek_to_page)
 
         self._build_menus()
-        self._build_toolbar()
-        self._build_statusbar()
 
         self.setAcceptDrops(True)
         self._restore_window_state()
@@ -169,29 +230,62 @@ class MainWindow(QMainWindow):
 
         back_action = QAction("← &Back to Library", self)
         back_action.setShortcut("Escape")
-        back_action.triggered.connect(self._back_to_library)
+        back_action.triggered.connect(self._on_escape)
         library_menu.addAction(back_action)
 
-    def _build_toolbar(self):
-        toolbar = QToolBar("Main")
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QWidget()
+        sidebar.setFixedWidth(56)
+        sidebar.setStyleSheet("QWidget { background: #1a1a1a; }")
 
-        toolbar.addAction("⌂ Library", self._back_to_library)
-        toolbar.addSeparator()
-        toolbar.addAction("Open", self.open_file_dialog)
-        toolbar.addSeparator()
-        toolbar.addAction("◀ Prev", self.prev_page)
-        toolbar.addAction("Next ▶", self.next_page)
-        toolbar.addSeparator()
-        toolbar.addAction("Fit Page", lambda: self.viewer.set_fit_mode(FitMode.FIT_PAGE))
-        toolbar.addAction("Fit Width", lambda: self.viewer.set_fit_mode(FitMode.FIT_WIDTH))
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-    def _build_statusbar(self):
-        self._page_label = QLabel("No file loaded")
-        sb = QStatusBar()
-        sb.addPermanentWidget(self._page_label)
-        self.setStatusBar(sb)
+        logo = QLabel("◉")
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setFixedHeight(48)
+        logo.setStyleSheet("background: #4a9eff; color: #fff; font-size: 18px; font-family: 'Libre Baskerville';")
+        layout.addWidget(logo)
+
+        btn_css = (
+            "QPushButton { background: transparent; color: #555; border: none;"
+            " border-radius: 0; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }"
+            "QPushButton:hover { color: #fff; background: #252525; }"
+            "QPushButton:pressed { color: #4a9eff; }"
+            "QPushButton:disabled { color: #2a2a2a; }"
+        )
+
+        btn_lib = QPushButton("⌂")
+        btn_lib.setFixedSize(56, 52)
+        btn_lib.setToolTip("Library")
+        btn_lib.setStyleSheet(btn_css)
+        btn_lib.clicked.connect(self._back_to_library)
+        layout.addWidget(btn_lib)
+
+        self._btn_add = QPushButton("+")
+        self._btn_add.setFixedSize(56, 52)
+        self._btn_add.setToolTip("Add Folder to Library (Ctrl+L)")
+        self._btn_add.setStyleSheet(btn_css)
+        self._btn_add.clicked.connect(self.add_folder_to_library)
+        layout.addWidget(self._btn_add)
+
+        layout.addStretch()
+
+        return sidebar
+
+    def _fade_switch(self, switch_fn):
+        """Capture the current stack view, run switch_fn, then fade the capture out."""
+        grab = self._stack.grab()
+        stack_geom = self._stack.geometry()
+        switch_fn()
+        self._trans_overlay.setPixmap(grab)
+        self._trans_overlay.setGeometry(stack_geom)
+        self._trans_overlay.show()
+        self._trans_overlay.raise_()
+        self._trans_anim.stop()
+        self._opacity_effect.setOpacity(1.0)
+        self._trans_anim.start()
 
     # ----- Library / reader navigation -----
 
@@ -199,12 +293,23 @@ class MainWindow(QMainWindow):
         self.load_file(path)
 
     def _back_to_library(self):
-        self._seek_bar.setVisible(False)
-        self._bookshelf.refresh()
-        self._stack.setCurrentIndex(0)
+        if self.isFullScreen():
+            self.showNormal()
+        def do_switch():
+            self._reader_bar.hide()
+            self._bar_timer.stop()
+            self._seek_bar.setVisible(False)
+            self._bookshelf.refresh()
+            self._stack.setCurrentIndex(0)
+        self._fade_switch(do_switch)
         self.setWindowTitle("Comic Reader")
-        self._page_label.setText("")
         self._current_comic_id = None
+
+    def _on_escape(self):
+        if self.isFullScreen():
+            self._toggle_fullscreen()
+        else:
+            self._back_to_library()
 
     # ----- File loading -----
 
@@ -239,7 +344,11 @@ class MainWindow(QMainWindow):
             return
 
         self._settings.setValue("last_dir", str(Path(path).parent))
-        self.setWindowTitle(f"Comic Reader — {Path(path).name}")
+        title = Path(path).stem
+        self.setWindowTitle(f"Comic Reader — {title}")
+        self._reader_bar.set_title(title)
+        if not self.isFullScreen():
+            self._reader_bar.show()
 
         # Resume to saved page if this comic is in the library.
         comic = self._library.get_comic(path)
@@ -254,20 +363,25 @@ class MainWindow(QMainWindow):
             self._current_page = 0
 
         self._seek_bar.set_page_count(self._reader.page_count())
-        self._seek_bar.setVisible(True)
-        self._stack.setCurrentIndex(1)
+
+        # Pre-load the page while the bookshelf is still showing
         self._show_current_page()
+
+        # Short pause so the click registers visually, then fade to reader
+        def do_switch():
+            self._seek_bar.setVisible(True)
+            self._stack.setCurrentIndex(1)
+        QTimer.singleShot(180, lambda: self._fade_switch(do_switch))
 
     # ----- Page navigation -----
 
-    def _show_current_page(self):
+    def _show_current_page(self, direction: int = 0):
         if not self._reader:
             return
         try:
             page_count = self._reader.page_count()
             data = self._reader.get_page_bytes(self._current_page)
-            self.viewer.set_image(data)
-            self._page_label.setText(f"Page {self._current_page + 1} / {page_count}")
+            self.viewer.set_image(data, direction)
             if page_count > 0:
                 self._seek_bar.set_progress((self._current_page + 1) / page_count)
         except Exception as e:
@@ -276,31 +390,33 @@ class MainWindow(QMainWindow):
     def next_page(self):
         if self._reader and self._current_page < self._reader.page_count() - 1:
             self._current_page += 1
-            self._show_current_page()
+            self._show_current_page(direction=1)
             self._save_progress()
 
     def prev_page(self):
         if self._reader and self._current_page > 0:
             self._current_page -= 1
-            self._show_current_page()
+            self._show_current_page(direction=-1)
             self._save_progress()
 
     def first_page(self):
         if self._reader:
             self._current_page = 0
-            self._show_current_page()
+            self._show_current_page(direction=-1)
             self._save_progress()
 
     def last_page(self):
         if self._reader:
             self._current_page = self._reader.page_count() - 1
-            self._show_current_page()
+            self._show_current_page(direction=1)
             self._save_progress()
 
     def seek_to_page(self, page: int):
         if self._reader:
-            self._current_page = max(0, min(page, self._reader.page_count() - 1))
-            self._show_current_page()
+            new_page = max(0, min(page, self._reader.page_count() - 1))
+            direction = 1 if new_page > self._current_page else (-1 if new_page < self._current_page else 0)
+            self._current_page = new_page
+            self._show_current_page(direction=direction)
             self._save_progress()
 
     def _save_progress(self):
@@ -312,8 +428,22 @@ class MainWindow(QMainWindow):
     def _toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
+            if self._stack.currentIndex() == 1:
+                self._reader_bar.show()
+                self._bar_timer.stop()
         else:
             self.showFullScreen()
+            self._reader_bar.hide()
+
+    def _on_viewer_mouse_y(self, y: int):
+        if self.isFullScreen() and y < 60:
+            self._reader_bar.show()
+            self._reader_bar.raise_()
+            self._bar_timer.start()
+
+    def _hide_reader_bar_fullscreen(self):
+        if self.isFullScreen():
+            self._reader_bar.hide()
 
     def _restore_window_state(self):
         geom = self._settings.value("geometry")
@@ -353,6 +483,7 @@ class MainWindow(QMainWindow):
 
         self._settings.setValue("last_library_dir", folder)
         self._add_folder_action.setEnabled(False)
+        self._btn_add.setEnabled(False)
 
         self._scan_thread = QThread(self)
         self._scanner = LibraryScanner(self._library, Path(folder))
@@ -417,3 +548,4 @@ class MainWindow(QMainWindow):
         self._scanner = None
         self._scan_progress = None
         self._add_folder_action.setEnabled(True)
+        self._btn_add.setEnabled(True)
