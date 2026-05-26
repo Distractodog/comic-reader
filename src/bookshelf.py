@@ -193,9 +193,10 @@ class _HeaderBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("HeaderBar")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setFixedHeight(56)
         self.setStyleSheet(
-            "#HeaderBar { background: #ecdede; border-bottom: 1px solid #c4aeae; }"
+            "#HeaderBar { background: #ecdede; border: none; }"
         )
         self._in_comic_view = False
 
@@ -206,7 +207,9 @@ class _HeaderBar(QWidget):
         self._back_btn = QPushButton("←")
         self._back_btn.setFlat(True)
         self._back_btn.setToolTip("Back to library")
-        self._back_btn.setStyleSheet("color: #8b2a2a; padding: 4px 8px;")
+        self._back_btn.setStyleSheet(
+            "background: transparent; color: #8b2a2a; border: none; padding: 4px 8px;"
+        )
         self._back_btn.clicked.connect(self.back_clicked)
         self._back_btn.hide()
         layout.addWidget(self._back_btn)
@@ -216,7 +219,7 @@ class _HeaderBar(QWidget):
         title_font.setPixelSize(22)
         title_font.setWeight(QFont.Weight.DemiBold)
         self._title.setFont(title_font)
-        self._title.setStyleSheet("color: #2a1818;")
+        self._title.setStyleSheet("background: transparent; color: #2a1818;")
         layout.addWidget(self._title)
         layout.addStretch()
 
@@ -316,6 +319,21 @@ class _HeaderBar(QWidget):
             self._search_btn.setText("⌕")
             self._search_btn.setToolTip("Search")
 
+    def apply_theme(self, c: dict):
+        self.setStyleSheet(
+            f"#HeaderBar {{ background: {c['header_bg']}; border: none; }}"
+        )
+        self._back_btn.setStyleSheet(
+            f"background: transparent; color: {c['accent']}; border: none; padding: 4px 8px;"
+        )
+        self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
+        self._search_input.setStyleSheet(f"QLineEdit:focus {{ border-color: {c['accent']}; }}")
+        self._search_btn.setStyleSheet(
+            f"QPushButton {{ color: {c['text_secondary']}; border: none; font-size: 18px;"
+            f" font-family: 'Libre Baskerville'; background: transparent; }}"
+            f"QPushButton:hover {{ color: {c['text']}; }}"
+        )
+
 
 class BookshelfView(QWidget):
     comic_opened = pyqtSignal(str)
@@ -369,7 +387,7 @@ class BookshelfView(QWidget):
         self._nav_anim.finished.connect(self._nav_overlay.hide)
 
         self._grid_widget = QWidget()
-        self._grid_widget.setStyleSheet("background: #f0e8e8;")
+        self._grid_widget.setStyleSheet(f"background: {_BG.name()};")
         self._scroll.setWidget(self._grid_widget)
 
         self._show_folders()
@@ -441,6 +459,23 @@ class BookshelfView(QWidget):
     def go_to_root(self):
         self._on_back_clicked()
 
+    def apply_theme(self, c: dict):
+        global _BG, _COVER_BG, _TITLE_FG, _STATUS_FG, _HOVER_OVERLAY
+        global _PROGRESS_TRACK, _PROGRESS_FILL, _PLACEHOLDER_FG
+        _BG = QColor(c["tile_bg"])
+        _COVER_BG = QColor(c["cover_bg"])
+        _TITLE_FG = QColor(c["text"])
+        _STATUS_FG = QColor(c["text_secondary"])
+        r, g, b, a = c["hover_overlay"]
+        _HOVER_OVERLAY = QColor(r, g, b, a)
+        _PROGRESS_TRACK = QColor(c["progress_track"])
+        _PROGRESS_FILL = QColor(c["progress_fill"])
+        _PLACEHOLDER_FG = QColor(c["placeholder_fg"])
+        self.setStyleSheet(f"background-color: {c['tile_bg']};")
+        self._scroll.setStyleSheet(f"QScrollArea {{ border: none; background: {c['tile_bg']}; }}")
+        self._header.apply_theme(c)
+        self.refresh()
+
     def _show_folders(self):
         def do():
             self._current_folder = None
@@ -472,7 +507,7 @@ class BookshelfView(QWidget):
         old.deleteLater()
 
         self._grid_widget = QWidget()
-        self._grid_widget.setStyleSheet("background: #f0e8e8;")
+        self._grid_widget.setStyleSheet(f"background: {_BG.name()};")
         self._scroll.setWidget(self._grid_widget)
 
         layout = QVBoxLayout(self._grid_widget)

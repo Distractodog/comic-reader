@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QEasingCurve, QPropertyAnimation, QSettings, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QSettings, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
     QFileDialog,
     QGraphicsOpacityEffect,
@@ -23,11 +23,14 @@ from PyQt6.QtWidgets import (
 class _ReaderBar(QWidget):
     """Top bar shown while reading — back button + comic title."""
     back_clicked = pyqtSignal()
+    HEIGHT = 56
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("ReaderBar")
-        self.setFixedHeight(48)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(self.HEIGHT)
         self.setStyleSheet(
             "#ReaderBar { background: #ecdede; border-bottom: 2px solid #c4aeae; }"
         )
@@ -35,14 +38,18 @@ class _ReaderBar(QWidget):
         layout.setContentsMargins(16, 0, 16, 0)
         layout.setSpacing(12)
 
-        btn = QPushButton("←")
-        btn.setFlat(True)
-        btn.setStyleSheet("color: #8b2a2a; border: none; padding: 4px 8px;")
-        btn.clicked.connect(self.back_clicked)
-        layout.addWidget(btn)
+        self._back_btn = QPushButton("←")
+        self._back_btn.setFlat(True)
+        self._back_btn.setStyleSheet("color: #8b2a2a; border: none; padding: 4px 8px;")
+        self._back_btn.clicked.connect(self.back_clicked)
+        layout.addWidget(self._back_btn)
 
         self._title = QLabel()
-        self._title.setStyleSheet("color: #7a5858;")
+        title_font = QFont("Libre Baskerville")
+        title_font.setPixelSize(22)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        self._title.setFont(title_font)
+        self._title.setStyleSheet("background: transparent; color: #2a1818;")
         layout.addWidget(self._title)
         layout.addStretch()
         self.hide()
@@ -50,12 +57,22 @@ class _ReaderBar(QWidget):
     def set_title(self, title: str):
         self._title.setText(title)
 
+    def apply_theme(self, c: dict):
+        self.setStyleSheet(
+            f"#ReaderBar {{ background: {c['reader_bar_bg']}; border-bottom: 2px solid {c['border']}; }}"
+        )
+        self._back_btn.setStyleSheet(
+            f"background: transparent; color: {c['accent']}; border: none; padding: 4px 8px;"
+        )
+        self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
+
 
 from archive_handler import ComicReader, open_comic
 from bookshelf import BookshelfView
 from library import Library
 from library_scanner import LibraryScanner
 from viewer import ComicViewer, FitMode, SeekBar
+import themes
 
 SUPPORTED_FILTERS = [
     "Comic files (*.cbz *.cbr *.cb7 *.cbt *.pdf *.zip *.rar *.7z *.tar)",
@@ -94,6 +111,22 @@ class MainWindow(QMainWindow):
 
         self._reader_bar = _ReaderBar()
         self._reader_bar.back_clicked.connect(self._back_to_library)
+        self._reader_bar_opacity = QGraphicsOpacityEffect(self._reader_bar)
+        self._reader_bar.setGraphicsEffect(self._reader_bar_opacity)
+        self._reader_bar_opacity.setOpacity(1.0)
+
+        self._reader_bar_height_anim = QPropertyAnimation(self._reader_bar, b"maximumHeight", self)
+        self._reader_bar_height_anim.setDuration(180)
+        self._reader_bar_height_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._reader_bar_opacity_anim = QPropertyAnimation(self._reader_bar_opacity, b"opacity", self)
+        self._reader_bar_opacity_anim.setDuration(150)
+        self._reader_bar_opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._reader_bar_anim = QParallelAnimationGroup(self)
+        self._reader_bar_anim.addAnimation(self._reader_bar_height_anim)
+        self._reader_bar_anim.addAnimation(self._reader_bar_opacity_anim)
+        self._reader_bar_anim.finished.connect(self._on_reader_bar_anim_finished)
+        self._reader_bar_should_hide = False
+        self._reader_bar_target_visible = False
 
         self._bar_timer = QTimer(self)
         self._bar_timer.setSingleShot(True)
@@ -131,7 +164,6 @@ class MainWindow(QMainWindow):
         self._trans_anim.finished.connect(self._trans_overlay.hide)
 
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
-        self._bookshelf.folder_entered.connect(self._on_folder_level_changed)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
         self.viewer.mouse_moved.connect(self._on_viewer_mouse_y)
@@ -141,6 +173,8 @@ class MainWindow(QMainWindow):
 
         self.setAcceptDrops(True)
         self._restore_window_state()
+
+        self.apply_theme(themes.DARK)
 
     # ----- UI construction -----
 
@@ -234,41 +268,40 @@ class MainWindow(QMainWindow):
         back_action.triggered.connect(self._on_escape)
         library_menu.addAction(back_action)
 
+    @staticmethod
+    def _sidebar_btn_css(c: dict) -> str:
+        return (
+            f"QPushButton {{ background: transparent; color: {c['btn_color']}; border: none;"
+            f" border-radius: 0; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }}"
+            f"QPushButton:hover {{ color: {c['btn_hover_color']}; background: {c['btn_hover_bg']}; }}"
+            f"QPushButton:pressed {{ color: {c['btn_pressed']}; }}"
+            f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
+        )
+
+    @staticmethod
+    def _add_btn_css(c: dict) -> str:
+        return (
+            f"QPushButton {{ background: transparent; color: {c['btn_color']}; border: none;"
+            f" border-radius: 4px; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }}"
+            f"QPushButton:hover {{ color: {c['btn_hover_color']}; background: {c['btn_hover_bg']};"
+            f" border: 1px solid white; }}"
+            f"QPushButton:pressed {{ color: {c['btn_pressed']}; }}"
+            f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
+        )
+
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
         sidebar.setFixedWidth(56)
-        sidebar.setStyleSheet("QWidget { background: #e4d8d8; }")
+        sidebar.setStyleSheet(f"QWidget {{ background: {themes.DARK['sidebar_bg']}; }}")
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        logo = QLabel("◉")
-        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setFixedHeight(48)
-        logo.setStyleSheet("background: #8b2a2a; color: #fff; font-size: 18px; font-family: 'Libre Baskerville';")
-        layout.addWidget(logo)
-
-        btn_css = (
-            "QPushButton { background: transparent; color: #5a4040; border: none;"
-            " border-radius: 0; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }"
-            "QPushButton:hover { color: #2a1818; background: #d8cccc; }"
-            "QPushButton:pressed { color: #8b2a2a; }"
-            "QPushButton:disabled { color: #b8aaaa; }"
-        )
-
-        self._btn_back = QPushButton("←")
-        self._btn_back.setFixedSize(56, 52)
-        self._btn_back.setToolTip("Back to library")
-        self._btn_back.setStyleSheet(btn_css)
-        self._btn_back.clicked.connect(self._bookshelf.go_to_root)
-        self._btn_back.hide()
-        layout.addWidget(self._btn_back)
-
         self._btn_add = QPushButton("+")
-        self._btn_add.setFixedSize(56, 52)
+        self._btn_add.setFixedSize(56, 56)
         self._btn_add.setToolTip("Add Folder to Library (Ctrl+L)")
-        self._btn_add.setStyleSheet(btn_css)
+        self._btn_add.setStyleSheet(self._add_btn_css(themes.DARK))
         self._btn_add.clicked.connect(self.add_folder_to_library)
         layout.addWidget(self._btn_add)
 
@@ -295,10 +328,8 @@ class MainWindow(QMainWindow):
         self.load_file(path)
 
     def _back_to_library(self):
-        if self.isFullScreen():
-            self.showNormal()
         def do_switch():
-            self._reader_bar.hide()
+            self._hide_reader_bar(animated=False)
             self._bar_timer.stop()
             self._seek_bar.setVisible(False)
             self._bookshelf.refresh()
@@ -309,13 +340,18 @@ class MainWindow(QMainWindow):
         self._current_comic_id = None
 
     def _on_escape(self):
-        if self.isFullScreen():
-            self._toggle_fullscreen()
-        else:
+        if self._stack.currentIndex() == 1:
             self._back_to_library()
+        elif self.isFullScreen():
+            self._toggle_fullscreen()
 
-    def _on_folder_level_changed(self, in_folder: bool):
-        self._btn_back.setVisible(in_folder)
+    def apply_theme(self, c: dict):
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance().setStyleSheet(themes.app_stylesheet(c))
+        self._sidebar.setStyleSheet(f"QWidget {{ background: {c['sidebar_bg']}; }}")
+        self._btn_add.setStyleSheet(self._add_btn_css(c))
+        self._reader_bar.apply_theme(c)
+        self._bookshelf.apply_theme(c)
 
     # ----- File loading -----
 
@@ -354,7 +390,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Comic Reader — {title}")
         self._reader_bar.set_title(title)
         if not self.isFullScreen():
-            self._reader_bar.show()
+            self._show_reader_bar(animated=False)
 
         # Resume to saved page if this comic is in the library.
         comic = self._library.get_comic(path)
@@ -436,20 +472,57 @@ class MainWindow(QMainWindow):
         if self.isFullScreen():
             self.showNormal()
             if self._stack.currentIndex() == 1:
-                self._reader_bar.show()
+                self._show_reader_bar(animated=False)
                 self._bar_timer.stop()
         else:
             self.showFullScreen()
-            self._reader_bar.hide()
+            self._hide_reader_bar(animated=True)
 
     def _on_viewer_mouse_y(self, y: int):
         if self.isFullScreen() and y < 60:
-            self._reader_bar.show()
-            self._reader_bar.raise_()
+            self._show_reader_bar(animated=True)
             self._bar_timer.start()
 
     def _hide_reader_bar_fullscreen(self):
         if self.isFullScreen():
+            self._hide_reader_bar(animated=True)
+
+    def _show_reader_bar(self, animated: bool):
+        if self._reader_bar_target_visible and self._reader_bar.isVisible():
+            return
+        self._reader_bar_target_visible = True
+        self._reader_bar_should_hide = False
+        self._reader_bar_anim.stop()
+        self._reader_bar.show()
+        self._reader_bar.raise_()
+        if not animated:
+            self._reader_bar.setMaximumHeight(_ReaderBar.HEIGHT)
+            self._reader_bar_opacity.setOpacity(1.0)
+            return
+        self._animate_reader_bar(_ReaderBar.HEIGHT, 1.0)
+
+    def _hide_reader_bar(self, animated: bool):
+        if not self._reader_bar_target_visible and not self._reader_bar.isVisible():
+            return
+        self._reader_bar_target_visible = False
+        self._reader_bar_should_hide = True
+        self._reader_bar_anim.stop()
+        if not animated:
+            self._reader_bar.setMaximumHeight(0)
+            self._reader_bar_opacity.setOpacity(0.0)
+            self._reader_bar.hide()
+            return
+        self._animate_reader_bar(0, 0.0)
+
+    def _animate_reader_bar(self, height: int, opacity: float):
+        self._reader_bar_height_anim.setStartValue(self._reader_bar.maximumHeight())
+        self._reader_bar_height_anim.setEndValue(height)
+        self._reader_bar_opacity_anim.setStartValue(self._reader_bar_opacity.opacity())
+        self._reader_bar_opacity_anim.setEndValue(opacity)
+        self._reader_bar_anim.start()
+
+    def _on_reader_bar_anim_finished(self):
+        if self._reader_bar_should_hide:
             self._reader_bar.hide()
 
     def _restore_window_state(self):
