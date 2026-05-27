@@ -159,7 +159,20 @@ CREATE TABLE IF NOT EXISTS comic_shelves (
 CREATE INDEX IF NOT EXISTS idx_comic_shelves_shelf ON comic_shelves(shelf_id);
 """
 
-_CURRENT_VERSION = 3
+_SCHEMA_V4_MIGRATION = """
+CREATE TABLE IF NOT EXISTS tags (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+CREATE TABLE IF NOT EXISTS comic_tags (
+    comic_id INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+    tag_id   INTEGER NOT NULL REFERENCES tags(id)   ON DELETE CASCADE,
+    PRIMARY KEY (comic_id, tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_comic_tags_tag ON comic_tags(tag_id);
+"""
+
+_CURRENT_VERSION = 4
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -192,6 +205,11 @@ class Library:
             self._conn.executescript(_SCHEMA_V3_MIGRATION)
             self._seed_smart_shelves()
             self._conn.execute("PRAGMA user_version = 3")
+            self._conn.commit()
+            version = 3
+        if version < 4:
+            self._conn.executescript(_SCHEMA_V4_MIGRATION)
+            self._conn.execute("PRAGMA user_version = 4")
             self._conn.commit()
 
     def _seed_smart_shelves(self):
@@ -476,6 +494,18 @@ class Library:
         meta_ids = {r["id"] for r in meta_rows}
         meta_comics = [_row_to_comic(r) for r in meta_rows]
 
+        tag_rows = self._conn.execute(
+            "SELECT DISTINCT c.* FROM comics c"
+            " JOIN comic_tags ct ON c.id = ct.comic_id"
+            " JOIN tags t ON ct.tag_id = t.id"
+            " WHERE t.name LIKE ? COLLATE NOCASE",
+            (like,),
+        ).fetchall()
+        for r in tag_rows:
+            if r["id"] not in meta_ids:
+                meta_ids.add(r["id"])
+                meta_comics.append(_row_to_comic(r))
+
         folder_comics: list[Comic] = []
         if matching_folder_paths:
             all_rows = self._conn.execute("SELECT * FROM comics").fetchall()
@@ -608,6 +638,63 @@ class Library:
             for r in rows
         ]
 
+    # ----- Tag CRUD -----
+
+    def get_all_tags(self) -> list[str]:
+        """Return all tag names sorted alphabetically."""
+        rows = self._conn.execute(
+            "SELECT name FROM tags ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        return [r["name"] for r in rows]
+
+    def get_tags_for_comic(self, comic_id: int) -> list[str]:
+        """Return tags for a comic, sorted alphabetically."""
+        rows = self._conn.execute(
+            "SELECT t.name FROM tags t"
+            " JOIN comic_tags ct ON t.id = ct.tag_id"
+            " WHERE ct.comic_id = ? ORDER BY t.name COLLATE NOCASE",
+            (comic_id,),
+        ).fetchall()
+        return [r["name"] for r in rows]
+
+    def set_tags_for_comic(self, comic_id: int, tag_names: list[str]) -> None:
+        """Replace all tags for a comic. Creates new tags as needed; prunes orphans."""
+        normalized = [n.strip() for n in tag_names if n.strip()]
+        with self.transaction() as cur:
+            cur.execute("DELETE FROM comic_tags WHERE comic_id = ?", (comic_id,))
+            for name in normalized:
+                cur.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (name,))
+                row = cur.execute(
+                    "SELECT id FROM tags WHERE name = ? COLLATE NOCASE", (name,)
+                ).fetchone()
+                cur.execute(
+                    "INSERT OR IGNORE INTO comic_tags (comic_id, tag_id) VALUES (?, ?)",
+                    (comic_id, row["id"]),
+                )
+        self._prune_unused_tags()
+
+    def _prune_unused_tags(self) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM tags WHERE id NOT IN"
+                " (SELECT DISTINCT tag_id FROM comic_tags)"
+            )
+
+    def get_comics_with_tag(
+        self, tag_name: str, *, sort_by: str = "title", order: str = "asc"
+    ) -> list[Comic]:
+        """Return all comics that have the given tag."""
+        if sort_by not in _VALID_SORT_COLUMNS:
+            sort_by = "title"
+        rows = self._conn.execute(
+            "SELECT c.* FROM comics c"
+            " JOIN comic_tags ct ON c.id = ct.comic_id"
+            " JOIN tags t ON ct.tag_id = t.id"
+            " WHERE t.name = ? COLLATE NOCASE",
+            (tag_name,),
+        ).fetchall()
+        return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
+
 
 if __name__ == "__main__":
     # Smoke test — in-memory DB, no real comic files needed.
@@ -667,6 +754,22 @@ if __name__ == "__main__":
 
     lib.delete_shelf(shelf_id)
     assert all(s.kind == "smart" for s in lib.get_shelves())
+
+    # Tag tests
+    lib.set_tags_for_comic(id1, ["Action", "classic", "superhero"])
+    tags = lib.get_tags_for_comic(id1)
+    assert tags == ["Action", "classic", "superhero"]
+    assert lib.get_all_tags() == ["Action", "classic", "superhero"]
+
+    lib.set_tags_for_comic(id1, ["classic", "superhero"])  # remove Action
+    assert lib.get_all_tags() == ["classic", "superhero"]  # Action pruned
+
+    tagged = lib.get_comics_with_tag("superhero")
+    assert len(tagged) == 1 and tagged[0].id == id1
+
+    lib.set_tags_for_comic(id1, [])  # clear all
+    assert lib.get_tags_for_comic(id1) == []
+    assert lib.get_all_tags() == []
 
     lib.close()
     print("library.py smoke test: OK")

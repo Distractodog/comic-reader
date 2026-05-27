@@ -17,7 +17,12 @@ from library import Comic
 class MetadataDialog(QDialog):
     MULTI = "(multiple values)"
 
-    def __init__(self, comics: list[Comic], parent=None):
+    def __init__(
+        self,
+        comics: list[Comic],
+        comic_tags: dict[int, list[str]] | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         n = len(comics)
         self.setWindowTitle("Edit Metadata" if n == 1 else f"Edit Metadata — {n} comics")
@@ -52,6 +57,23 @@ class MetadataDialog(QDialog):
 
             self._fields[key] = widget
             layout.addRow(label + ":", widget)
+
+        # Tags field
+        self._tag_field = QLineEdit()
+        self._tag_original = ""
+        if comic_tags is not None:
+            all_tag_sets = [frozenset(comic_tags.get(c.id, [])) for c in comics]
+            if len(set(all_tag_sets)) == 1:
+                shared_tags = sorted(all_tag_sets[0], key=str.lower)
+                self._tag_original = ", ".join(shared_tags)
+                self._tag_field.setText(self._tag_original)
+            else:
+                self._tag_field.setPlaceholderText(self.MULTI)
+                self._tag_original = self.MULTI
+        self._tag_field.setPlaceholderText(
+            self._tag_field.placeholderText() or "e.g. Action, Classic, Sci-Fi"
+        )
+        layout.addRow("Tags:", self._tag_field)
 
         if n > 1:
             note = QLabel(f"Filled fields apply to all {n} comics.\nLeave blank to keep existing values.")
@@ -108,6 +130,15 @@ class MetadataDialog(QDialog):
                 changes[key] = float(text) if text else None
             else:
                 changes[key] = text if text else None
+
+        # Tags
+        tag_text = self._tag_field.text().strip()
+        if self._tag_original == self.MULTI:
+            if tag_text and tag_text != self.MULTI:
+                changes["tags"] = [t.strip() for t in tag_text.split(",") if t.strip()]
+        else:
+            if tag_text != self._tag_original:
+                changes["tags"] = [t.strip() for t in tag_text.split(",") if t.strip()]
 
         return changes
 

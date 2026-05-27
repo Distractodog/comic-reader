@@ -75,22 +75,20 @@ comic-reader/
     ```
 - **Windows build:** push to `main` → GitHub Actions runs → `.exe` appears as workflow artifact. Tag `v1.0.0` etc. to publish a Release.
 
-## Current status (as of 2026-05-22)
+## Current status (as of 2026-05-27)
 
-- Latest commit: `1eab25d`
-- Phase 1 items done: 1–9 (all items complete)
-  - 1: SQLite library DB
-  - 2: folder scanner
-  - 3: cover thumbnails
-  - 4: bookshelf grid
-  - 5: reading progress tracking
-  - 6: read/unread/in-progress badges
-  - 7: ComicInfo.xml metadata parsing (new `src/comicinfo.py`; backfills existing comics on rescan)
-  - 8: search bar (title, series, author, folder name; folder results include all folder contents)
-  - 9: sort dropdown (Title A–Z/Z–A, Recently Added, Last Read; in comic and search views)
-- Bonus features added (pulled from Phase 3): reader progress bar, click-zone page navigation, seek bar
+- Phase 1 complete (items 1–9 + Phase 3 pull-forwards: seek bar, click-zone nav, reader progress bar)
+- Mini-polish pass complete (page slide animation, bookshelf↔reader fade, rounded tiles, typography)
+- Phase 2 complete (items 11–16):
+  - 11: user-created shelves + smart shelves (Recently Added, Currently Reading, Unread, Finished)
+  - 12: smart shelves seeded via schema v3
+  - 13: series grouping (SeriesTile, manual "Group as series", ungroup)
+  - 14: tags/labels many-to-many (schema v4: `tags` + `comic_tags`; Tags field in metadata editor; search includes tags)
+  - 15: watch folders (simplified to right-click "Rescan folder" on FolderTile)
+  - 16: manual metadata editor (single + multi-select, MetadataDialog)
+- Additional polish: sidebar nav (180px), dark mode locked, theme system, WA_StyledBackground fix, smooth nav transitions on all grid refreshes
 - App launches and runs locally on Mac with the `DYLD_LIBRARY_PATH` workaround
-- Phase 1 complete — mini-polish pass next, then Phase 2
+- Next: Phase 3 (reading experience polish)
 
 ## Known issues
 

@@ -850,7 +850,7 @@ class BookshelfView(QWidget):
         if self._current_shelf_id is not None:
             for cid in comic_ids:
                 self._library.remove_comic_from_shelf(cid, self._current_shelf_id)
-            self._repopulate()
+            self._nav_transition(self._repopulate)
             self.shelf_changed.emit()
 
     def _edit_metadata(self, comic_ids: list[int]):
@@ -858,14 +858,20 @@ class BookshelfView(QWidget):
         comics = [c for cid in comic_ids if (c := self._library.get_comic_by_id(cid))]
         if not comics:
             return
-        dlg = MetadataDialog(comics, self)
+        comic_tags = {c.id: self._library.get_tags_for_comic(c.id) for c in comics}
+        dlg = MetadataDialog(comics, comic_tags=comic_tags, parent=self)
         if dlg.exec():
             changes = dlg.get_changes()
             if changes:
-                for comic in comics:
-                    self._library.update_metadata(comic.id, **changes)
+                tags = changes.pop("tags", None)
+                if changes:
+                    for comic in comics:
+                        self._library.update_metadata(comic.id, **changes)
+                if tags is not None:
+                    for comic in comics:
+                        self._library.set_tags_for_comic(comic.id, tags)
                 self._clear_selection()
-                self._repopulate()
+                self._nav_transition(self._repopulate)
 
     def _group_as_series(self, comic_ids: list[int]):
         from PyQt6.QtWidgets import QInputDialog
@@ -883,7 +889,7 @@ class BookshelfView(QWidget):
         if self._current_series_name == series_name:
             self._show_comics(folder_path)
         else:
-            self._repopulate()
+            self._nav_transition(self._repopulate)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
