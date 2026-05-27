@@ -545,7 +545,8 @@ class MainWindow(QMainWindow):
     def _on_folder_level_changed(self, in_folder: bool):
         self._sidebar.set_back_visible(in_folder)
         if not in_folder:
-            self._sidebar.set_active(-1)
+            shelf_id = self._bookshelf._current_shelf_id
+            self._sidebar.set_active(shelf_id if shelf_id is not None else -1)
 
     def apply_theme(self, c: dict):
         from PyQt6.QtWidgets import QApplication

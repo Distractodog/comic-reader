@@ -565,6 +565,35 @@ class Library:
         ).fetchall()
         return _sort_comics([_row_to_comic(r) for r in comic_rows], sort_by, order)
 
+    def get_shelf_folders(self, shelf_id: int) -> list[Folder]:
+        """Return folders for comics on this shelf, with per-shelf counts.
+        Folders with 0 comics on the shelf are excluded."""
+        comics = self.get_comics_in_shelf(shelf_id)
+        seen: dict[str, Folder] = {}
+        for c in comics:
+            parent = str(Path(c.file_path).parent)
+            if parent not in seen:
+                seen[parent] = Folder(
+                    path=parent,
+                    name=Path(parent).name,
+                    comic_count=0,
+                    cover_path=c.cover_path or None,
+                )
+            seen[parent].comic_count += 1
+            if seen[parent].cover_path is None and c.cover_path:
+                seen[parent].cover_path = c.cover_path
+        return sorted(
+            [f for f in seen.values() if f.comic_count >= 1],
+            key=lambda f: f.name.lower(),
+        )
+
+    def get_comics_in_shelf_for_folder(
+        self, shelf_id: int, folder_path: str, *, sort_by: str = "title", order: str = "asc"
+    ) -> list[Comic]:
+        """Return comics on a shelf that belong to a specific folder."""
+        comics = self.get_comics_in_shelf(shelf_id, sort_by=sort_by, order=order)
+        return [c for c in comics if str(Path(c.file_path).parent) == folder_path]
+
     def get_shelves_for_comic(self, comic_id: int) -> list[Shelf]:
         """Return manual shelves this comic belongs to."""
         rows = self._conn.execute(

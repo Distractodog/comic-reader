@@ -491,6 +491,9 @@ class BookshelfView(QWidget):
         if self._current_series_name is not None:
             self._show_comics(self._current_folder)
             return
+        if self._current_shelf_id is not None and self._current_folder is not None:
+            self._show_shelf_folders()
+            return
         self._search_timer.stop()
         self._search_query = ""
         self._in_search = False
@@ -631,6 +634,32 @@ class BookshelfView(QWidget):
             self.folder_entered.emit(True)
         self._nav_transition(do)
 
+    def _show_shelf_folders(self):
+        """Return to the shelf's folder-tile grid from a folder drill-down."""
+        def do():
+            self._current_folder = None
+            self._current_series_name = None
+            self._selected_ids.clear()
+            self._comic_tiles.clear()
+            self._header.set_shelf_mode(self._current_shelf_name)
+            self._last_n_cols = 0
+            self._repopulate()
+            self.folder_entered.emit(False)
+        self._nav_transition(do)
+
+    def _show_shelf_folder(self, folder_path: str):
+        """Drill into a specific folder's comics within the current shelf."""
+        def do():
+            self._current_folder = folder_path
+            self._current_series_name = None
+            self._selected_ids.clear()
+            self._comic_tiles.clear()
+            self._header.set_comic_mode(Path(folder_path).name)
+            self._last_n_cols = 0
+            self._repopulate()
+            self.folder_entered.emit(True)
+        self._nav_transition(do)
+
     def _clear_selection(self):
         old = set(self._selected_ids)
         self._selected_ids.clear()
@@ -667,11 +696,17 @@ class BookshelfView(QWidget):
             )
             items = folders + comics
             empty_msg = f'No results for "{self._search_query}"'
-        elif self._current_shelf_id is not None:
-            items = self._library.get_comics_in_shelf(
-                self._current_shelf_id, sort_by=self._sort_by, order=self._sort_order
-            )
+        elif self._current_shelf_id is not None and self._current_folder is None:
+            # Shelf top level — show folders that have comics on this shelf
+            items = self._library.get_shelf_folders(self._current_shelf_id)
             empty_msg = "This shelf is empty."
+        elif self._current_shelf_id is not None:
+            # Shelf drill-down — show comics from this folder that are on the shelf
+            items = self._library.get_comics_in_shelf_for_folder(
+                self._current_shelf_id, self._current_folder,
+                sort_by=self._sort_by, order=self._sort_order,
+            )
+            empty_msg = "No comics from this folder on this shelf."
         elif self._current_series_name is not None:
             items = self._library.get_comics_in_series(
                 self._current_folder, self._current_series_name
@@ -714,6 +749,8 @@ class BookshelfView(QWidget):
                 tile = FolderTile(item)
                 if self._search_query:
                     tile.opened.connect(self._open_folder_from_search)
+                elif self._current_shelf_id is not None:
+                    tile.opened.connect(self._show_shelf_folder)
                 else:
                     tile.opened.connect(self._show_comics)
                 tile.rescan_requested.connect(self.folder_rescan_requested)
