@@ -128,6 +128,8 @@ class _Tile(QWidget):
 
 
 class FolderTile(_Tile):
+    rescan_requested = pyqtSignal(str)   # folder_path
+
     def __init__(self, folder: Folder, parent=None):
         super().__init__(parent)
         self._folder = folder
@@ -140,6 +142,13 @@ class FolderTile(_Tile):
         self._draw_title(painter, self._folder.name)
         n = self._folder.comic_count
         self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}")
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.addAction("Rescan folder").triggered.connect(
+            lambda: self.rescan_requested.emit(self._folder.path)
+        )
+        menu.exec(event.globalPos())
 
     def _on_click(self):
         self.opened.emit(self._folder.path)
@@ -405,7 +414,8 @@ class _HeaderBar(QWidget):
 class BookshelfView(QWidget):
     comic_opened = pyqtSignal(str)
     folder_entered = pyqtSignal(bool)
-    shelf_changed = pyqtSignal()   # emitted when shelf membership changes
+    shelf_changed = pyqtSignal()            # emitted when shelf membership changes
+    folder_rescan_requested = pyqtSignal(str)  # folder_path
 
     def __init__(self, library: Library, parent=None):
         super().__init__(parent)
@@ -706,6 +716,7 @@ class BookshelfView(QWidget):
                     tile.opened.connect(self._open_folder_from_search)
                 else:
                     tile.opened.connect(self._show_comics)
+                tile.rescan_requested.connect(self.folder_rescan_requested)
             elif isinstance(item, Series):
                 tile = SeriesTile(item)
                 tile.series_opened.connect(self.show_series)

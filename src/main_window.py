@@ -400,6 +400,7 @@ class MainWindow(QMainWindow):
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
         self._bookshelf.folder_entered.connect(self._on_folder_level_changed)
         self._bookshelf.shelf_changed.connect(self._sidebar.refresh_shelves)
+        self._bookshelf.folder_rescan_requested.connect(self.rescan_folder)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
         self.viewer.mouse_moved.connect(self._on_viewer_mouse_y)
@@ -792,8 +793,16 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Add Folder to Library", last_dir)
         if not folder:
             return
-
         self._settings.setValue("last_library_dir", folder)
+        self._start_scan(folder)
+
+    def rescan_folder(self, folder_path: str):
+        self._start_scan(folder_path)
+
+    def _start_scan(self, folder: str):
+        if self._scan_thread and self._scan_thread.isRunning():
+            return
+
         self._add_folder_action.setEnabled(False)
         self._sidebar.set_add_enabled(False)
 
