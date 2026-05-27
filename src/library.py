@@ -27,6 +27,14 @@ class Shelf:
 
 
 @dataclass
+class Series:
+    name: str
+    comic_count: int
+    cover_path: str | None
+    folder_path: str
+
+
+@dataclass
 class Comic:
     id: int
     file_path: str
@@ -415,6 +423,27 @@ class Library:
             if str(Path(r["file_path"]).parent) == folder_path
         ]
         return _sort_comics(comics, sort_by, order)
+
+    def get_series_in_folder(self, folder_path: str) -> list[Series]:
+        """Return series that have 2+ comics in the folder, sorted by name."""
+        comics = self.get_comics_in_folder(folder_path)
+        groups: dict[str, list[Comic]] = {}
+        for c in comics:
+            if c.series:
+                groups.setdefault(c.series, []).append(c)
+        result = []
+        for name, group in groups.items():
+            if len(group) >= 2:
+                sorted_group = sorted(group, key=lambda c: (c.series_number or 0, (c.title or "").lower()))
+                cover = next((c.cover_path for c in sorted_group if c.cover_path), None)
+                result.append(Series(name=name, comic_count=len(group), cover_path=cover, folder_path=folder_path))
+        return sorted(result, key=lambda s: s.name.lower())
+
+    def get_comics_in_series(self, folder_path: str, series_name: str) -> list[Comic]:
+        """Return comics for a specific series within a folder, sorted by issue number."""
+        comics = self.get_comics_in_folder(folder_path)
+        series_comics = [c for c in comics if c.series == series_name]
+        return sorted(series_comics, key=lambda c: (c.series_number or 0, (c.title or "").lower()))
 
     def search_library(
         self, query: str, sort_by: str = "title", order: str = "asc"
