@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -75,6 +77,17 @@ class MetadataDialog(QDialog):
         )
         layout.addRow("Tags:", self._tag_field)
 
+        # Manga checkbox
+        manga_vals = {getattr(c, "is_manga", False) for c in comics}
+        self._manga_original: bool | None = manga_vals.pop() if len(manga_vals) == 1 else None
+        self._manga_check = QCheckBox("Manga (right-to-left)")
+        if self._manga_original is not None:
+            self._manga_check.setChecked(self._manga_original)
+        else:
+            self._manga_check.setTristate(True)
+            self._manga_check.setCheckState(Qt.CheckState.PartiallyChecked)
+        layout.addRow(self._manga_check)
+
         if n > 1:
             note = QLabel(f"Filled fields apply to all {n} comics.\nLeave blank to keep existing values.")
             note.setWordWrap(True)
@@ -139,6 +152,13 @@ class MetadataDialog(QDialog):
         else:
             if tag_text != self._tag_original:
                 changes["tags"] = [t.strip() for t in tag_text.split(",") if t.strip()]
+
+        # Manga checkbox (only record a change if not in indeterminate state)
+        check_state = self._manga_check.checkState()
+        if check_state != Qt.CheckState.PartiallyChecked:
+            new_manga = check_state == Qt.CheckState.Checked
+            if self._manga_original is None or new_manga != self._manga_original:
+                changes["is_manga"] = new_manga
 
         return changes
 

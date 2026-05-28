@@ -35,6 +35,15 @@ class Series:
 
 
 @dataclass
+class Bookmark:
+    id: int
+    comic_id: int
+    page_index: int
+    label: str | None
+    created_at: str
+
+
+@dataclass
 class Comic:
     id: int
     file_path: str
@@ -53,6 +62,8 @@ class Comic:
     current_page: int
     read_status: str  # 'unread' | 'in_progress' | 'read'
     source_folder: str | None
+    is_manga: bool = False
+    reading_mode: str = "single"  # 'single' | 'webtoon'
 
 
 def _default_db_path() -> Path:
@@ -85,6 +96,8 @@ def _row_to_comic(row: sqlite3.Row) -> Comic:
         current_page=row["current_page"],
         read_status=row["read_status"],
         source_folder=row["source_folder"],
+        is_manga=bool(row["is_manga"]),
+        reading_mode=row["reading_mode"],
     )
 
 
@@ -172,7 +185,19 @@ CREATE TABLE IF NOT EXISTS comic_tags (
 CREATE INDEX IF NOT EXISTS idx_comic_tags_tag ON comic_tags(tag_id);
 """
 
-_CURRENT_VERSION = 4
+_SCHEMA_V5_MIGRATION_TABLES = """
+CREATE TABLE IF NOT EXISTS bookmarks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    comic_id    INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+    page_index  INTEGER NOT NULL,
+    label       TEXT,
+    created_at  TEXT    NOT NULL,
+    UNIQUE(comic_id, page_index)
+);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_comic ON bookmarks(comic_id);
+"""
+
+_CURRENT_VERSION = 5
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -210,6 +235,17 @@ class Library:
         if version < 4:
             self._conn.executescript(_SCHEMA_V4_MIGRATION)
             self._conn.execute("PRAGMA user_version = 4")
+            self._conn.commit()
+            version = 4
+        if version < 5:
+            self._conn.execute(
+                "ALTER TABLE comics ADD COLUMN reading_mode TEXT NOT NULL DEFAULT 'single'"
+            )
+            self._conn.execute(
+                "ALTER TABLE comics ADD COLUMN is_manga INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.executescript(_SCHEMA_V5_MIGRATION_TABLES)
+            self._conn.execute("PRAGMA user_version = 5")
             self._conn.commit()
 
     def _seed_smart_shelves(self):
@@ -680,6 +716,67 @@ class Library:
                 " (SELECT DISTINCT tag_id FROM comic_tags)"
             )
 
+    # ----- Bookmark CRUD -----
+
+    def toggle_bookmark(self, comic_id: int, page_index: int, label: str | None = None) -> bool:
+        """Toggle a bookmark on a page. Returns True if added, False if removed."""
+        existing = self._conn.execute(
+            "SELECT id FROM bookmarks WHERE comic_id = ? AND page_index = ?",
+            (comic_id, page_index),
+        ).fetchone()
+        if existing:
+            with self.transaction() as cur:
+                cur.execute("DELETE FROM bookmarks WHERE id = ?", (existing["id"],))
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO bookmarks (comic_id, page_index, label, created_at)"
+                " VALUES (?, ?, ?, ?)",
+                (comic_id, page_index, label, now),
+            )
+        return True
+
+    def get_bookmarks(self, comic_id: int) -> list[Bookmark]:
+        rows = self._conn.execute(
+            "SELECT * FROM bookmarks WHERE comic_id = ? ORDER BY page_index",
+            (comic_id,),
+        ).fetchall()
+        return [
+            Bookmark(
+                id=r["id"],
+                comic_id=r["comic_id"],
+                page_index=r["page_index"],
+                label=r["label"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def is_bookmarked(self, comic_id: int, page_index: int) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM bookmarks WHERE comic_id = ? AND page_index = ?",
+            (comic_id, page_index),
+        ).fetchone()
+        return row is not None
+
+    # ----- Per-comic reading settings -----
+
+    def set_reading_mode(self, comic_id: int, mode: str) -> None:
+        if mode not in ("single", "webtoon"):
+            raise ValueError(f"Invalid reading_mode: {mode!r}")
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET reading_mode = ? WHERE id = ?", (mode, comic_id)
+            )
+
+    def set_is_manga(self, comic_id: int, is_manga: bool) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET is_manga = ? WHERE id = ?",
+                (1 if is_manga else 0, comic_id),
+            )
+
     def get_comics_with_tag(
         self, tag_name: str, *, sort_by: str = "title", order: str = "asc"
     ) -> list[Comic]:
@@ -770,6 +867,28 @@ if __name__ == "__main__":
     lib.set_tags_for_comic(id1, [])  # clear all
     assert lib.get_tags_for_comic(id1) == []
     assert lib.get_all_tags() == []
+
+    # Bookmark tests
+    assert not lib.is_bookmarked(id1, 5)
+    added = lib.toggle_bookmark(id1, 5, "Fight scene")
+    assert added is True
+    assert lib.is_bookmarked(id1, 5)
+    bms = lib.get_bookmarks(id1)
+    assert len(bms) == 1 and bms[0].page_index == 5 and bms[0].label == "Fight scene"
+    removed = lib.toggle_bookmark(id1, 5)
+    assert removed is False
+    assert not lib.is_bookmarked(id1, 5)
+
+    # Reading mode and manga tests
+    lib.set_reading_mode(id1, "webtoon")
+    assert lib.get_comic_by_id(id1).reading_mode == "webtoon"
+    lib.set_reading_mode(id1, "single")
+    assert lib.get_comic_by_id(id1).reading_mode == "single"
+
+    lib.set_is_manga(id1, True)
+    assert lib.get_comic_by_id(id1).is_manga is True
+    lib.set_is_manga(id1, False)
+    assert lib.get_comic_by_id(id1).is_manga is False
 
     lib.close()
     print("library.py smoke test: OK")

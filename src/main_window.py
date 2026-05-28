@@ -25,8 +25,9 @@ from PyQt6.QtWidgets import (
 )
 
 class _ReaderBar(QWidget):
-    """Top bar shown while reading — back button + comic title."""
+    """Top bar shown while reading — back button, comic title, and ⋮ menu."""
     back_clicked = pyqtSignal()
+    menu_requested = pyqtSignal()
     HEIGHT = 56
 
     def __init__(self, parent=None):
@@ -56,10 +57,25 @@ class _ReaderBar(QWidget):
         self._title.setStyleSheet("background: transparent; color: #2a1818;")
         layout.addWidget(self._title)
         layout.addStretch()
+
+        self._menu_btn = QPushButton("⋮")
+        self._menu_btn.setFlat(True)
+        self._menu_btn.setFixedSize(36, 36)
+        self._menu_btn.setStyleSheet(
+            "color: #8b2a2a; border: none; font-size: 18px; padding: 0;"
+        )
+        self._menu_btn.clicked.connect(self.menu_requested)
+        layout.addWidget(self._menu_btn)
+
         self.hide()
 
     def set_title(self, title: str):
         self._title.setText(title)
+
+    def menu_btn_global_pos(self) -> QPoint:
+        return self._menu_btn.mapToGlobal(
+            QPoint(0, self._menu_btn.height())
+        )
 
     def apply_theme(self, c: dict):
         self.setStyleSheet(
@@ -68,14 +84,21 @@ class _ReaderBar(QWidget):
         self._back_btn.setStyleSheet(
             f"background: transparent; color: {c['accent']}; border: none; padding: 4px 8px;"
         )
+        self._menu_btn.setStyleSheet(
+            f"background: transparent; color: {c['accent']}; border: none;"
+            f" font-size: 18px; padding: 0;"
+        )
         self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
 
 
 from archive_handler import ComicReader, open_comic
 from bookshelf import BookshelfView
+from keybindings import ACTIONS, KeybindingDialog, KeybindingManager
 from library import Library, Shelf
 from library_scanner import LibraryScanner
-from viewer import ComicViewer, FitMode, SeekBar
+from preloader import PageCache, PagePreloader
+from viewer import ComicViewer, FitMode, ReadingMode, SeekBar, ThumbnailStrip, make_spread_pixmap
+from webtoon_viewer import WebtoonViewer
 import themes
 
 
@@ -327,14 +350,33 @@ class MainWindow(QMainWindow):
         self._scanner: LibraryScanner | None = None
         self._scan_progress: QProgressDialog | None = None
 
+        # Reading-mode state (spread is session-only; webtoon + manga persist per-comic)
+        self._spread_mode: bool = False
+        self._webtoon_mode: bool = False
+        self._is_manga: bool = False
+
+        # Page cache + preloader
+        self._cache: PageCache = PageCache()
+        self._preloader: PagePreloader | None = None
+
+        # Thumb strip load-once guard
+        self._thumb_strip_loaded: bool = False
+
+        self._kb = KeybindingManager()
+
         self._stack = QStackedWidget()
         self._bookshelf = BookshelfView(self._library)
         self.viewer = ComicViewer()
-        self._stack.addWidget(self._bookshelf)  # index 0
-        self._stack.addWidget(self.viewer)       # index 1
+        self._webtoon_viewer = WebtoonViewer()
+        self._stack.addWidget(self._bookshelf)      # index 0
+        self._stack.addWidget(self.viewer)           # index 1
+        self._stack.addWidget(self._webtoon_viewer)  # index 2
 
         self._seek_bar = SeekBar()
         self._seek_bar.setVisible(False)
+
+        self._thumb_strip = ThumbnailStrip()
+        self._thumb_strip.setVisible(False)
 
         self._reader_bar = _ReaderBar()
         self._reader_bar.back_clicked.connect(self._back_to_library)
@@ -366,6 +408,7 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(0)
         content_layout.addWidget(self._reader_bar)
         content_layout.addWidget(self._stack)
+        content_layout.addWidget(self._thumb_strip)
         content_layout.addWidget(self._seek_bar)
 
         self._sidebar = _Sidebar(self._library)
@@ -405,6 +448,9 @@ class MainWindow(QMainWindow):
         self.viewer.page_back.connect(self.prev_page)
         self.viewer.mouse_moved.connect(self._on_viewer_mouse_y)
         self._seek_bar.seeked.connect(self.seek_to_page)
+        self._reader_bar.menu_requested.connect(self._show_reader_menu)
+        self._thumb_strip.page_selected.connect(self.seek_to_page)
+        self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
 
         self._build_menus()
 
@@ -416,6 +462,7 @@ class MainWindow(QMainWindow):
     # ----- UI construction -----
 
     def _build_menus(self):
+        kb = self._kb
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("&File")
@@ -438,60 +485,87 @@ class MainWindow(QMainWindow):
 
         view_menu = menubar.addMenu("&View")
 
+        def _shortcuts(action_id: str) -> list[QKeySequence]:
+            primary = QKeySequence(kb.get(action_id))
+            extras = [QKeySequence(s) for s in ACTIONS[action_id]["extras"]]
+            return [primary] + extras
+
         fit_page = QAction("Fit &Page", self)
-        fit_page.setShortcut("1")
+        fit_page.setShortcuts(_shortcuts("fit_page"))
         fit_page.triggered.connect(lambda: self.viewer.set_fit_mode(FitMode.FIT_PAGE))
         view_menu.addAction(fit_page)
 
         fit_width = QAction("Fit &Width", self)
-        fit_width.setShortcut("2")
+        fit_width.setShortcuts(_shortcuts("fit_width"))
         fit_width.triggered.connect(lambda: self.viewer.set_fit_mode(FitMode.FIT_WIDTH))
         view_menu.addAction(fit_width)
 
         actual = QAction("&Actual Size", self)
-        actual.setShortcut("3")
+        actual.setShortcuts(_shortcuts("actual_size"))
         actual.triggered.connect(self.viewer.reset_zoom)
         view_menu.addAction(actual)
 
         view_menu.addSeparator()
 
         zoom_in = QAction("Zoom &In", self)
-        zoom_in.setShortcuts([QKeySequence.StandardKey.ZoomIn, QKeySequence("Ctrl+=")])
+        zoom_in.setShortcuts(_shortcuts("zoom_in"))
         zoom_in.triggered.connect(self.viewer.zoom_in)
         view_menu.addAction(zoom_in)
 
         zoom_out = QAction("Zoom &Out", self)
-        zoom_out.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        zoom_out.setShortcuts(_shortcuts("zoom_out"))
         zoom_out.triggered.connect(self.viewer.zoom_out)
         view_menu.addAction(zoom_out)
 
         view_menu.addSeparator()
         fullscreen = QAction("&Fullscreen", self)
-        fullscreen.setShortcut("F11")
+        fullscreen.setShortcuts(_shortcuts("fullscreen"))
         fullscreen.triggered.connect(self._toggle_fullscreen)
         view_menu.addAction(fullscreen)
+
+        view_menu.addSeparator()
+        shortcuts_action = QAction("Customize Shortcuts…", self)
+        shortcuts_action.triggered.connect(self._open_shortcuts_dialog)
+        view_menu.addAction(shortcuts_action)
 
         nav_menu = menubar.addMenu("&Navigate")
 
         next_page = QAction("&Next Page", self)
-        next_page.setShortcuts([QKeySequence("Right"), QKeySequence("Space"), QKeySequence("PgDown")])
+        next_page.setShortcuts(_shortcuts("next_page"))
         next_page.triggered.connect(self.next_page)
         nav_menu.addAction(next_page)
 
         prev_page = QAction("&Previous Page", self)
-        prev_page.setShortcuts([QKeySequence("Left"), QKeySequence("Backspace"), QKeySequence("PgUp")])
+        prev_page.setShortcuts(_shortcuts("prev_page"))
         prev_page.triggered.connect(self.prev_page)
         nav_menu.addAction(prev_page)
 
         first = QAction("&First Page", self)
-        first.setShortcut("Home")
+        first.setShortcuts(_shortcuts("first_page"))
         first.triggered.connect(self.first_page)
         nav_menu.addAction(first)
 
         last = QAction("&Last Page", self)
-        last.setShortcut("End")
+        last.setShortcuts(_shortcuts("last_page"))
         last.triggered.connect(self.last_page)
         nav_menu.addAction(last)
+
+        nav_menu.addSeparator()
+
+        bm_toggle = QAction("Toggle Bookmark", self)
+        bm_toggle.setShortcuts(_shortcuts("bookmark"))
+        bm_toggle.triggered.connect(self._toggle_bookmark)
+        nav_menu.addAction(bm_toggle)
+
+        bm_prev = QAction("Previous Bookmark", self)
+        bm_prev.setShortcuts(_shortcuts("prev_bookmark"))
+        bm_prev.triggered.connect(self._prev_bookmark)
+        nav_menu.addAction(bm_prev)
+
+        bm_next = QAction("Next Bookmark", self)
+        bm_next.setShortcuts(_shortcuts("next_bookmark"))
+        bm_next.triggered.connect(self._next_bookmark)
+        nav_menu.addAction(bm_next)
 
         library_menu = menubar.addMenu("&Library")
 
@@ -501,9 +575,15 @@ class MainWindow(QMainWindow):
         library_menu.addAction(self._add_folder_action)
 
         back_action = QAction("← &Back to Library", self)
-        back_action.setShortcut("Escape")
+        back_action.setShortcuts(_shortcuts("back_to_library"))
         back_action.triggered.connect(self._on_escape)
         library_menu.addAction(back_action)
+
+        # Thumbnail strip shortcut (no menu entry needed — handled via ⋮)
+        thumb_action = QAction(self)
+        thumb_action.setShortcuts(_shortcuts("thumbnail_strip"))
+        thumb_action.triggered.connect(self._toggle_thumb_strip)
+        self.addAction(thumb_action)
 
 
     def _fade_switch(self, switch_fn):
@@ -525,16 +605,182 @@ class MainWindow(QMainWindow):
         self.load_file(path)
 
     def _back_to_library(self):
+        self._stop_preloader()
+
         def do_switch():
             self._hide_reader_bar(animated=False)
             self._bar_timer.stop()
             self._seek_bar.setVisible(False)
+            self._thumb_strip.setVisible(False)
             self._bookshelf.refresh()
             self._stack.setCurrentIndex(0)
             self._sidebar.show()
         self._fade_switch(do_switch)
         self.setWindowTitle("Comic Reader")
         self._current_comic_id = None
+
+    # ----- Reader ⋮ menu -----
+
+    def _show_reader_menu(self) -> None:
+        menu = QMenu(self)
+
+        spread_act = menu.addAction("Spread mode")
+        spread_act.setCheckable(True)
+        spread_act.setChecked(self._spread_mode)
+        spread_act.triggered.connect(self._toggle_spread)
+
+        manga_act = menu.addAction("Manga (right-to-left)")
+        manga_act.setCheckable(True)
+        manga_act.setChecked(self._is_manga)
+        manga_act.triggered.connect(self._toggle_manga)
+
+        webtoon_act = menu.addAction("Webtoon / scroll mode")
+        webtoon_act.setCheckable(True)
+        webtoon_act.setChecked(self._webtoon_mode)
+        webtoon_act.triggered.connect(self._toggle_webtoon)
+
+        menu.addSeparator()
+
+        is_bm = self._current_page_is_bookmarked()
+        bm_text = "Remove bookmark" if is_bm else "Bookmark this page…"
+        bm_act = menu.addAction(bm_text)
+        bm_act.triggered.connect(self._toggle_bookmark)
+
+        menu.addSeparator()
+
+        thumb_act = menu.addAction("Page thumbnails")
+        thumb_act.setCheckable(True)
+        thumb_act.setChecked(self._thumb_strip.isVisible())
+        thumb_act.triggered.connect(self._toggle_thumb_strip)
+
+        menu.exec(self._reader_bar.menu_btn_global_pos())
+
+    # ----- Toggle handlers -----
+
+    def _toggle_spread(self) -> None:
+        if self._webtoon_mode:
+            return  # spread is meaningless in webtoon mode
+        self._spread_mode = not self._spread_mode
+        if not self._reader:
+            return
+        page_count = self._reader.page_count()
+        if self._spread_mode:
+            self._current_page = (self._current_page // 2) * 2
+            self._seek_bar.set_page_count(max(1, (page_count + 1) // 2))
+        else:
+            self._seek_bar.set_page_count(page_count)
+        self._show_current_page(direction=0)
+
+    def _toggle_manga(self) -> None:
+        self._is_manga = not self._is_manga
+        self.viewer.set_rtl(self._is_manga)
+        if self._current_comic_id is not None:
+            self._library.set_is_manga(self._current_comic_id, self._is_manga)
+
+    def _toggle_webtoon(self) -> None:
+        if not self._reader:
+            return
+        self._webtoon_mode = not self._webtoon_mode
+        if self._current_comic_id is not None:
+            self._library.set_reading_mode(
+                self._current_comic_id, "webtoon" if self._webtoon_mode else "single"
+            )
+        if self._webtoon_mode:
+            self._spread_mode = False
+            self._stop_preloader()
+            self._seek_bar.set_page_count(self._reader.page_count())
+            self._webtoon_viewer.load_comic(self._reader, self._current_page)
+            self._stack.setCurrentIndex(2)
+        else:
+            self._cache.clear()
+            self._preloader = PagePreloader(self._reader, self._cache)
+            self._preloader.set_center(self._current_page)
+            self._preloader.start()
+            self._stack.setCurrentIndex(1)
+            self._show_current_page(direction=0)
+
+    def _toggle_thumb_strip(self) -> None:
+        if self._thumb_strip.isVisible():
+            self._thumb_strip.hide()
+        else:
+            if self._reader and not self._thumb_strip_loaded:
+                self._thumb_strip.load_comic(self._reader)
+                self._thumb_strip_loaded = True
+                self._thumb_strip.set_current(self._current_page)
+            self._thumb_strip.show()
+
+    # ----- Bookmarks -----
+
+    def _current_page_is_bookmarked(self) -> bool:
+        if self._current_comic_id is None:
+            return False
+        return self._library.is_bookmarked(self._current_comic_id, self._current_page)
+
+    def _toggle_bookmark(self) -> None:
+        if self._current_comic_id is None or not self._reader:
+            return
+        page = self._current_page
+        if self._library.is_bookmarked(self._current_comic_id, page):
+            self._library.toggle_bookmark(self._current_comic_id, page)
+        else:
+            label, ok = QInputDialog.getText(self, "Add Bookmark", "Label (optional):")
+            if not ok:
+                return
+            self._library.toggle_bookmark(self._current_comic_id, page, label.strip() or None)
+        self._reload_bookmarks()
+
+    def _prev_bookmark(self) -> None:
+        if self._current_comic_id is None:
+            return
+        bookmarks = sorted(self._library.get_bookmarks(self._current_comic_id),
+                           key=lambda b: b.page_index, reverse=True)
+        for b in bookmarks:
+            if b.page_index < self._current_page:
+                self.seek_to_page(b.page_index)
+                return
+
+    def _next_bookmark(self) -> None:
+        if self._current_comic_id is None:
+            return
+        bookmarks = sorted(self._library.get_bookmarks(self._current_comic_id),
+                           key=lambda b: b.page_index)
+        for b in bookmarks:
+            if b.page_index > self._current_page:
+                self.seek_to_page(b.page_index)
+                return
+
+    def _reload_bookmarks(self) -> None:
+        if self._current_comic_id is None:
+            self._seek_bar.set_bookmarks([])
+            return
+        bookmarks = self._library.get_bookmarks(self._current_comic_id)
+        self._seek_bar.set_bookmarks([(b.page_index, b.label) for b in bookmarks])
+
+    # ----- Preloader helpers -----
+
+    def _stop_preloader(self) -> None:
+        if self._preloader and self._preloader.isRunning():
+            self._preloader.abort()
+            self._preloader.wait()
+        self._preloader = None
+
+    # ----- Webtoon page tracking -----
+
+    def _on_webtoon_page_changed(self, page: int) -> None:
+        self._current_page = page
+        page_count = self._reader.page_count() if self._reader else 0
+        if page_count > 0:
+            self._seek_bar.set_progress((page + 1) / page_count)
+        self._save_progress()
+
+    # ----- Shortcuts dialog -----
+
+    def _open_shortcuts_dialog(self) -> None:
+        dlg = KeybindingDialog(self._kb, self)
+        if dlg.exec():
+            # Rebuild menus so new shortcuts take effect immediately
+            self.menuBar().clear()
+            self._build_menus()
 
     def _on_escape(self):
         if self._stack.currentIndex() == 1:
@@ -594,28 +840,52 @@ class MainWindow(QMainWindow):
         if not self.isFullScreen():
             self._show_reader_bar(animated=False)
 
-        # Resume to saved page if this comic is in the library.
+        # Reset session state
+        self._spread_mode = False
+        self._thumb_strip.setVisible(False)
+        self._thumb_strip_loaded = False
+
+        # Resume to saved page; apply per-comic settings from library
         comic = self._library.get_comic(path)
         if comic is not None:
             self._current_comic_id = comic.id
-            if 0 < comic.current_page < self._reader.page_count():
-                self._current_page = comic.current_page
-            else:
-                self._current_page = 0
+            self._current_page = comic.current_page if 0 < comic.current_page < self._reader.page_count() else 0
+            self._webtoon_mode = comic.reading_mode == "webtoon"
+            self._is_manga = comic.is_manga
         else:
             self._current_comic_id = None
             self._current_page = 0
+            self._webtoon_mode = False
+            self._is_manga = False
 
-        self._seek_bar.set_page_count(self._reader.page_count())
+        self.viewer.set_rtl(self._is_manga)
 
-        # Pre-load the page while the bookshelf is still showing
-        self._show_current_page()
+        # Set up page cache + preloader (only in non-webtoon mode)
+        self._stop_preloader()
+        if not self._webtoon_mode:
+            self._cache.clear()
+            self._preloader = PagePreloader(self._reader, self._cache)
+            self._preloader.set_center(self._current_page)
+            self._preloader.start()
 
-        # Short pause so the click registers visually, then fade to reader
+        # Load bookmarks for seek bar
+        self._reload_bookmarks()
+
+        page_count = self._reader.page_count()
+        if self._webtoon_mode:
+            self._seek_bar.set_page_count(page_count)
+            self._webtoon_viewer.load_comic(self._reader, self._current_page)
+            target_index = 2
+        else:
+            self._seek_bar.set_page_count(page_count)
+            self._show_current_page()
+            target_index = 1
+
         def do_switch():
             self._seek_bar.setVisible(True)
-            self._stack.setCurrentIndex(1)
+            self._stack.setCurrentIndex(target_index)
             self._sidebar.hide()
+
         QTimer.singleShot(180, lambda: self._fade_switch(do_switch))
 
     # ----- Page navigation -----
@@ -624,45 +894,100 @@ class MainWindow(QMainWindow):
         if not self._reader:
             return
         try:
-            page_count = self._reader.page_count()
-            data = self._reader.get_page_bytes(self._current_page)
-            self.viewer.set_image(data, direction)
-            if page_count > 0:
-                self._seek_bar.set_progress((self._current_page + 1) / page_count)
+            if self._spread_mode:
+                self._show_spread(direction)
+            else:
+                self._show_single(direction)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not load page:\n{e}")
 
+    def _show_single(self, direction: int = 0):
+        page_count = self._reader.page_count()
+        cached = self._cache.get(self._current_page)
+        if cached is not None:
+            from PyQt6.QtGui import QPixmap
+            self.viewer.set_image_pixmap(QPixmap.fromImage(cached), direction)
+        else:
+            data = self._reader.get_page_bytes(self._current_page)
+            self.viewer.set_image(data, direction)
+        if page_count > 0:
+            self._seek_bar.set_progress((self._current_page + 1) / page_count)
+        if self._thumb_strip.isVisible():
+            self._thumb_strip.set_current(self._current_page)
+
+    def _show_spread(self, direction: int = 0):
+        page_count = self._reader.page_count()
+        p1 = self._current_page
+        p2 = p1 + 1
+        data1 = self._reader.get_page_bytes(p1)
+        data2 = self._reader.get_page_bytes(p2) if p2 < page_count else None
+        if data2 is not None:
+            pixmap = make_spread_pixmap(data1, data2, self._is_manga)
+        else:
+            from PyQt6.QtGui import QPixmap
+            pixmap = QPixmap()
+            pixmap.loadFromData(data1)
+        self.viewer.set_image_pixmap(pixmap, direction)
+        pair_count = (page_count + 1) // 2
+        pair_index = p1 // 2
+        if pair_count > 0:
+            self._seek_bar.set_progress((pair_index + 1) / pair_count)
+
     def next_page(self):
-        if self._reader and self._current_page < self._reader.page_count() - 1:
-            self._current_page += 1
+        if not self._reader:
+            return
+        step = 2 if self._spread_mode else 1
+        limit = self._reader.page_count() - 1
+        if self._current_page < limit:
+            self._current_page = min(self._current_page + step, limit)
+            if self._spread_mode:
+                self._current_page = (self._current_page // 2) * 2
             self._show_current_page(direction=1)
+            self._advance_preloader()
             self._save_progress()
 
     def prev_page(self):
-        if self._reader and self._current_page > 0:
-            self._current_page -= 1
+        if not self._reader:
+            return
+        step = 2 if self._spread_mode else 1
+        if self._current_page > 0:
+            self._current_page = max(self._current_page - step, 0)
+            if self._spread_mode:
+                self._current_page = (self._current_page // 2) * 2
             self._show_current_page(direction=-1)
+            self._advance_preloader()
             self._save_progress()
 
     def first_page(self):
         if self._reader:
             self._current_page = 0
             self._show_current_page(direction=-1)
+            self._advance_preloader()
             self._save_progress()
 
     def last_page(self):
         if self._reader:
-            self._current_page = self._reader.page_count() - 1
+            page_count = self._reader.page_count()
+            self._current_page = ((page_count - 1) // 2) * 2 if self._spread_mode else page_count - 1
             self._show_current_page(direction=1)
+            self._advance_preloader()
             self._save_progress()
 
     def seek_to_page(self, page: int):
-        if self._reader:
-            new_page = max(0, min(page, self._reader.page_count() - 1))
-            direction = 1 if new_page > self._current_page else (-1 if new_page < self._current_page else 0)
-            self._current_page = new_page
-            self._show_current_page(direction=direction)
-            self._save_progress()
+        if not self._reader:
+            return
+        if self._spread_mode:
+            page = (page // 2) * 2  # snap to spread boundary
+        new_page = max(0, min(page, self._reader.page_count() - 1))
+        direction = 1 if new_page > self._current_page else (-1 if new_page < self._current_page else 0)
+        self._current_page = new_page
+        self._show_current_page(direction=direction)
+        self._advance_preloader()
+        self._save_progress()
+
+    def _advance_preloader(self) -> None:
+        if self._preloader and self._preloader.isRunning():
+            self._preloader.set_center(self._current_page)
 
     def _save_progress(self):
         if self._current_comic_id is not None:
@@ -744,6 +1069,7 @@ class MainWindow(QMainWindow):
             self.load_file(urls[0].toLocalFile())
 
     def closeEvent(self, event):
+        self._stop_preloader()
         if self._scanner:
             self._scanner.cancel()
         if self._scan_thread:

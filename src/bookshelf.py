@@ -864,12 +864,16 @@ class BookshelfView(QWidget):
             changes = dlg.get_changes()
             if changes:
                 tags = changes.pop("tags", None)
+                is_manga = changes.pop("is_manga", None)
                 if changes:
                     for comic in comics:
                         self._library.update_metadata(comic.id, **changes)
                 if tags is not None:
                     for comic in comics:
                         self._library.set_tags_for_comic(comic.id, tags)
+                if is_manga is not None:
+                    for comic in comics:
+                        self._library.set_is_manga(comic.id, is_manga)
                 self._clear_selection()
                 self._nav_transition(self._repopulate)
 

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QRect, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter, QPixmap
-from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QLabel, QWidget
+from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPropertyAnimation, QRect, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
+from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QToolTip, QWidget
 
 CLICK_ZONE_FRACTION = 0.30  # left/right 30% = nav zones, middle 40% = dead zone
 
@@ -15,6 +15,41 @@ class FitMode(Enum):
     ACTUAL_SIZE = "actual"
     FIT_WIDTH = "width"
     FIT_PAGE = "page"
+
+
+class ReadingMode(Enum):
+    SINGLE = "single"
+    WEBTOON = "webtoon"
+
+
+def make_spread_pixmap(page1_bytes: bytes, page2_bytes: bytes, rtl: bool = False) -> QPixmap:
+    """Compose two pages side by side into a single pixmap."""
+    pix1 = QPixmap()
+    pix1.loadFromData(page1_bytes)
+    pix2 = QPixmap()
+    pix2.loadFromData(page2_bytes)
+
+    if pix1.isNull():
+        return pix2
+    if pix2.isNull():
+        return pix1
+
+    w = pix1.width() + pix2.width()
+    h = max(pix1.height(), pix2.height())
+
+    combined = QPixmap(w, h)
+    combined.fill(Qt.GlobalColor.black)
+
+    painter = QPainter(combined)
+    if rtl:
+        painter.drawPixmap(0, (h - pix2.height()) // 2, pix2)
+        painter.drawPixmap(pix2.width(), (h - pix1.height()) // 2, pix1)
+    else:
+        painter.drawPixmap(0, (h - pix1.height()) // 2, pix1)
+        painter.drawPixmap(pix1.width(), (h - pix2.height()) // 2, pix2)
+    painter.end()
+
+    return combined
 
 
 class ComicViewer(QGraphicsView):
@@ -48,6 +83,7 @@ class ComicViewer(QGraphicsView):
         self._fit_mode = FitMode.FIT_PAGE
         self._zoom_factor = 1.0
         self._has_image = False
+        self._rtl = False
         self._swipe_x = 0
         self._swipe_y = 0
         self._swipe_fired = False
@@ -74,8 +110,17 @@ class ComicViewer(QGraphicsView):
         self._anim_group.addAnimation(self._slide_anim_new)
         self._anim_group.finished.connect(self._on_slide_done)
 
+    def set_rtl(self, rtl: bool) -> None:
+        self._rtl = rtl
+
     def set_image(self, image_bytes: bytes, direction: int = 0):
-        """Load a new page. direction: 1=forward (slide left), -1=back (slide right), 0=instant."""
+        """Load a new page from raw bytes."""
+        pixmap = QPixmap()
+        pixmap.loadFromData(image_bytes)
+        self.set_image_pixmap(pixmap, direction)
+
+    def set_image_pixmap(self, pixmap: QPixmap, direction: int = 0):
+        """Load a pre-built pixmap (e.g. from the page cache or spread composer)."""
         self._anim_group.stop()
         self._overlay.hide()
         self._overlay_new.hide()
@@ -83,8 +128,6 @@ class ComicViewer(QGraphicsView):
         should_animate = direction != 0 and self._has_image
         old_grab = self.viewport().grab() if should_animate else None
 
-        pixmap = QPixmap()
-        pixmap.loadFromData(image_bytes)
         self._pixmap_item.setPixmap(pixmap)
         self._scene.setSceneRect(pixmap.rect().toRectF())
         self._zoom_factor = 1.0
@@ -147,10 +190,10 @@ class ComicViewer(QGraphicsView):
             x = event.position().x()
             w = self.viewport().width()
             if x < w * CLICK_ZONE_FRACTION:
-                self.page_back.emit()
+                (self.page_forward if self._rtl else self.page_back).emit()
                 return
             elif x > w * (1 - CLICK_ZONE_FRACTION):
-                self.page_forward.emit()
+                (self.page_back if self._rtl else self.page_forward).emit()
                 return
         super().mousePressEvent(event)
 
@@ -190,10 +233,10 @@ class ComicViewer(QGraphicsView):
         # Fire as soon as threshold is crossed — don't wait for finger lift
         if abs(self._swipe_x) >= 60 and abs(self._swipe_x) > abs(self._swipe_y):
             self._swipe_fired = True
-            if self._swipe_x < 0:
-                self.page_forward.emit()
-            else:
-                self.page_back.emit()
+            forward = self._swipe_x < 0  # swipe left = forward in LTR
+            if self._rtl:
+                forward = not forward
+            (self.page_forward if forward else self.page_back).emit()
             return
 
         # Pass vertical scroll through for zoomed/fit-width views
@@ -226,6 +269,8 @@ class ComicViewer(QGraphicsView):
 
 _BAR_TRACK = QColor("#2d2d2d")
 _BAR_FILL = QColor("#4a9eff")
+_BAR_BOOKMARK = QColor("#ffffff")
+_BOOKMARK_SNAP_PX = 5  # pixels either side of a tick that triggers tooltip
 
 
 class SeekBar(QWidget):
@@ -240,17 +285,24 @@ class SeekBar(QWidget):
         super().__init__(parent)
         self.setFixedHeight(self._WIDGET_H)
         self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setMouseTracking(True)
         self._ratio: float = 0.0
         self._drag_ratio: float | None = None
         self._page_count: int = 0
+        self._bookmarks: list[tuple[int, str | None]] = []  # (page_index, label)
 
     def set_page_count(self, n: int):
         self._page_count = n
+        self.update()
 
     def set_progress(self, ratio: float):
         self._ratio = max(0.0, min(1.0, ratio))
         if self._drag_ratio is None:
             self.update()
+
+    def set_bookmarks(self, marks: list[tuple[int, str | None]]) -> None:
+        self._bookmarks = marks
+        self.update()
 
     def _ratio_from_x(self, x: float) -> float:
         w = self.width()
@@ -270,6 +322,19 @@ class SeekBar(QWidget):
         if event.buttons() & Qt.MouseButton.LeftButton and self._drag_ratio is not None:
             self._drag_ratio = self._ratio_from_x(event.position().x())
             self.update()
+            return
+
+        # Show bookmark tooltip when hovering near a tick
+        if self._page_count > 0 and self._bookmarks:
+            mx = event.position().x()
+            w = self.width()
+            for page_idx, label in self._bookmarks:
+                tick_x = int(w * page_idx / self._page_count)
+                if abs(mx - tick_x) <= _BOOKMARK_SNAP_PX:
+                    text = label if label else f"Page {page_idx + 1}"
+                    QToolTip.showText(event.globalPosition().toPoint(), text, self)
+                    return
+        QToolTip.hideText()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._drag_ratio is not None:
@@ -284,3 +349,155 @@ class SeekBar(QWidget):
         ratio = self._drag_ratio if self._drag_ratio is not None else self._ratio
         painter.fillRect(0, y, w, self._VISUAL_H, _BAR_TRACK)
         painter.fillRect(0, y, int(w * ratio), self._VISUAL_H, _BAR_FILL)
+
+        # Bookmark ticks — 2px white lines spanning full widget height
+        if self._page_count > 0 and self._bookmarks:
+            painter.setPen(_BAR_BOOKMARK)
+            for page_idx, _ in self._bookmarks:
+                x = int(w * page_idx / self._page_count)
+                painter.drawLine(x, 0, x, self._WIDGET_H)
+
+
+# ---------------------------------------------------------------------------
+# Thumbnail strip
+# ---------------------------------------------------------------------------
+
+_THUMB_W = 60
+_THUMB_H = 80
+_THUMB_SPACING = 4
+_STRIP_H = _THUMB_H + 16  # top + bottom padding
+
+
+class _ThumbLoader(QThread):
+    """Loads comic page thumbnails in order and emits each as a QImage."""
+
+    image_ready = pyqtSignal(int, QImage)
+
+    def __init__(self, reader, page_count: int, parent=None):
+        super().__init__(parent)
+        self._reader = reader
+        self._page_count = page_count
+        self._abort = False
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self):
+        for i in range(self._page_count):
+            if self._abort:
+                return
+            try:
+                data = self._reader.get_page_bytes(i)
+                img = QImage()
+                img.loadFromData(data)
+                if not img.isNull():
+                    scaled = img.scaled(
+                        _THUMB_W, _THUMB_H,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    self.image_ready.emit(i, scaled)
+            except Exception:
+                pass
+
+
+class _ThumbCell(QLabel):
+    clicked = pyqtSignal(int)
+
+    def __init__(self, page_index: int, parent=None):
+        super().__init__(parent)
+        self._index = page_index
+        self.setFixedSize(_THUMB_W, _THUMB_H)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._selected = False
+        self._refresh_style()
+
+    def set_selected(self, selected: bool) -> None:
+        if self._selected == selected:
+            return
+        self._selected = selected
+        self._refresh_style()
+
+    def _refresh_style(self) -> None:
+        if self._selected:
+            self.setStyleSheet(
+                "border: 2px solid #4a9eff; background: #0a0a0a;"
+            )
+        else:
+            self.setStyleSheet(
+                "border: 2px solid transparent; background: #1a1a1a;"
+            )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._index)
+
+
+class ThumbnailStrip(QScrollArea):
+    """Horizontal strip of page thumbnails for quick navigation."""
+
+    page_selected = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(_STRIP_H)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setStyleSheet("background: #0d0d0d; border: none;")
+
+        self._content = QWidget()
+        self._content.setStyleSheet("background: #0d0d0d;")
+        self._row = QHBoxLayout(self._content)
+        self._row.setSpacing(_THUMB_SPACING)
+        self._row.setContentsMargins(8, 8, 8, 8)
+        self._row.addStretch()
+
+        self.setWidget(self._content)
+        self.setWidgetResizable(True)
+
+        self._cells: list[_ThumbCell] = []
+        self._current: int = -1
+        self._loader: _ThumbLoader | None = None
+
+    def load_comic(self, reader) -> None:
+        self._stop_loader()
+
+        # Clear existing cells (all items except the trailing stretch)
+        while self._row.count() > 1:
+            item = self._row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._cells.clear()
+        self._current = -1
+
+        page_count = reader.page_count()
+        for i in range(page_count):
+            cell = _ThumbCell(i)
+            cell.clicked.connect(self.page_selected)
+            self._row.insertWidget(i, cell)
+            self._cells.append(cell)
+
+        self._loader = _ThumbLoader(reader, page_count)
+        self._loader.image_ready.connect(self._on_image_ready)
+        self._loader.start()
+
+    def set_current(self, page_index: int) -> None:
+        if self._current == page_index:
+            return
+        if 0 <= self._current < len(self._cells):
+            self._cells[self._current].set_selected(False)
+        self._current = page_index
+        if 0 <= page_index < len(self._cells):
+            self._cells[page_index].set_selected(True)
+            self.ensureWidgetVisible(self._cells[page_index])
+
+    def _on_image_ready(self, index: int, image: QImage) -> None:
+        if 0 <= index < len(self._cells):
+            self._cells[index].setPixmap(QPixmap.fromImage(image))
+
+    def _stop_loader(self) -> None:
+        if self._loader and self._loader.isRunning():
+            self._loader.abort()
+            self._loader.wait()
+        self._loader = None
