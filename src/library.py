@@ -64,6 +64,7 @@ class Comic:
     source_folder: str | None
     is_manga: bool = False
     reading_mode: str = "single"  # 'single' | 'webtoon'
+    hidden: bool = False
 
 
 def _default_db_path() -> Path:
@@ -103,6 +104,7 @@ def _row_to_comic(row: sqlite3.Row) -> Comic:
         source_folder=row["source_folder"],
         is_manga=bool(row["is_manga"]),
         reading_mode=row["reading_mode"],
+        hidden=bool(row["hidden"]),
     )
 
 
@@ -202,7 +204,14 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 CREATE INDEX IF NOT EXISTS idx_bookmarks_comic ON bookmarks(comic_id);
 """
 
-_CURRENT_VERSION = 6
+_SCHEMA_V7_MIGRATION = """
+CREATE TABLE IF NOT EXISTS folder_covers (
+    folder_path TEXT PRIMARY KEY,
+    cover_path  TEXT NOT NULL
+);
+"""
+
+_CURRENT_VERSION = 7
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -268,6 +277,19 @@ class Library:
             )
             self._conn.execute("PRAGMA user_version = 6")
             self._conn.commit()
+            version = 6
+        if version < 7:
+            # Soft-hide flag (remove from app without deleting from disk) +
+            # per-folder cover overrides.
+            self._conn.execute(
+                "ALTER TABLE comics ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_comics_hidden ON comics(hidden)"
+            )
+            self._conn.executescript(_SCHEMA_V7_MIGRATION)
+            self._conn.execute("PRAGMA user_version = 7")
+            self._conn.commit()
 
     def _seed_smart_shelves(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -291,19 +313,19 @@ class Library:
         if smart_key == "recently_added":
             cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
             rows = self._conn.execute(
-                "SELECT * FROM comics WHERE date_added >= ?", (cutoff,)
+                "SELECT * FROM comics WHERE hidden = 0 AND date_added >= ?", (cutoff,)
             ).fetchall()
         elif smart_key == "currently_reading":
             rows = self._conn.execute(
-                "SELECT * FROM comics WHERE read_status = 'in_progress'"
+                "SELECT * FROM comics WHERE hidden = 0 AND read_status = 'in_progress'"
             ).fetchall()
         elif smart_key == "unread":
             rows = self._conn.execute(
-                "SELECT * FROM comics WHERE read_status = 'unread'"
+                "SELECT * FROM comics WHERE hidden = 0 AND read_status = 'unread'"
             ).fetchall()
         elif smart_key == "finished":
             rows = self._conn.execute(
-                "SELECT * FROM comics WHERE read_status = 'read'"
+                "SELECT * FROM comics WHERE hidden = 0 AND read_status = 'read'"
             ).fetchall()
         else:
             return []
@@ -386,7 +408,7 @@ class Library:
             sort_by = "date_added"
         order = "DESC" if order.lower() == "desc" else "ASC"
         rows = self._conn.execute(
-            f"SELECT * FROM comics ORDER BY {sort_by} {order}"
+            f"SELECT * FROM comics WHERE hidden = 0 ORDER BY {sort_by} {order}"
         ).fetchall()
         return [_row_to_comic(r) for r in rows]
 
@@ -405,6 +427,61 @@ class Library:
                 pass
         with self.transaction() as cur:
             cur.execute("DELETE FROM comics WHERE id = ?", (comic_id,))
+
+    # ----- Hide / restore (remove from app without deleting from disk) -----
+
+    def set_hidden(self, comic_id: int, hidden: bool = True) -> None:
+        """Hide or restore a single comic. Hidden comics never touch the disk."""
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET hidden = ? WHERE id = ?",
+                (1 if hidden else 0, comic_id),
+            )
+
+    def hide_folder(self, folder_path: str) -> None:
+        """Hide every comic currently in a folder. Files are left on disk."""
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET hidden = 1 WHERE parent_dir = ?", (folder_path,)
+            )
+
+    def get_hidden_comics(
+        self, *, sort_by: str = "title", order: str = "asc"
+    ) -> list[Comic]:
+        """Return all hidden comics, for the restore view."""
+        rows = self._conn.execute(
+            "SELECT * FROM comics WHERE hidden = 1"
+        ).fetchall()
+        return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
+
+    # ----- Folder cover overrides -----
+
+    def _folder_cover_overrides(self) -> dict[str, str]:
+        rows = self._conn.execute(
+            "SELECT folder_path, cover_path FROM folder_covers"
+        ).fetchall()
+        return {r["folder_path"]: r["cover_path"] for r in rows}
+
+    def get_folder_cover(self, folder_path: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT cover_path FROM folder_covers WHERE folder_path = ?",
+            (folder_path,),
+        ).fetchone()
+        return row["cover_path"] if row else None
+
+    def set_folder_cover(self, folder_path: str, cover_path: str) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO folder_covers (folder_path, cover_path) VALUES (?, ?)"
+                " ON CONFLICT(folder_path) DO UPDATE SET cover_path = excluded.cover_path",
+                (folder_path, cover_path),
+            )
+
+    def clear_folder_cover(self, folder_path: str) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM folder_covers WHERE folder_path = ?", (folder_path,)
+            )
 
     # ----- Comic updates -----
 
@@ -470,14 +547,15 @@ class Library:
         """Return one Folder per unique parent directory, sorted alphabetically."""
         rows = self._conn.execute(
             "SELECT parent_dir, COUNT(*) AS cnt, MAX(cover_path) AS cover"
-            " FROM comics GROUP BY parent_dir"
+            " FROM comics WHERE hidden = 0 GROUP BY parent_dir"
         ).fetchall()
+        overrides = self._folder_cover_overrides()
         folders = [
             Folder(
                 path=row["parent_dir"],
                 name=Path(row["parent_dir"]).name,
                 comic_count=row["cnt"],
-                cover_path=row["cover"] or None,
+                cover_path=overrides.get(row["parent_dir"]) or row["cover"] or None,
             )
             for row in rows
         ]
@@ -490,7 +568,7 @@ class Library:
         if sort_by not in _VALID_SORT_COLUMNS:
             sort_by = "title"
         rows = self._conn.execute(
-            "SELECT * FROM comics WHERE parent_dir = ?", (folder_path,)
+            "SELECT * FROM comics WHERE parent_dir = ? AND hidden = 0", (folder_path,)
         ).fetchall()
         return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
 
@@ -536,10 +614,12 @@ class Library:
         meta_rows = self._conn.execute(
             """
             SELECT * FROM comics
-            WHERE title LIKE ? COLLATE NOCASE
-               OR series LIKE ? COLLATE NOCASE
-               OR author LIKE ? COLLATE NOCASE
-               OR file_path LIKE ? COLLATE NOCASE
+            WHERE hidden = 0 AND (
+                   title LIKE ? COLLATE NOCASE
+                OR series LIKE ? COLLATE NOCASE
+                OR author LIKE ? COLLATE NOCASE
+                OR file_path LIKE ? COLLATE NOCASE
+            )
             """,
             (like, like, like, like),
         ).fetchall()
@@ -550,7 +630,7 @@ class Library:
             "SELECT DISTINCT c.* FROM comics c"
             " JOIN comic_tags ct ON c.id = ct.comic_id"
             " JOIN tags t ON ct.tag_id = t.id"
-            " WHERE t.name LIKE ? COLLATE NOCASE",
+            " WHERE t.name LIKE ? COLLATE NOCASE AND c.hidden = 0",
             (like,),
         ).fetchall()
         for r in tag_rows:
@@ -562,7 +642,7 @@ class Library:
         if matching_folder_paths:
             placeholders = ",".join("?" for _ in matching_folder_paths)
             rows = self._conn.execute(
-                f"SELECT * FROM comics WHERE parent_dir IN ({placeholders})",
+                f"SELECT * FROM comics WHERE hidden = 0 AND parent_dir IN ({placeholders})",
                 tuple(matching_folder_paths),
             ).fetchall()
             folder_comics = [
@@ -643,7 +723,7 @@ class Library:
         comic_rows = self._conn.execute(
             "SELECT c.* FROM comics c"
             " JOIN comic_shelves cs ON c.id = cs.comic_id"
-            " WHERE cs.shelf_id = ?",
+            " WHERE cs.shelf_id = ? AND c.hidden = 0",
             (shelf_id,),
         ).fetchall()
         return _sort_comics([_row_to_comic(r) for r in comic_rows], sort_by, order)
@@ -652,6 +732,7 @@ class Library:
         """Return folders for comics on this shelf, with per-shelf counts.
         Folders with 0 comics on the shelf are excluded."""
         comics = self.get_comics_in_shelf(shelf_id)
+        overrides = self._folder_cover_overrides()
         seen: dict[str, Folder] = {}
         for c in comics:
             parent = str(Path(c.file_path).parent)
@@ -660,7 +741,7 @@ class Library:
                     path=parent,
                     name=Path(parent).name,
                     comic_count=0,
-                    cover_path=c.cover_path or None,
+                    cover_path=overrides.get(parent) or c.cover_path or None,
                 )
             seen[parent].comic_count += 1
             if seen[parent].cover_path is None and c.cover_path:
@@ -804,7 +885,7 @@ class Library:
             "SELECT c.* FROM comics c"
             " JOIN comic_tags ct ON c.id = ct.comic_id"
             " JOIN tags t ON ct.tag_id = t.id"
-            " WHERE t.name = ? COLLATE NOCASE",
+            " WHERE t.name = ? COLLATE NOCASE AND c.hidden = 0",
             (tag_name,),
         ).fetchall()
         return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
@@ -906,6 +987,32 @@ if __name__ == "__main__":
     assert lib.get_comic_by_id(id1).is_manga is True
     lib.set_is_manga(id1, False)
     assert lib.get_comic_by_id(id1).is_manga is False
+
+    # Hide / restore tests
+    id3 = lib.add_comic("/comics/spawn.cbz", page_count=20, file_size=5_000_000, title="Spawn #1")
+    assert len(lib.get_all_comics()) == 2  # id1 + id3 (id2 removed earlier)
+    lib.set_hidden(id3, True)
+    assert lib.get_comic_by_id(id3).hidden is True
+    assert all(c.id != id3 for c in lib.get_all_comics())          # hidden out of library
+    assert any(c.id == id3 for c in lib.get_hidden_comics())        # but in restore view
+    lib.set_hidden(id3, False)
+    assert any(c.id == id3 for c in lib.get_all_comics())           # restored
+
+    # Hiding a whole folder hides every comic in it
+    lib.hide_folder("/comics")
+    assert lib.get_all_comics() == []
+    assert len(lib.get_hidden_comics()) == 2
+    for c in lib.get_hidden_comics():
+        lib.set_hidden(c.id, False)
+    assert len(lib.get_all_comics()) == 2
+
+    # Folder cover override
+    assert lib.get_folder_cover("/comics") is None
+    lib.set_folder_cover("/comics", "/cache/custom.jpg")
+    assert lib.get_folder_cover("/comics") == "/cache/custom.jpg"
+    assert next(f for f in lib.get_folders() if f.path == "/comics").cover_path == "/cache/custom.jpg"
+    lib.clear_folder_cover("/comics")
+    assert lib.get_folder_cover("/comics") is None
 
     lib.close()
     print("library.py smoke test: OK")

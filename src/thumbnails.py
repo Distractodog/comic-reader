@@ -29,6 +29,31 @@ def thumbnail_path_for(comic_id: int) -> Path:
     return thumbnail_cache_dir() / f"{comic_id}.jpg"
 
 
+def folder_cover_path_for(folder_path: str) -> Path:
+    """Stable cache path for a custom folder cover, keyed by the folder's path."""
+    import hashlib
+    h = hashlib.md5(folder_path.encode("utf-8")).hexdigest()[:16]
+    return thumbnail_cache_dir() / f"folder_{h}.jpg"
+
+
+def generate_thumbnail_from_image(image_path: str, output_path: Path) -> bool:
+    """Scale an arbitrary image file into a JPEG cover thumbnail. Returns True on success."""
+    try:
+        image = QImage(image_path)
+        if image.isNull():
+            return False
+        thumb = image.scaled(
+            THUMB_MAX_WIDTH,
+            THUMB_MAX_HEIGHT,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return thumb.save(str(output_path), "JPEG", THUMB_QUALITY)
+    except Exception:
+        return False
+
+
 def generate_thumbnail(file_path: str, output_path: Path) -> bool:
     """Open comic, render first page to a JPEG thumbnail. Returns True on success."""
     try:

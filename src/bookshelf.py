@@ -8,11 +8,14 @@ from PyQt6.QtCore import Qt, QEasingCurve, QEvent, QPoint, QPropertyAnimation, Q
 from PyQt6.QtGui import QAction, QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QComboBox,
+    QFileDialog,
     QGraphicsOpacityEffect,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -158,7 +161,7 @@ class _Tile(QWidget):
 
 
 class FolderTile(_Tile):
-    rescan_requested = pyqtSignal(str)   # folder_path
+    menu_requested = pyqtSignal(str, int, int)  # folder_path, global_x, global_y
 
     def __init__(self, folder: Folder, parent=None):
         super().__init__(parent)
@@ -174,11 +177,9 @@ class FolderTile(_Tile):
         self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}")
 
     def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        menu.addAction("Rescan folder").triggered.connect(
-            lambda: self.rescan_requested.emit(self._folder.path)
+        self.menu_requested.emit(
+            self._folder.path, event.globalPos().x(), event.globalPos().y()
         )
-        menu.exec(event.globalPos())
 
     def _on_click(self):
         self.opened.emit(self._folder.path)
@@ -454,6 +455,7 @@ class BookshelfView(QWidget):
         self._current_shelf_id: int | None = None
         self._current_shelf_name: str = ""
         self._current_series_name: str | None = None
+        self._show_hidden_mode: bool = False
         self._last_n_cols = 0
 
         self._selected_ids: set[int] = set()
@@ -621,6 +623,7 @@ class BookshelfView(QWidget):
             self._current_series_name = None
             self._selected_ids.clear()
             self._comic_tiles.clear()
+            self._show_hidden_mode = False
             self._header.set_folder_mode()
             self._last_n_cols = 0
             self._repopulate()
@@ -633,6 +636,7 @@ class BookshelfView(QWidget):
             self._current_shelf_id = None
             self._current_shelf_name = ""
             self._current_series_name = None
+            self._show_hidden_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
@@ -649,6 +653,7 @@ class BookshelfView(QWidget):
             self._current_series_name = None
             self._selected_ids.clear()
             self._comic_tiles.clear()
+            self._show_hidden_mode = False
             self._header.set_shelf_mode(shelf_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -663,6 +668,7 @@ class BookshelfView(QWidget):
             self._current_series_name = series_name
             self._selected_ids.clear()
             self._comic_tiles.clear()
+            self._show_hidden_mode = False
             self._header.set_series_mode(series_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -676,6 +682,7 @@ class BookshelfView(QWidget):
             self._current_series_name = None
             self._selected_ids.clear()
             self._comic_tiles.clear()
+            self._show_hidden_mode = False
             self._header.set_shelf_mode(self._current_shelf_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -687,12 +694,29 @@ class BookshelfView(QWidget):
         def do():
             self._current_folder = folder_path
             self._current_series_name = None
+            self._show_hidden_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(True)
+        self._nav_transition(do)
+
+    def show_hidden(self):
+        """Show the Hidden view — comics removed from the library, for restoring."""
+        def do():
+            self._current_folder = None
+            self._current_shelf_id = None
+            self._current_shelf_name = ""
+            self._current_series_name = None
+            self._show_hidden_mode = True
+            self._selected_ids.clear()
+            self._comic_tiles.clear()
+            self._header.set_shelf_mode("Hidden")
+            self._last_n_cols = 0
+            self._repopulate()
+            self.folder_entered.emit(False)
         self._nav_transition(do)
 
     def _clear_selection(self):
@@ -727,7 +751,13 @@ class BookshelfView(QWidget):
         self._stop_cover_loader()
         self._ordered_tiles = []
 
-        if self._search_query:
+        if self._show_hidden_mode:
+            items = self._library.get_hidden_comics(
+                sort_by=self._sort_by, order=self._sort_order
+            )
+            empty_msg = ("Nothing hidden.\n"
+                         "Comics you remove from the library appear here.")
+        elif self._search_query:
             folders, comics = self._library.search_library(
                 self._search_query, self._sort_by, self._sort_order
             )
@@ -790,7 +820,7 @@ class BookshelfView(QWidget):
                     tile.opened.connect(self._show_shelf_folder)
                 else:
                     tile.opened.connect(self._show_comics)
-                tile.rescan_requested.connect(self.folder_rescan_requested)
+                tile.menu_requested.connect(self._on_folder_context_menu)
             elif isinstance(item, Series):
                 tile = SeriesTile(item)
                 tile.series_opened.connect(self.show_series)
@@ -844,6 +874,15 @@ class BookshelfView(QWidget):
 
         menu = QMenu(self)
 
+        # Hidden view — only offer restore
+        if self._show_hidden_mode:
+            restore_label = f"Restore {n} to library" if is_multi else "Restore to library"
+            menu.addAction(restore_label).triggered.connect(
+                lambda: self._restore_comics(target_ids)
+            )
+            menu.exec(QPoint(gx, gy))
+            return
+
         # Metadata / grouping
         meta_label = f"Edit metadata… ({n} selected)" if is_multi else "Edit metadata…"
         menu.addAction(meta_label).triggered.connect(
@@ -893,6 +932,12 @@ class BookshelfView(QWidget):
                     lambda: self._remove_comics_from_current_shelf(target_ids)
                 )
 
+        menu.addSeparator()
+        remove_label = f"Remove {n} from library…" if is_multi else "Remove from library…"
+        menu.addAction(remove_label).triggered.connect(
+            lambda: self._remove_comics_from_library(target_ids)
+        )
+
         menu.exec(QPoint(gx, gy))
 
     def _toggle_selection(self, comic_id: int):
@@ -915,6 +960,110 @@ class BookshelfView(QWidget):
         if self._current_shelf_id is not None:
             for cid in comic_ids:
                 self._library.remove_comic_from_shelf(cid, self._current_shelf_id)
+            self._nav_transition(self._repopulate)
+            self.shelf_changed.emit()
+
+    # ----- Hide / restore -----
+
+    def _remove_comics_from_library(self, comic_ids: list[int]):
+        n = len(comic_ids)
+        what = "this comic" if n == 1 else f"these {n} comics"
+        reply = QMessageBox.question(
+            self, "Remove from Library",
+            f"Hide {what} from the app?\n\n"
+            "This does not delete anything from your computer — the files stay on "
+            "disk. You can bring them back any time from the Hidden view.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            for cid in comic_ids:
+                self._library.set_hidden(cid, True)
+            self._clear_selection()
+            self._nav_transition(self._repopulate)
+            self.shelf_changed.emit()
+
+    def _restore_comics(self, comic_ids: list[int]):
+        for cid in comic_ids:
+            self._library.set_hidden(cid, False)
+        self._clear_selection()
+        self._nav_transition(self._repopulate)
+        self.shelf_changed.emit()
+
+    # ----- Folder context menu (rescan / cover / hide) -----
+
+    def _on_folder_context_menu(self, folder_path: str, gx: int, gy: int):
+        menu = QMenu(self)
+        menu.addAction("Rescan folder").triggered.connect(
+            lambda: self.folder_rescan_requested.emit(folder_path)
+        )
+        # Cover + hide only make sense in the plain folder grid.
+        if self._current_shelf_id is None and not self._search_query:
+            menu.addSeparator()
+            menu.addAction("Set cover from comic…").triggered.connect(
+                lambda: self._set_folder_cover_from_comic(folder_path)
+            )
+            menu.addAction("Choose cover image…").triggered.connect(
+                lambda: self._set_folder_cover_from_image(folder_path)
+            )
+            if self._library.get_folder_cover(folder_path):
+                menu.addAction("Reset cover to default").triggered.connect(
+                    lambda: self._reset_folder_cover(folder_path)
+                )
+            menu.addSeparator()
+            menu.addAction("Hide this folder").triggered.connect(
+                lambda: self._hide_folder(folder_path)
+            )
+        menu.exec(QPoint(gx, gy))
+
+    def _set_folder_cover_from_comic(self, folder_path: str):
+        comics = [c for c in self._library.get_comics_in_folder(folder_path) if c.cover_path]
+        if not comics:
+            QMessageBox.information(
+                self, "Set Folder Cover",
+                "No comics with cover images in this folder yet.",
+            )
+            return
+        names = [c.title or Path(c.file_path).stem for c in comics]
+        name, ok = QInputDialog.getItem(
+            self, "Set Folder Cover", "Use the cover from:", names, 0, False
+        )
+        if ok and name:
+            chosen = comics[names.index(name)]
+            self._library.set_folder_cover(folder_path, chosen.cover_path)
+            self._nav_transition(self._repopulate)
+
+    def _set_folder_cover_from_image(self, folder_path: str):
+        from thumbnails import folder_cover_path_for, generate_thumbnail_from_image
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose Cover Image", str(Path.home()),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)",
+        )
+        if not path:
+            return
+        out = folder_cover_path_for(folder_path)
+        if generate_thumbnail_from_image(path, out):
+            self._library.set_folder_cover(folder_path, str(out))
+            self._nav_transition(self._repopulate)
+        else:
+            QMessageBox.warning(
+                self, "Choose Cover Image", "Could not load that image file."
+            )
+
+    def _reset_folder_cover(self, folder_path: str):
+        self._library.clear_folder_cover(folder_path)
+        self._nav_transition(self._repopulate)
+
+    def _hide_folder(self, folder_path: str):
+        name = Path(folder_path).name
+        reply = QMessageBox.question(
+            self, "Hide Folder",
+            f"Hide “{name}” and its comics from the app?\n\n"
+            "This does not delete anything from your computer — the files stay on "
+            "disk. You can bring them back any time from the Hidden view.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._library.hide_folder(folder_path)
             self._nav_transition(self._repopulate)
             self.shelf_changed.emit()
 

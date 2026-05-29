@@ -106,6 +106,7 @@ class _Sidebar(QWidget):
     """Left sidebar — action buttons + library/shelf navigation list."""
 
     show_folders_clicked = pyqtSignal()
+    show_hidden_clicked = pyqtSignal()
     show_shelf_clicked = pyqtSignal(int, str)   # shelf_id, shelf_name
     add_folder_clicked = pyqtSignal()
     new_shelf_clicked = pyqtSignal()
@@ -118,9 +119,10 @@ class _Sidebar(QWidget):
     def __init__(self, library: Library, parent=None):
         super().__init__(parent)
         self._library = library
-        self._active_id: int = -1   # -1 = Folders, int = shelf id
+        self._active_id: int = -1   # -1 = Folders, -2 = Hidden, int = shelf id
         self._shelf_btns: list[tuple[int, QPushButton]] = []
         self._folders_btn: QPushButton | None = None
+        self._hidden_btn: QPushButton | None = None
         self._theme: dict = themes.DARK
 
         self.setFixedWidth(self.WIDTH)
@@ -206,6 +208,7 @@ class _Sidebar(QWidget):
                 item.widget().deleteLater()
         self._shelf_btns.clear()
         self._folders_btn = None
+        self._hidden_btn = None
 
         # LIBRARY section
         self._list_layout.addWidget(self._section_label("LIBRARY"))
@@ -213,6 +216,11 @@ class _Sidebar(QWidget):
         self._folders_btn.setChecked(self._active_id == -1)
         self._folders_btn.clicked.connect(self._on_folders_clicked)
         self._list_layout.addWidget(self._folders_btn)
+
+        self._hidden_btn = self._nav_btn("  Hidden")
+        self._hidden_btn.setChecked(self._active_id == -2)
+        self._hidden_btn.clicked.connect(self._on_hidden_clicked)
+        self._list_layout.addWidget(self._hidden_btn)
 
         # SHELVES section
         self._list_layout.addWidget(self._section_label("SHELVES"))
@@ -286,6 +294,10 @@ class _Sidebar(QWidget):
         self.set_active(-1)
         self.show_folders_clicked.emit()
 
+    def _on_hidden_clicked(self):
+        self.set_active(-2)
+        self.show_hidden_clicked.emit()
+
     def _on_shelf_clicked(self, shelf_id: int, shelf_name: str):
         self.set_active(shelf_id)
         self.show_shelf_clicked.emit(shelf_id, shelf_name)
@@ -306,6 +318,8 @@ class _Sidebar(QWidget):
         self._active_id = active_id
         if self._folders_btn:
             self._folders_btn.setChecked(active_id == -1)
+        if self._hidden_btn:
+            self._hidden_btn.setChecked(active_id == -2)
         for sid, btn in self._shelf_btns:
             btn.setChecked(sid == active_id)
 
@@ -409,6 +423,7 @@ class MainWindow(QMainWindow):
 
         self._sidebar = _Sidebar(self._library)
         self._sidebar.show_folders_clicked.connect(self._bookshelf.go_to_root)
+        self._sidebar.show_hidden_clicked.connect(self._bookshelf.show_hidden)
         self._sidebar.show_shelf_clicked.connect(self._bookshelf.show_shelf)
         self._sidebar.add_folder_clicked.connect(self.add_folder_to_library)
         self._sidebar.new_shelf_clicked.connect(self._create_new_shelf)
@@ -801,8 +816,11 @@ class MainWindow(QMainWindow):
     def _on_folder_level_changed(self, in_folder: bool):
         self._sidebar.set_back_visible(in_folder)
         if not in_folder:
-            shelf_id = self._bookshelf._current_shelf_id
-            self._sidebar.set_active(shelf_id if shelf_id is not None else -1)
+            if self._bookshelf._show_hidden_mode:
+                self._sidebar.set_active(-2)
+            else:
+                shelf_id = self._bookshelf._current_shelf_id
+                self._sidebar.set_active(shelf_id if shelf_id is not None else -1)
 
     def apply_theme(self, c: dict):
         from PyQt6.QtWidgets import QApplication
