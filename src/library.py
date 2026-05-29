@@ -77,6 +77,11 @@ def _default_db_path() -> Path:
     return base / "library.db"
 
 
+def _parent_dir(file_path: str) -> str:
+    """The immediate parent directory of a comic file — how the folder grid groups."""
+    return str(Path(file_path).parent)
+
+
 def _row_to_comic(row: sqlite3.Row) -> Comic:
     return Comic(
         id=row["id"],
@@ -197,7 +202,7 @@ CREATE TABLE IF NOT EXISTS bookmarks (
 CREATE INDEX IF NOT EXISTS idx_bookmarks_comic ON bookmarks(comic_id);
 """
 
-_CURRENT_VERSION = 5
+_CURRENT_VERSION = 6
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -246,6 +251,22 @@ class Library:
             )
             self._conn.executescript(_SCHEMA_V5_MIGRATION_TABLES)
             self._conn.execute("PRAGMA user_version = 5")
+            self._conn.commit()
+            version = 5
+        if version < 6:
+            # Indexed immediate-parent directory, so folder queries no longer
+            # need a full table scan + per-row Path() parsing in Python.
+            self._conn.execute("ALTER TABLE comics ADD COLUMN parent_dir TEXT")
+            rows = self._conn.execute("SELECT id, file_path FROM comics").fetchall()
+            for r in rows:
+                self._conn.execute(
+                    "UPDATE comics SET parent_dir = ? WHERE id = ?",
+                    (_parent_dir(r["file_path"]), r["id"]),
+                )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_comics_parent ON comics(parent_dir)"
+            )
+            self._conn.execute("PRAGMA user_version = 6")
             self._conn.commit()
 
     def _seed_smart_shelves(self):
@@ -331,12 +352,12 @@ class Library:
                 """
                 INSERT INTO comics
                     (file_path, page_count, file_size, title, series, series_number,
-                     author, publisher, year, date_added, source_folder)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     author, publisher, year, date_added, source_folder, parent_dir)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_path) DO NOTHING
                 """,
                 (file_path, page_count, file_size, title, series, series_number,
-                 author, publisher, year, now, source_folder),
+                 author, publisher, year, now, source_folder, _parent_dir(file_path)),
             )
         row = self._conn.execute(
             "SELECT id FROM comics WHERE file_path = ?", (file_path,)
@@ -448,22 +469,19 @@ class Library:
     def get_folders(self) -> list[Folder]:
         """Return one Folder per unique parent directory, sorted alphabetically."""
         rows = self._conn.execute(
-            "SELECT file_path, cover_path FROM comics ORDER BY file_path"
+            "SELECT parent_dir, COUNT(*) AS cnt, MAX(cover_path) AS cover"
+            " FROM comics GROUP BY parent_dir"
         ).fetchall()
-        seen: dict[str, Folder] = {}
-        for row in rows:
-            parent = str(Path(row["file_path"]).parent)
-            if parent not in seen:
-                seen[parent] = Folder(
-                    path=parent,
-                    name=Path(parent).name,
-                    comic_count=0,
-                    cover_path=row["cover_path"] or None,
-                )
-            seen[parent].comic_count += 1
-            if seen[parent].cover_path is None and row["cover_path"]:
-                seen[parent].cover_path = row["cover_path"]
-        return sorted(seen.values(), key=lambda f: f.name.lower())
+        folders = [
+            Folder(
+                path=row["parent_dir"],
+                name=Path(row["parent_dir"]).name,
+                comic_count=row["cnt"],
+                cover_path=row["cover"] or None,
+            )
+            for row in rows
+        ]
+        return sorted(folders, key=lambda f: f.name.lower())
 
     def get_comics_in_folder(
         self, folder_path: str, *, sort_by: str = "title", order: str = "asc"
@@ -471,12 +489,10 @@ class Library:
         """Return all comics whose file lives directly in folder_path."""
         if sort_by not in _VALID_SORT_COLUMNS:
             sort_by = "title"
-        rows = self._conn.execute("SELECT * FROM comics").fetchall()
-        comics = [
-            _row_to_comic(r) for r in rows
-            if str(Path(r["file_path"]).parent) == folder_path
-        ]
-        return _sort_comics(comics, sort_by, order)
+        rows = self._conn.execute(
+            "SELECT * FROM comics WHERE parent_dir = ?", (folder_path,)
+        ).fetchall()
+        return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
 
     def get_series_in_folder(self, folder_path: str) -> list[Series]:
         """Return series that have 2+ comics in the folder, sorted by name."""
@@ -544,13 +560,14 @@ class Library:
 
         folder_comics: list[Comic] = []
         if matching_folder_paths:
-            all_rows = self._conn.execute("SELECT * FROM comics").fetchall()
-            for r in all_rows:
-                if (
-                    str(Path(r["file_path"]).parent) in matching_folder_paths
-                    and r["id"] not in meta_ids
-                ):
-                    folder_comics.append(_row_to_comic(r))
+            placeholders = ",".join("?" for _ in matching_folder_paths)
+            rows = self._conn.execute(
+                f"SELECT * FROM comics WHERE parent_dir IN ({placeholders})",
+                tuple(matching_folder_paths),
+            ).fetchall()
+            folder_comics = [
+                _row_to_comic(r) for r in rows if r["id"] not in meta_ids
+            ]
 
         return matching_folders, _sort_comics(meta_comics + folder_comics, sort_by, order)
 

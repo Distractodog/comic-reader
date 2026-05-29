@@ -6,6 +6,7 @@ import io
 import os
 import tarfile
 import tempfile
+import threading
 import zipfile
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -25,20 +26,39 @@ def _natural_sort_key(name: str):
 
 
 class ComicReader(ABC):
-    """Base interface for all comic file readers."""
+    """Base interface for all comic file readers.
+
+    A single reader instance is shared between the UI thread and background
+    loader/preloader threads. The underlying archive/document handles
+    (zipfile, rarfile, fitz, …) are NOT thread-safe, so all access to a page
+    goes through a lock here. ``get_page_bytes`` / ``close`` are the locked
+    public entry points; subclasses implement the unlocked ``_read_page`` /
+    ``_close`` internals.
+    """
 
     def __init__(self, file_path: str):
         self.file_path = file_path
         self.pages: list = []
+        self._lock = threading.Lock()
 
     def page_count(self) -> int:
         return len(self.pages)
 
-    @abstractmethod
     def get_page_bytes(self, index: int) -> bytes:
-        """Return raw image bytes for the page at the given index."""
+        """Return raw image bytes for the page at the given index (thread-safe)."""
+        with self._lock:
+            return self._read_page(index)
+
+    @abstractmethod
+    def _read_page(self, index: int) -> bytes:
+        """Return raw image bytes for the page at the given index (no locking)."""
 
     def close(self):
+        """Close the underlying handle (thread-safe — waits for any in-flight read)."""
+        with self._lock:
+            self._close()
+
+    def _close(self):
         pass
 
     def __enter__(self):
@@ -63,10 +83,10 @@ class CBZReader(_ArchiveReader):
         self._zip = zipfile.ZipFile(file_path, "r")
         self.pages = self._filter_and_sort(self._zip.namelist())
 
-    def get_page_bytes(self, index: int) -> bytes:
+    def _read_page(self, index: int) -> bytes:
         return self._zip.read(self.pages[index])
 
-    def close(self):
+    def _close(self):
         self._zip.close()
 
 
@@ -76,10 +96,10 @@ class CBRReader(_ArchiveReader):
         self._rar = rarfile.RarFile(file_path)
         self.pages = self._filter_and_sort(self._rar.namelist())
 
-    def get_page_bytes(self, index: int) -> bytes:
+    def _read_page(self, index: int) -> bytes:
         return self._rar.read(self.pages[index])
 
-    def close(self):
+    def _close(self):
         self._rar.close()
 
 
@@ -92,10 +112,10 @@ class CB7Reader(_ArchiveReader):
             self.pages = self._filter_and_sort(all_names)
             sz.extractall(path=self._tmpdir.name)
 
-    def get_page_bytes(self, index: int) -> bytes:
+    def _read_page(self, index: int) -> bytes:
         return (Path(self._tmpdir.name) / self.pages[index]).read_bytes()
 
-    def close(self):
+    def _close(self):
         self._tmpdir.cleanup()
 
 
@@ -106,13 +126,13 @@ class CBTReader(_ArchiveReader):
         members = [m.name for m in self._tar.getmembers() if m.isfile()]
         self.pages = self._filter_and_sort(members)
 
-    def get_page_bytes(self, index: int) -> bytes:
+    def _read_page(self, index: int) -> bytes:
         f = self._tar.extractfile(self.pages[index])
         if f is None:
             raise IOError(f"Could not extract {self.pages[index]}")
         return f.read()
 
-    def close(self):
+    def _close(self):
         self._tar.close()
 
 
@@ -122,13 +142,17 @@ class PDFReader(ComicReader):
         self._doc = fitz.open(file_path)
         self.pages = list(range(self._doc.page_count))
 
-    def get_page_bytes(self, index: int) -> bytes:
+    def _read_page(self, index: int) -> bytes:
         page = self._doc.load_page(index)
-        # Render at 2x for crisp display
+        # Render at 2x for crisp display.
         pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
-        return pix.tobytes("png")
+        # Return uncompressed PPM rather than PNG: PNG-compressing a ~6-megapixel
+        # raster (and decoding it again in Qt) is the single most expensive thing
+        # we can do per page. PPM is a trivial header + raw RGB, so Qt loads it
+        # near-instantly — a large speedup for multi-hundred-page PDFs.
+        return pix.tobytes("ppm")
 
-    def close(self):
+    def _close(self):
         self._doc.close()
 
 
@@ -143,7 +167,7 @@ class ImageFolderReader(_ArchiveReader):
         ]
         self.pages = sorted(names, key=_natural_sort_key)
 
-    def get_page_bytes(self, index: int) -> bytes:
+    def _read_page(self, index: int) -> bytes:
         with open(os.path.join(self.file_path, self.pages[index]), "rb") as f:
             return f.read()
 

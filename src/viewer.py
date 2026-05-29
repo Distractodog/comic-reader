@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPropertyAnimation, QRect, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPropertyAnimation, QRect, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QToolTip, QWidget
 
@@ -83,6 +83,10 @@ class ComicViewer(QGraphicsView):
         self._fit_mode = FitMode.FIT_PAGE
         self._zoom_factor = 1.0
         self._has_image = False
+        # Full-resolution source kept for zoom; the scene shows a pixmap pre-scaled
+        # to the viewport so the view never smooth-scales a huge image per repaint.
+        self._source_pixmap: QPixmap | None = None
+        self._display_key = None
         self._rtl = False
         self._swipe_x = 0
         self._swipe_y = 0
@@ -128,15 +132,51 @@ class ComicViewer(QGraphicsView):
         should_animate = direction != 0 and self._has_image
         old_grab = self.viewport().grab() if should_animate else None
 
-        self._pixmap_item.setPixmap(pixmap)
-        self._scene.setSceneRect(pixmap.rect().toRectF())
+        self._source_pixmap = pixmap
+        self._display_key = None
         self._zoom_factor = 1.0
         self._has_image = True
+        self._apply_display_pixmap()
         self._apply_fit()
 
         if old_grab is not None:
             new_grab = self.viewport().grab()
             self._run_slide(old_grab, new_grab, direction)
+
+    def _apply_display_pixmap(self):
+        """Put a viewport-sized pixmap in the scene for fit modes (cheap to paint),
+        or the full-resolution source when zoomed. Skips work when nothing changed."""
+        src = self._source_pixmap
+        if src is None or src.isNull():
+            return
+        smooth = Qt.TransformationMode.SmoothTransformation
+        if self._fit_mode == FitMode.ACTUAL_SIZE:
+            key = ("actual",)
+            disp = src
+        elif self._fit_mode == FitMode.FIT_WIDTH:
+            vw = max(1, self.viewport().width())
+            if src.width() > vw:
+                key = ("fitw", vw)
+                disp = src.scaledToWidth(vw, smooth)
+            else:
+                key = ("src",)
+                disp = src
+        else:  # FIT_PAGE — constrained by whichever dimension is tighter
+            vw = max(1, self.viewport().width())
+            vh = max(1, self.viewport().height())
+            if src.width() > vw or src.height() > vh:
+                key = ("fitp", vw, vh)
+                disp = src.scaled(
+                    vw, vh, Qt.AspectRatioMode.KeepAspectRatio, smooth
+                )
+            else:
+                key = ("src",)
+                disp = src
+        if key == self._display_key:
+            return
+        self._display_key = key
+        self._pixmap_item.setPixmap(disp)
+        self._scene.setSceneRect(disp.rect().toRectF())
 
     def _run_slide(self, old_pixmap: QPixmap, new_pixmap: QPixmap, direction: int):
         vp = self.viewport()
@@ -168,21 +208,25 @@ class ComicViewer(QGraphicsView):
     def set_fit_mode(self, mode: FitMode):
         self._fit_mode = mode
         self._zoom_factor = 1.0
+        self._apply_display_pixmap()
         self._apply_fit()
 
     def zoom_in(self):
         self._fit_mode = FitMode.ACTUAL_SIZE
         self._zoom_factor *= 1.25
+        self._apply_display_pixmap()
         self._apply_fit()
 
     def zoom_out(self):
         self._fit_mode = FitMode.ACTUAL_SIZE
         self._zoom_factor *= 0.8
+        self._apply_display_pixmap()
         self._apply_fit()
 
     def reset_zoom(self):
         self._fit_mode = FitMode.ACTUAL_SIZE
         self._zoom_factor = 1.0
+        self._apply_display_pixmap()
         self._apply_fit()
 
     def mousePressEvent(self, event):
@@ -246,6 +290,7 @@ class ComicViewer(QGraphicsView):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._has_image and self._fit_mode != FitMode.ACTUAL_SIZE:
+            self._apply_display_pixmap()
             self._apply_fit()
 
     def _apply_fit(self):
@@ -369,21 +414,22 @@ _STRIP_H = _THUMB_H + 16  # top + bottom padding
 
 
 class _ThumbLoader(QThread):
-    """Loads comic page thumbnails in order and emits each as a QImage."""
+    """Loads thumbnails for a given list of page indices, emitting each as a QImage."""
 
-    image_ready = pyqtSignal(int, QImage)
+    image_ready = pyqtSignal(int, int, QImage)  # gen, page_index, image
 
-    def __init__(self, reader, page_count: int, parent=None):
+    def __init__(self, reader, indices: list[int], gen: int, parent=None):
         super().__init__(parent)
         self._reader = reader
-        self._page_count = page_count
+        self._indices = indices
+        self._gen = gen
         self._abort = False
 
     def abort(self) -> None:
         self._abort = True
 
     def run(self):
-        for i in range(self._page_count):
+        for i in self._indices:
             if self._abort:
                 return
             try:
@@ -396,7 +442,7 @@ class _ThumbLoader(QThread):
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
-                    self.image_ready.emit(i, scaled)
+                    self.image_ready.emit(self._gen, i, scaled)
             except Exception:
                 pass
 
@@ -458,10 +504,22 @@ class ThumbnailStrip(QScrollArea):
 
         self._cells: list[_ThumbCell] = []
         self._current: int = -1
+        self._reader = None
+        self._loaded: set[int] = set()
         self._loader: _ThumbLoader | None = None
+        self._loader_gen: int = 0
+
+        # Debounce scroll → load so fast scrubbing doesn't spawn a thread per pixel.
+        self._load_timer = QTimer(self)
+        self._load_timer.setSingleShot(True)
+        self._load_timer.setInterval(60)
+        self._load_timer.timeout.connect(self._load_visible)
+        self.horizontalScrollBar().valueChanged.connect(self._load_timer.start)
 
     def load_comic(self, reader) -> None:
-        self._stop_loader()
+        self.stop()
+        self._reader = reader
+        self._loaded.clear()
 
         # Clear existing cells (all items except the trailing stretch)
         while self._row.count() > 1:
@@ -478,9 +536,8 @@ class ThumbnailStrip(QScrollArea):
             self._row.insertWidget(i, cell)
             self._cells.append(cell)
 
-        self._loader = _ThumbLoader(reader, page_count)
-        self._loader.image_ready.connect(self._on_image_ready)
-        self._loader.start()
+        # Cells aren't laid out yet — defer the first visible-range load.
+        QTimer.singleShot(50, self._load_visible)
 
     def set_current(self, page_index: int) -> None:
         if self._current == page_index:
@@ -491,13 +548,40 @@ class ThumbnailStrip(QScrollArea):
         if 0 <= page_index < len(self._cells):
             self._cells[page_index].set_selected(True)
             self.ensureWidgetVisible(self._cells[page_index])
+            self._load_timer.start()
 
-    def _on_image_ready(self, index: int, image: QImage) -> None:
+    def _load_visible(self) -> None:
+        if not self._reader or not self._cells:
+            return
+        sx = self.horizontalScrollBar().value()
+        vw = self.viewport().width()
+        buf = 200  # px of look-ahead on each side
+        lo, hi = sx - buf, sx + vw + buf
+        want = [
+            i for i, c in enumerate(self._cells)
+            if i not in self._loaded and c.x() <= hi and c.x() + c.width() >= lo
+        ]
+        if not want:
+            return
+        self._stop_loader()
+        self._loader_gen += 1
+        self._loader = _ThumbLoader(self._reader, want, self._loader_gen)
+        self._loader.image_ready.connect(self._on_image_ready)
+        self._loader.start()
+
+    def _on_image_ready(self, gen: int, index: int, image: QImage) -> None:
+        if gen != self._loader_gen:
+            return  # stale result — discard
         if 0 <= index < len(self._cells):
             self._cells[index].setPixmap(QPixmap.fromImage(image))
+            self._loaded.add(index)
 
     def _stop_loader(self) -> None:
         if self._loader and self._loader.isRunning():
             self._loader.abort()
             self._loader.wait()
         self._loader = None
+
+    def stop(self) -> None:
+        """Stop the background loader — call before the bound reader is closed."""
+        self._stop_loader()

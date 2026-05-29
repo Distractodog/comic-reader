@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
 
-_BUFFER_PX = 800  # pixels above/below viewport to keep loaded
+_BUFFER_PX = 600     # pixels above/below viewport to preload
+_RETAIN_RADIUS = 10  # keep full-res images within ±N pages of the current page
 
 
 class _PageLoader(QThread):
-    """Loads a range of pages in priority order, emitting each as a QImage."""
+    """Loads a list of pages in order, emitting each as a raw QImage (no scaling)."""
 
-    image_ready = pyqtSignal(int, QImage)
+    image_ready = pyqtSignal(int, int, QImage)  # gen, page_index, image
 
-    def __init__(self, reader, indices: list[int], parent=None):
+    def __init__(self, reader, indices: list[int], gen: int, parent=None):
         super().__init__(parent)
         self._reader = reader
         self._indices = indices
+        self._gen = gen
         self._abort = False
 
     def abort(self) -> None:
@@ -32,7 +34,7 @@ class _PageLoader(QThread):
                 img = QImage()
                 img.loadFromData(data)
                 if not img.isNull():
-                    self.image_ready.emit(idx, img)
+                    self.image_ready.emit(self._gen, idx, img)
             except Exception:
                 pass
 
@@ -41,6 +43,7 @@ class WebtoonViewer(QScrollArea):
     """Vertically scrolling viewer that loads pages lazily as the user scrolls."""
 
     page_changed = pyqtSignal(int)  # current page at viewport center
+    mouse_moved = pyqtSignal(int)   # viewport y — for fullscreen bar reveal
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -48,6 +51,11 @@ class WebtoonViewer(QScrollArea):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setStyleSheet("background-color: #000000; border: none;")
         self.setWidgetResizable(True)
+
+        self.viewport().setMouseTracking(True)
+        self.viewport().installEventFilter(self)
+
+        self._width_fraction: float = 1.0
 
         self._content = QWidget()
         self._content.setStyleSheet("background-color: #000000;")
@@ -57,38 +65,58 @@ class WebtoonViewer(QScrollArea):
         self.setWidget(self._content)
 
         self._labels: list[QLabel] = []
-        self._originals: dict[int, QImage] = {}  # original images for rescaling
+        self._originals: dict[int, QImage] = {}
         self._loaded: set[int] = set()
         self._reader = None
         self._page_count = 0
         self._current_page = 0
         self._last_emitted = -1
-        self._loader: _PageLoader | None = None
 
-        self._save_timer = QTimer(self)
-        self._save_timer.setSingleShot(True)
-        self._save_timer.setInterval(1500)
+        # Generation counter: stale loader signals are dropped without blocking
+        self._loader: _PageLoader | None = None
+        self._loader_gen: int = 0
+
+        # Debounce scroll → load so we don't spawn a thread on every pixel
+        self._load_timer = QTimer(self)
+        self._load_timer.setSingleShot(True)
+        self._load_timer.setInterval(80)
+        self._load_timer.timeout.connect(self._load_visible)
+
+        # Debounce resize → re-render
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(150)
+        self._resize_timer.timeout.connect(self._rerender_all)
 
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
+    # ----- Event filter for mouse tracking -----
+
+    def eventFilter(self, obj, event):
+        if obj is self.viewport() and event.type() == QEvent.Type.MouseMove:
+            self.mouse_moved.emit(int(event.position().y()))
+        return super().eventFilter(obj, event)
+
     # ----- Public API -----
 
+    def set_width_fraction(self, fraction: float) -> None:
+        self._width_fraction = max(0.3, min(1.0, fraction))
+        self._rerender_all()
+
     def load_comic(self, reader, start_page: int = 0) -> None:
-        self._stop_loader()
+        self._abort_loader()
         self._reader = reader
         self._page_count = reader.page_count()
         self._loaded.clear()
         self._originals.clear()
         self._last_emitted = -1
 
-        # Remove old labels
         while self._layout.count():
             item = self._layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
         self._labels.clear()
 
-        # Create placeholder labels for each page
         for _ in range(self._page_count):
             lbl = QLabel()
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -97,7 +125,6 @@ class WebtoonViewer(QScrollArea):
             self._layout.addWidget(lbl)
             self._labels.append(lbl)
 
-        # Scroll to start page after layout settles, then load visible pages
         if start_page > 0:
             QTimer.singleShot(120, lambda: self._scroll_to(start_page))
         else:
@@ -118,7 +145,7 @@ class WebtoonViewer(QScrollArea):
 
     def _on_scroll(self) -> None:
         self._update_current_page()
-        self._load_visible()
+        self._load_timer.start()
 
     def _update_current_page(self) -> None:
         if not self._labels:
@@ -126,7 +153,7 @@ class WebtoonViewer(QScrollArea):
         vp_center = self.verticalScrollBar().value() + self.viewport().height() // 2
         best = 0
         for i, lbl in enumerate(self._labels):
-            lbl_center = lbl.mapTo(self._content, lbl.rect().center()).y()
+            lbl_center = lbl.y() + lbl.height() // 2
             if lbl_center <= vp_center:
                 best = i
         if best != self._last_emitted:
@@ -134,25 +161,41 @@ class WebtoonViewer(QScrollArea):
             self._last_emitted = best
             self.page_changed.emit(best)
 
+    def _current_display_w(self) -> int:
+        return max(1, int(self.viewport().width() * self._width_fraction))
+
+    def _evict_far(self) -> None:
+        """Drop full-resolution images for pages far from the current page so memory
+        stays bounded on long comics. The label keeps its fixed height (so scroll
+        position is preserved) and the page is reloaded if scrolled back into view."""
+        if len(self._loaded) <= 2 * _RETAIN_RADIUS:
+            return
+        cur = self._current_page
+        for idx in list(self._loaded):
+            if abs(idx - cur) > _RETAIN_RADIUS:
+                self._originals.pop(idx, None)
+                self._loaded.discard(idx)
+                if 0 <= idx < len(self._labels):
+                    self._labels[idx].clear()
+
     def _load_visible(self) -> None:
         if not self._reader or not self._labels:
             return
+        self._evict_far()
         scroll_top = self.verticalScrollBar().value()
         scroll_bot = scroll_top + self.viewport().height()
         load_top = scroll_top - _BUFFER_PX
         load_bot = scroll_bot + _BUFFER_PX
 
-        # Collect pages that need loading, in viewport-priority order
         near: list[int] = []
         far: list[int] = []
         for i, lbl in enumerate(self._labels):
             if i in self._loaded:
                 continue
-            lbl_top = lbl.mapTo(self._content, lbl.rect().topLeft()).y()
-            lbl_bot = lbl_top + lbl.height()
-            if lbl_bot >= load_top and lbl_top <= load_bot:
-                # Prioritise: in-viewport first, then buffer zone
-                if lbl_bot >= scroll_top and lbl_top <= scroll_bot:
+            top = lbl.y()
+            bot = top + lbl.height()
+            if bot >= load_top and top <= load_bot:
+                if bot >= scroll_top and top <= scroll_bot:
                     near.append(i)
                 else:
                     far.append(i)
@@ -161,12 +204,16 @@ class WebtoonViewer(QScrollArea):
         if not to_load:
             return
 
-        self._stop_loader()
-        self._loader = _PageLoader(self._reader, to_load)
+        self._abort_loader()
+        self._loader_gen += 1
+        gen = self._loader_gen
+        self._loader = _PageLoader(self._reader, to_load, gen)
         self._loader.image_ready.connect(self._on_image_ready)
         self._loader.start()
 
-    def _on_image_ready(self, index: int, image: QImage) -> None:
+    def _on_image_ready(self, gen: int, index: int, image: QImage) -> None:
+        if gen != self._loader_gen:
+            return  # stale result — discard
         if index < 0 or index >= len(self._labels):
             return
         self._originals[index] = image
@@ -177,31 +224,22 @@ class WebtoonViewer(QScrollArea):
         img = self._originals.get(index)
         if img is None:
             return
-        w = self.viewport().width()
-        if w <= 0:
-            return
-        scaled = img.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
+        display_w = self._current_display_w()
+        # FastTransformation is ~50x quicker than Smooth and fine for comic viewing
+        scaled = img.scaledToWidth(display_w, Qt.TransformationMode.FastTransformation)
         lbl = self._labels[index]
         lbl.setPixmap(QPixmap.fromImage(scaled))
         lbl.setFixedHeight(scaled.height())
 
-    def _stop_loader(self) -> None:
+    def _rerender_all(self) -> None:
+        for i in list(self._loaded):
+            self._render(i)
+
+    def _abort_loader(self) -> None:
         if self._loader and self._loader.isRunning():
             self._loader.abort()
-            self._loader.wait()
         self._loader = None
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # Re-render all loaded pages at new width
-        w = self.viewport().width()
-        if w <= 0:
-            return
-        for i in list(self._loaded):
-            img = self._originals.get(i)
-            if img is None:
-                continue
-            scaled = img.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
-            lbl = self._labels[i]
-            lbl.setPixmap(QPixmap.fromImage(scaled))
-            lbl.setFixedHeight(scaled.height())
+        self._resize_timer.start()

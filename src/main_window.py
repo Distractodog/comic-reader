@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, QSettings, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPropertyAnimation, QSettings, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -354,6 +354,7 @@ class MainWindow(QMainWindow):
         self._spread_mode: bool = False
         self._webtoon_mode: bool = False
         self._is_manga: bool = False
+        self._webtoon_width_pct: int = 100  # 100 / 80 / 60
 
         # Page cache + preloader
         self._cache: PageCache = PageCache()
@@ -396,11 +397,6 @@ class MainWindow(QMainWindow):
         self._reader_bar_anim.finished.connect(self._on_reader_bar_anim_finished)
         self._reader_bar_should_hide = False
         self._reader_bar_target_visible = False
-
-        self._bar_timer = QTimer(self)
-        self._bar_timer.setSingleShot(True)
-        self._bar_timer.setInterval(2500)
-        self._bar_timer.timeout.connect(self._hide_reader_bar_fullscreen)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -451,6 +447,7 @@ class MainWindow(QMainWindow):
         self._reader_bar.menu_requested.connect(self._show_reader_menu)
         self._thumb_strip.page_selected.connect(self.seek_to_page)
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
+        self._webtoon_viewer.mouse_moved.connect(self._on_viewer_mouse_y)
 
         self._build_menus()
 
@@ -609,7 +606,6 @@ class MainWindow(QMainWindow):
 
         def do_switch():
             self._hide_reader_bar(animated=False)
-            self._bar_timer.stop()
             self._seek_bar.setVisible(False)
             self._thumb_strip.setVisible(False)
             self._bookshelf.refresh()
@@ -653,6 +649,15 @@ class MainWindow(QMainWindow):
         thumb_act.setChecked(self._thumb_strip.isVisible())
         thumb_act.triggered.connect(self._toggle_thumb_strip)
 
+        if self._webtoon_mode:
+            menu.addSeparator()
+            width_menu = menu.addMenu("Webtoon width")
+            for pct in (100, 80, 60):
+                act = width_menu.addAction(f"{pct}%")
+                act.setCheckable(True)
+                act.setChecked(self._webtoon_width_pct == pct)
+                act.triggered.connect(lambda checked, p=pct: self._set_webtoon_width(p))
+
         menu.exec(self._reader_bar.menu_btn_global_pos())
 
     # ----- Toggle handlers -----
@@ -689,6 +694,7 @@ class MainWindow(QMainWindow):
             self._spread_mode = False
             self._stop_preloader()
             self._seek_bar.set_page_count(self._reader.page_count())
+            self._webtoon_viewer.set_width_fraction(self._webtoon_width_pct / 100)
             self._webtoon_viewer.load_comic(self._reader, self._current_page)
             self._stack.setCurrentIndex(2)
         else:
@@ -698,6 +704,10 @@ class MainWindow(QMainWindow):
             self._preloader.start()
             self._stack.setCurrentIndex(1)
             self._show_current_page(direction=0)
+
+    def _set_webtoon_width(self, pct: int) -> None:
+        self._webtoon_width_pct = pct
+        self._webtoon_viewer.set_width_fraction(pct / 100)
 
     def _toggle_thumb_strip(self) -> None:
         if self._thumb_strip.isVisible():
@@ -783,7 +793,7 @@ class MainWindow(QMainWindow):
             self._build_menus()
 
     def _on_escape(self):
-        if self._stack.currentIndex() == 1:
+        if self._stack.currentIndex() in (1, 2):  # single or webtoon viewer
             self._back_to_library()
         elif self.isFullScreen():
             self._toggle_fullscreen()
@@ -822,6 +832,10 @@ class MainWindow(QMainWindow):
 
     def load_file(self, path: str):
         try:
+            # Stop any background threads bound to the previous reader before
+            # closing it, so they can't read from a closed handle.
+            self._stop_preloader()
+            self._thumb_strip.stop()
             if self._reader:
                 self._reader.close()
             self._reader = open_comic(path)
@@ -874,6 +888,7 @@ class MainWindow(QMainWindow):
         page_count = self._reader.page_count()
         if self._webtoon_mode:
             self._seek_bar.set_page_count(page_count)
+            self._webtoon_viewer.set_width_fraction(self._webtoon_width_pct / 100)
             self._webtoon_viewer.load_comic(self._reader, self._current_page)
             target_index = 2
         else:
@@ -998,20 +1013,21 @@ class MainWindow(QMainWindow):
     def _toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
-            if self._stack.currentIndex() == 1:
+            if self._stack.currentIndex() in (1, 2):
                 self._show_reader_bar(animated=False)
-                self._bar_timer.stop()
         else:
             self.showFullScreen()
             self._hide_reader_bar(animated=True)
 
     def _on_viewer_mouse_y(self, y: int):
-        if self.isFullScreen() and y < 60:
+        # Windowed mode always shows the bar. In fullscreen it's hidden for immersive
+        # reading but reveals when the cursor moves to the top edge, and hides again
+        # when the cursor moves away — otherwise there's no way to reach the menu/back.
+        if not self.isFullScreen():
+            return
+        if y < 60:
             self._show_reader_bar(animated=True)
-            self._bar_timer.start()
-
-    def _hide_reader_bar_fullscreen(self):
-        if self.isFullScreen():
+        elif y > _ReaderBar.HEIGHT + 60:
             self._hide_reader_bar(animated=True)
 
     def _show_reader_bar(self, animated: bool):

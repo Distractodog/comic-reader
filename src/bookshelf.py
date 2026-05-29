@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtCore import Qt, QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QComboBox,
     QGraphicsOpacityEffect,
@@ -39,6 +39,40 @@ _PROGRESS_FILL = QColor("#8b2a2a")
 _PLACEHOLDER_FG = QColor("#b0a0a0")
 
 
+class _CoverLoader(QThread):
+    """Decodes and scales cover images off the UI thread, emitting each as it's ready.
+
+    QPixmap can't be created off the GUI thread, so the worker emits a QImage and
+    the main thread converts it. A generation counter lets stale results (from a
+    grid that's already been rebuilt) be dropped cheaply.
+    """
+
+    cover_ready = pyqtSignal(int, int, QImage)  # gen, tile_index, scaled image
+
+    def __init__(self, jobs: list[tuple[int, str]], gen: int, parent=None):
+        super().__init__(parent)
+        self._jobs = jobs
+        self._gen = gen
+        self._abort = False
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self):
+        for index, path in self._jobs:
+            if self._abort:
+                return
+            img = QImage(path)
+            if img.isNull():
+                continue
+            scaled = img.scaled(
+                TILE_W, COVER_H,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.cover_ready.emit(self._gen, index, scaled)
+
+
 class _Tile(QWidget):
     """Shared base for FolderTile and ComicTile."""
 
@@ -47,19 +81,15 @@ class _Tile(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
+        self.cover_path: str | None = None
         self._hovered = False
         self.setFixedSize(TILE_W, TILE_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def _load_pixmap(self, path: str | None) -> None:
-        if path and Path(path).exists():
-            px = QPixmap(path)
-            if not px.isNull():
-                self._pixmap = px.scaled(
-                    TILE_W, COVER_H,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
+    def apply_cover(self, pixmap: QPixmap) -> None:
+        """Set the (already-scaled) cover pixmap — called from the cover loader slot."""
+        self._pixmap = pixmap
+        self.update()
 
     def _draw_cover(self, painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -133,7 +163,7 @@ class FolderTile(_Tile):
     def __init__(self, folder: Folder, parent=None):
         super().__init__(parent)
         self._folder = folder
-        self._load_pixmap(folder.cover_path)
+        self.cover_path = folder.cover_path
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -162,7 +192,7 @@ class ComicTile(_Tile):
         super().__init__(parent)
         self._comic = comic
         self._selected = selected
-        self._load_pixmap(comic.cover_path)
+        self.cover_path = comic.cover_path
 
     def set_selected(self, selected: bool):
         self._selected = selected
@@ -225,7 +255,7 @@ class SeriesTile(_Tile):
     def __init__(self, series: Series, parent=None):
         super().__init__(parent)
         self._series = series
-        self._load_pixmap(series.cover_path)
+        self.cover_path = series.cover_path
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -428,6 +458,11 @@ class BookshelfView(QWidget):
 
         self._selected_ids: set[int] = set()
         self._comic_tiles: dict[int, ComicTile] = {}
+
+        # Async cover loading — tiles render placeholders, covers fill in off-thread.
+        self._ordered_tiles: list[_Tile] = []
+        self._cover_loader: _CoverLoader | None = None
+        self._cover_gen: int = 0
 
         self._sort_by = "title"
         self._sort_order = "asc"
@@ -689,6 +724,8 @@ class BookshelfView(QWidget):
         layout.setSpacing(0)
 
         self._comic_tiles.clear()
+        self._stop_cover_loader()
+        self._ordered_tiles = []
 
         if self._search_query:
             folders, comics = self._library.search_library(
@@ -765,12 +802,40 @@ class BookshelfView(QWidget):
                 tile.shelf_action_requested.connect(self._on_comic_context_menu)
                 self._comic_tiles[item.id] = tile
 
+            self._ordered_tiles.append(tile)
             row_layout.addWidget(tile)
 
         if row_layout is not None:
             row_layout.addStretch()
 
         layout.addStretch()
+
+        self._start_cover_loader()
+
+    def _start_cover_loader(self):
+        jobs = [
+            (i, tile.cover_path)
+            for i, tile in enumerate(self._ordered_tiles)
+            if tile.cover_path
+        ]
+        if not jobs:
+            return
+        self._cover_gen += 1
+        self._cover_loader = _CoverLoader(jobs, self._cover_gen, self)
+        self._cover_loader.cover_ready.connect(self._on_cover_ready)
+        self._cover_loader.start()
+
+    def _on_cover_ready(self, gen: int, index: int, image: QImage):
+        if gen != self._cover_gen:
+            return  # stale — grid was rebuilt
+        if 0 <= index < len(self._ordered_tiles):
+            self._ordered_tiles[index].apply_cover(QPixmap.fromImage(image))
+
+    def _stop_cover_loader(self):
+        if self._cover_loader and self._cover_loader.isRunning():
+            self._cover_loader.abort()
+            self._cover_loader.wait()
+        self._cover_loader = None
 
     def _on_comic_context_menu(self, comic_id: int, gx: int, gy: int):
         is_multi = comic_id in self._selected_ids and len(self._selected_ids) > 1
