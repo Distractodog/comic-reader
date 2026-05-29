@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build App Artifacts
 
 on:
   push:
@@ -7,7 +7,23 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: ComicReader-Windows
+            binary_name: ComicReader-Windows
+            artifact_path: dist/ComicReader-Windows.exe
+          - os: macos-latest
+            artifact_name: ComicReader-macOS
+            binary_name: ComicReader-macOS
+            artifact_path: dist/ComicReader-macOS
+          - os: ubuntu-latest
+            artifact_name: ComicReader-Linux
+            binary_name: ComicReader-Linux
+            artifact_path: dist/ComicReader-Linux
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout code
@@ -18,24 +34,47 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install Linux Qt runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
+
+      - name: Install Windows unrar helper
+        if: runner.os == 'Windows'
+        run: |
+          choco install unrar -y
+          $unrar = Get-ChildItem "C:\Program Files", "C:\ProgramData\chocolatey" -Recurse -Filter unrar.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($unrar) {
+            "COMIC_READER_UNRAR=$($unrar.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build EXE with PyInstaller
+      - name: Build with PyInstaller
+        env:
+          COMIC_READER_BINARY_NAME: ${{ matrix.binary_name }}
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name ComicReader src/main.py
+          pyinstaller --noconfirm ComicReader.spec
 
-      - name: Upload EXE artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ComicReader-Windows
-          path: dist/ComicReader.exe
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
 
-      - name: Create Release (on tag)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Create Windows Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/ComicReader.exe
+          files: ${{ matrix.artifact_path }}
+
+      - name: Create macOS/Linux Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os != 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact_path }}

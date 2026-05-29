@@ -10,13 +10,19 @@ from main_window import MainWindow
 from themes import DARK, app_stylesheet
 
 
+def resource_path(relative: str) -> Path:
+    """Return a source/dev or PyInstaller onefile resource path."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / relative
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Comic Reader")
     app.setOrganizationName("ComicReader")
     app.setStyle("Fusion")
 
-    fonts_dir = Path(__file__).parent / "fonts"
+    fonts_dir = resource_path("fonts")
     for ttf in fonts_dir.glob("*.ttf"):
         QFontDatabase.addApplicationFont(str(ttf))
 

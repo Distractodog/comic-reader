@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -890,8 +891,256 @@ class Library:
         ).fetchall()
         return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
 
+    # ----- Library export / import -----
+
+    def get_source_folders(self) -> list[str]:
+        """Return distinct library roots that were added through the scanner."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT source_folder FROM comics"
+            " WHERE source_folder IS NOT NULL AND source_folder != ''"
+            " ORDER BY source_folder COLLATE NOCASE"
+        ).fetchall()
+        return [r["source_folder"] for r in rows]
+
+    def export_to_json(self, output_path: str | Path) -> dict:
+        """Write a portable JSON snapshot of library metadata."""
+        payload = {
+            "format": "comic-reader-library",
+            "version": 1,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "source_folders": self.get_source_folders(),
+            "comics": [],
+            "shelves": [],
+            "folder_covers": [],
+        }
+
+        comics = self._conn.execute("SELECT * FROM comics ORDER BY file_path").fetchall()
+        for row in comics:
+            comic_id = row["id"]
+            payload["comics"].append({
+                "file_path": row["file_path"],
+                "content_hash": row["content_hash"],
+                "title": row["title"],
+                "series": row["series"],
+                "series_number": row["series_number"],
+                "author": row["author"],
+                "publisher": row["publisher"],
+                "year": row["year"],
+                "page_count": row["page_count"],
+                "file_size": row["file_size"],
+                "cover_path": row["cover_path"],
+                "date_added": row["date_added"],
+                "last_read": row["last_read"],
+                "current_page": row["current_page"],
+                "read_status": row["read_status"],
+                "source_folder": row["source_folder"],
+                "parent_dir": row["parent_dir"],
+                "is_manga": bool(row["is_manga"]),
+                "reading_mode": row["reading_mode"],
+                "hidden": bool(row["hidden"]),
+                "tags": self.get_tags_for_comic(comic_id),
+                "bookmarks": [
+                    {
+                        "page_index": b.page_index,
+                        "label": b.label,
+                        "created_at": b.created_at,
+                    }
+                    for b in self.get_bookmarks(comic_id)
+                ],
+            })
+
+        shelves = self._conn.execute(
+            "SELECT * FROM shelves WHERE kind = 'manual' ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        for shelf in shelves:
+            members = self._conn.execute(
+                "SELECT c.file_path FROM comics c"
+                " JOIN comic_shelves cs ON c.id = cs.comic_id"
+                " WHERE cs.shelf_id = ? ORDER BY cs.position, c.file_path",
+                (shelf["id"],),
+            ).fetchall()
+            payload["shelves"].append({
+                "name": shelf["name"],
+                "sort_order": shelf["sort_order"],
+                "created_at": shelf["created_at"],
+                "comic_paths": [m["file_path"] for m in members],
+            })
+
+        folder_covers = self._conn.execute(
+            "SELECT folder_path, cover_path FROM folder_covers ORDER BY folder_path"
+        ).fetchall()
+        payload["folder_covers"] = [
+            {"folder_path": r["folder_path"], "cover_path": r["cover_path"]}
+            for r in folder_covers
+        ]
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return {
+            "comics": len(payload["comics"]),
+            "shelves": len(payload["shelves"]),
+            "folder_covers": len(payload["folder_covers"]),
+        }
+
+    def import_from_json(self, input_path: str | Path) -> dict:
+        """Merge a library JSON export into the current database by file path."""
+        payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
+        if payload.get("format") != "comic-reader-library":
+            raise ValueError("This is not a Comic Reader library export.")
+
+        stats = {
+            "comics_added": 0,
+            "comics_updated": 0,
+            "shelves": 0,
+            "folder_covers": 0,
+        }
+        path_to_id: dict[str, int] = {}
+
+        with self.transaction() as cur:
+            for item in payload.get("comics", []):
+                file_path = item.get("file_path")
+                if not file_path:
+                    continue
+                existing = cur.execute(
+                    "SELECT id FROM comics WHERE file_path = ?", (file_path,)
+                ).fetchone()
+                values = (
+                    item.get("content_hash"),
+                    item.get("title"),
+                    item.get("series"),
+                    item.get("series_number"),
+                    item.get("author"),
+                    item.get("publisher"),
+                    item.get("year"),
+                    item.get("page_count") or 0,
+                    item.get("file_size") or 0,
+                    item.get("cover_path"),
+                    item.get("date_added") or datetime.now(timezone.utc).isoformat(),
+                    item.get("last_read"),
+                    item.get("current_page") or 0,
+                    item.get("read_status") or "unread",
+                    item.get("source_folder"),
+                    item.get("parent_dir") or _parent_dir(file_path),
+                    1 if item.get("is_manga") else 0,
+                    item.get("reading_mode") or "single",
+                    1 if item.get("hidden") else 0,
+                )
+                if existing:
+                    comic_id = existing["id"]
+                    cur.execute(
+                        """
+                        UPDATE comics
+                        SET content_hash = ?, title = ?, series = ?, series_number = ?,
+                            author = ?, publisher = ?, year = ?, page_count = ?,
+                            file_size = ?, cover_path = ?, date_added = ?, last_read = ?,
+                            current_page = ?, read_status = ?, source_folder = ?,
+                            parent_dir = ?, is_manga = ?, reading_mode = ?, hidden = ?
+                        WHERE id = ?
+                        """,
+                        values + (comic_id,),
+                    )
+                    stats["comics_updated"] += 1
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO comics
+                            (content_hash, title, series, series_number, author,
+                             publisher, year, page_count, file_size, cover_path,
+                             date_added, last_read, current_page, read_status,
+                             source_folder, parent_dir, is_manga, reading_mode,
+                             hidden, file_path)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        values + (file_path,),
+                    )
+                    comic_id = cur.lastrowid
+                    stats["comics_added"] += 1
+                path_to_id[file_path] = comic_id
+
+                cur.execute("DELETE FROM comic_tags WHERE comic_id = ?", (comic_id,))
+                for tag in item.get("tags", []):
+                    name = str(tag).strip()
+                    if not name:
+                        continue
+                    cur.execute("INSERT OR IGNORE INTO tags (name) VALUES (?)", (name,))
+                    tag_row = cur.execute(
+                        "SELECT id FROM tags WHERE name = ? COLLATE NOCASE", (name,)
+                    ).fetchone()
+                    cur.execute(
+                        "INSERT OR IGNORE INTO comic_tags (comic_id, tag_id) VALUES (?, ?)",
+                        (comic_id, tag_row["id"]),
+                    )
+
+                cur.execute("DELETE FROM bookmarks WHERE comic_id = ?", (comic_id,))
+                for bm in item.get("bookmarks", []):
+                    cur.execute(
+                        "INSERT OR IGNORE INTO bookmarks"
+                        " (comic_id, page_index, label, created_at) VALUES (?, ?, ?, ?)",
+                        (
+                            comic_id,
+                            bm.get("page_index") or 0,
+                            bm.get("label"),
+                            bm.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+
+            for shelf in payload.get("shelves", []):
+                name = str(shelf.get("name", "")).strip()
+                if not name:
+                    continue
+                row = cur.execute(
+                    "SELECT id FROM shelves WHERE name = ? AND kind = 'manual'",
+                    (name,),
+                ).fetchone()
+                if row:
+                    shelf_id = row["id"]
+                else:
+                    cur.execute(
+                        "INSERT INTO shelves (name, kind, sort_order, created_at)"
+                        " VALUES (?, 'manual', ?, ?)",
+                        (
+                            name,
+                            shelf.get("sort_order") or 999,
+                            shelf.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+                    shelf_id = cur.lastrowid
+                stats["shelves"] += 1
+                for position, comic_path in enumerate(shelf.get("comic_paths", [])):
+                    comic_id = path_to_id.get(comic_path)
+                    if comic_id is None:
+                        row = cur.execute(
+                            "SELECT id FROM comics WHERE file_path = ?", (comic_path,)
+                        ).fetchone()
+                        comic_id = row["id"] if row else None
+                    if comic_id is None:
+                        continue
+                    cur.execute(
+                        "INSERT OR REPLACE INTO comic_shelves (comic_id, shelf_id, position)"
+                        " VALUES (?, ?, ?)",
+                        (comic_id, shelf_id, position),
+                    )
+
+            for cover in payload.get("folder_covers", []):
+                folder_path = cover.get("folder_path")
+                cover_path = cover.get("cover_path")
+                if not folder_path or not cover_path:
+                    continue
+                cur.execute(
+                    "INSERT INTO folder_covers (folder_path, cover_path) VALUES (?, ?)"
+                    " ON CONFLICT(folder_path) DO UPDATE SET cover_path = excluded.cover_path",
+                    (folder_path, cover_path),
+                )
+                stats["folder_covers"] += 1
+
+        self._prune_unused_tags()
+        return stats
+
 
 if __name__ == "__main__":
+    import tempfile
+
     # Smoke test — in-memory DB, no real comic files needed.
     lib = Library(db_path=":memory:")
 
@@ -1013,6 +1262,31 @@ if __name__ == "__main__":
     assert next(f for f in lib.get_folders() if f.path == "/comics").cover_path == "/cache/custom.jpg"
     lib.clear_folder_cover("/comics")
     assert lib.get_folder_cover("/comics") is None
+
+    # Export / import merge test
+    lib.set_folder_cover("/comics", "/cache/custom.jpg")
+    lib.set_tags_for_comic(id1, ["classic"])
+    lib.toggle_bookmark(id1, 3, "Opening")
+    shelf_id = lib.create_shelf("Export Shelf")
+    lib.add_comic_to_shelf(id1, shelf_id)
+    with tempfile.TemporaryDirectory() as tmp:
+        export_path = Path(tmp) / "library.json"
+        stats = lib.export_to_json(export_path)
+        assert stats["comics"] == 2
+
+        imported = Library(db_path=":memory:")
+        import_stats = imported.import_from_json(export_path)
+        assert import_stats["comics_added"] == 2
+        imported_comic = imported.get_comic("/comics/batman.cbz")
+        assert imported_comic is not None
+        assert imported.get_tags_for_comic(imported_comic.id) == ["classic"]
+        assert len(imported.get_bookmarks(imported_comic.id)) == 1
+        assert any(s.name == "Export Shelf" for s in imported.get_shelves())
+        assert imported.get_folder_cover("/comics") == "/cache/custom.jpg"
+        import_stats = imported.import_from_json(export_path)
+        assert import_stats["comics_added"] == 0
+        assert import_stats["comics_updated"] == 2
+        imported.close()
 
     lib.close()
     print("library.py smoke test: OK")

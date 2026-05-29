@@ -339,12 +339,13 @@ class _Sidebar(QWidget):
         self._build_list()
 
 SUPPORTED_FILTERS = [
-    "Comic files (*.cbz *.cbr *.cb7 *.cbt *.pdf *.zip *.rar *.7z *.tar)",
+    "Comic files (*.cbz *.cbr *.cb7 *.cbt *.pdf *.epub *.zip *.rar *.7z *.tar)",
     "CBZ files (*.cbz *.zip)",
     "CBR files (*.cbr *.rar)",
     "CB7 files (*.cb7 *.7z)",
     "CBT files (*.cbt *.tar)",
     "PDF files (*.pdf)",
+    "EPUB files (*.epub)",
     "All files (*)",
 ]
 
@@ -363,6 +364,8 @@ class MainWindow(QMainWindow):
         self._scan_thread: QThread | None = None
         self._scanner: LibraryScanner | None = None
         self._scan_progress: QProgressDialog | None = None
+        self._scan_queue: list[str] = []
+        self._scan_totals = {"added": 0, "skipped": 0, "errors": [], "cancelled": False}
 
         # Reading-mode state (spread is session-only; webtoon + manga persist per-comic)
         self._spread_mode: bool = False
@@ -585,6 +588,22 @@ class MainWindow(QMainWindow):
         self._add_folder_action.setShortcut("Ctrl+L")
         self._add_folder_action.triggered.connect(self.add_folder_to_library)
         library_menu.addAction(self._add_folder_action)
+
+        rescan_all_action = QAction("&Rescan All Library Folders", self)
+        rescan_all_action.triggered.connect(self.rescan_all_folders)
+        library_menu.addAction(rescan_all_action)
+
+        library_menu.addSeparator()
+
+        export_action = QAction("&Export Library...", self)
+        export_action.triggered.connect(self.export_library)
+        library_menu.addAction(export_action)
+
+        import_action = QAction("&Import Library...", self)
+        import_action.triggered.connect(self.import_library)
+        library_menu.addAction(import_action)
+
+        library_menu.addSeparator()
 
         back_action = QAction("← &Back to Library", self)
         back_action.setShortcuts(_shortcuts("back_to_library"))
@@ -1160,6 +1179,79 @@ class MainWindow(QMainWindow):
     def rescan_folder(self, folder_path: str):
         self._start_scan(folder_path)
 
+    def rescan_all_folders(self):
+        folders = self._library.get_source_folders()
+        if not folders:
+            QMessageBox.information(
+                self,
+                "No Library Folders",
+                "No scanned library folders are saved yet.",
+            )
+            return
+        self._scan_queue = folders[1:]
+        self._scan_totals = {"added": 0, "skipped": 0, "errors": [], "cancelled": False}
+        self._start_scan(folders[0])
+
+    def export_library(self):
+        last_dir = self._settings.value("last_export_dir", str(Path.home()))
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Library",
+            str(Path(last_dir) / "comic-reader-library.json"),
+            "JSON files (*.json)",
+        )
+        if not path:
+            return
+        self._settings.setValue("last_export_dir", str(Path(path).parent))
+        try:
+            stats = self._library.export_to_json(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Could not export library:\n{e}")
+            return
+        QMessageBox.information(
+            self,
+            "Export Complete",
+            f"Library exported.\n\n"
+            f"Comics: {stats['comics']}\n"
+            f"Shelves: {stats['shelves']}\n"
+            f"Folder covers: {stats['folder_covers']}",
+        )
+
+    def import_library(self):
+        last_dir = self._settings.value("last_export_dir", str(Path.home()))
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Library",
+            last_dir,
+            "JSON files (*.json)",
+        )
+        if not path:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Import Library",
+            "Import this library export? Existing entries with the same file path will be updated.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            stats = self._library.import_from_json(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Failed", f"Could not import library:\n{e}")
+            return
+        self._sidebar.refresh_shelves()
+        self._bookshelf.refresh()
+        QMessageBox.information(
+            self,
+            "Import Complete",
+            f"Library import complete.\n\n"
+            f"Comics added: {stats['comics_added']}\n"
+            f"Comics updated: {stats['comics_updated']}\n"
+            f"Shelves merged: {stats['shelves']}\n"
+            f"Folder covers: {stats['folder_covers']}",
+        )
+
     def _start_scan(self, folder: str):
         if self._scan_thread and self._scan_thread.isRunning():
             return
@@ -1198,6 +1290,21 @@ class MainWindow(QMainWindow):
         if self._scan_progress:
             self._scan_progress.close()
         self._cleanup_scan()
+        if self._scan_queue or self._scan_totals["added"] or self._scan_totals["skipped"] or self._scan_totals["errors"]:
+            self._scan_totals["added"] += result.added
+            self._scan_totals["skipped"] += result.skipped
+            self._scan_totals["errors"].extend(result.errors)
+            self._scan_totals["cancelled"] = self._scan_totals["cancelled"] or result.cancelled
+            if self._scan_queue and not result.cancelled:
+                next_folder = self._scan_queue.pop(0)
+                self._start_scan(next_folder)
+                return
+            self._scan_queue.clear()
+            result.added = self._scan_totals["added"]
+            result.skipped = self._scan_totals["skipped"]
+            result.errors = self._scan_totals["errors"]
+            result.cancelled = self._scan_totals["cancelled"]
+            self._scan_totals = {"added": 0, "skipped": 0, "errors": [], "cancelled": False}
         self._bookshelf.refresh()
 
         msg = QMessageBox(self)

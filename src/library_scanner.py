@@ -13,7 +13,7 @@ from library import Library
 from thumbnails import generate_thumbnail, thumbnail_path_for
 
 SCANNABLE_EXTENSIONS = {
-    ".cbz", ".cbr", ".cb7", ".cbt", ".pdf",
+    ".cbz", ".cbr", ".cb7", ".cbt", ".pdf", ".epub",
     ".zip", ".rar", ".7z", ".tar",
 }
 

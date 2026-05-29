@@ -23,10 +23,11 @@ A standalone Windows desktop comic book reader app. Single-window app that opens
   - `.cb7` / `.7z` → `py7zr` (pure Python, v1.x API — use `extractall()` not `read()`)
   - `.cbt` / `.tar` → `tarfile` (stdlib)
   - `.pdf` → `PyMuPDF` (a.k.a. `fitz`)
+  - `.epub` → image-only EPUB reader via `zipfile` + OPF spine parsing (no text reflow)
   - Loose images in a folder → direct read with `Pillow`-compatible formats
 - **Database:** SQLite via stdlib `sqlite3`, WAL mode, schema versioned via `PRAGMA user_version`
-- **Packaging:** PyInstaller `--onefile --windowed`
-- **CI/CD:** GitHub Actions on `windows-latest`, builds `.exe` on every push to `main`
+- **Packaging:** PyInstaller via `ComicReader.spec` so bundled resources are stable
+- **CI/CD:** GitHub Actions builds Windows, macOS, and Linux PyInstaller artifacts on every push to `main`
 
 ## Project layout
 
@@ -75,7 +76,7 @@ comic-reader/
     ```
 - **Windows build:** push to `main` → GitHub Actions runs → `.exe` appears as workflow artifact. Tag `v1.0.0` etc. to publish a Release.
 
-## Current status (as of 2026-05-27)
+## Current status (as of 2026-05-29)
 
 - Phase 1 complete (items 1–9 + Phase 3 pull-forwards: seek bar, click-zone nav, reader progress bar)
 - Mini-polish pass complete (page slide animation, bookshelf↔reader fade, rounded tiles, typography)
@@ -88,12 +89,27 @@ comic-reader/
   - 16: manual metadata editor (single + multi-select, MetadataDialog)
 - Additional polish: sidebar nav (180px), dark mode locked, theme system, WA_StyledBackground fix, smooth nav transitions on all grid refreshes
 - App launches and runs locally on Mac with the `DYLD_LIBRARY_PATH` workaround
-- Next: Phase 3 (reading experience polish)
+- Phase 3 reading polish substantially underway/partly complete:
+  - seek bar, click-zone nav, reader progress bar
+  - page slide animation, bookshelf↔reader fade
+  - bookmarks, thumbnail strip, spread mode, RTL manga mode, webtoon mode
+  - page preloading and PDF/webtoon performance fixes
+- Pre-Phase-4 user features complete:
+  - hide/restore comics and folders via soft-hide flag
+  - folder cover overrides from comic covers or arbitrary image files
+- Phase 4 started:
+  - library export/import to portable JSON
+  - "Rescan All Library Folders" for folder-sync workflows
+  - image-only EPUB support
+  - README positioning for no limits, local-first, no telemetry, no required cloud
+  - GitHub Actions matrix for Windows/macOS/Linux artifacts
+  - PyInstaller spec includes fonts and can bundle `unrar.exe` on Windows CI
+- Next: push and verify GitHub Actions artifacts; fix any CI-only packaging failures
 
 ## Known issues
 
 - **macOS file dialog greys out comic files.** macOS Tahoe requires UTI registration for `.cbz`, `.cbr`, etc. in the file picker. Drag-and-drop and clicking tiles in the bookshelf both work as workarounds.
-- **CBR on Windows:** `rarfile` needs `unrar.exe`. Not yet bundled in the PyInstaller build.
+- **CBR on Windows:** CI tries to install `unrar` via Chocolatey and bundle `unrar.exe` through `ComicReader.spec`. If Chocolatey changes package paths or availability, CBR support may need a workflow adjustment.
 
 ## Feature roadmap (5 phases, 43 items)
 
