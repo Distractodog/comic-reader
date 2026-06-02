@@ -205,6 +205,22 @@ class ComicViewer(QGraphicsView):
         self._overlay.hide()
         self._overlay_new.hide()
 
+    @property
+    def fit_mode(self) -> FitMode:
+        return self._fit_mode
+
+    @property
+    def zoom_factor(self) -> float:
+        return self._zoom_factor
+
+    def restore_view_state(self, fit_mode: FitMode, zoom: float) -> None:
+        """Restore saved fit mode + zoom without the zoom-reset that set_fit_mode does."""
+        self._fit_mode = fit_mode
+        self._zoom_factor = float(zoom)
+        if self._has_image:
+            self._apply_display_pixmap()
+            self._apply_fit()
+
     def set_fit_mode(self, mode: FitMode):
         self._fit_mode = mode
         self._zoom_factor = 1.0

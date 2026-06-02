@@ -507,17 +507,17 @@ class MainWindow(QMainWindow):
 
         fit_page = QAction("Fit &Page", self)
         fit_page.setShortcuts(_shortcuts("fit_page"))
-        fit_page.triggered.connect(lambda: self.viewer.set_fit_mode(FitMode.FIT_PAGE))
+        fit_page.triggered.connect(lambda: self._set_fit_mode(FitMode.FIT_PAGE))
         view_menu.addAction(fit_page)
 
         fit_width = QAction("Fit &Width", self)
         fit_width.setShortcuts(_shortcuts("fit_width"))
-        fit_width.triggered.connect(lambda: self.viewer.set_fit_mode(FitMode.FIT_WIDTH))
+        fit_width.triggered.connect(lambda: self._set_fit_mode(FitMode.FIT_WIDTH))
         view_menu.addAction(fit_width)
 
         actual = QAction("&Actual Size", self)
         actual.setShortcuts(_shortcuts("actual_size"))
-        actual.triggered.connect(self.viewer.reset_zoom)
+        actual.triggered.connect(lambda: self._set_fit_mode(FitMode.ACTUAL_SIZE))
         view_menu.addAction(actual)
 
         view_menu.addSeparator()
@@ -898,16 +898,25 @@ class MainWindow(QMainWindow):
 
         # Resume to saved page; apply per-comic settings from library
         comic = self._library.get_comic(path)
+        _fit_mode_map = {
+            "actual": FitMode.ACTUAL_SIZE,
+            "width":  FitMode.FIT_WIDTH,
+            "page":   FitMode.FIT_PAGE,
+        }
         if comic is not None:
             self._current_comic_id = comic.id
             self._current_page = comic.current_page if 0 < comic.current_page < self._reader.page_count() else 0
             self._webtoon_mode = comic.reading_mode == "webtoon"
             self._is_manga = comic.is_manga
+            self.viewer.restore_view_state(
+                _fit_mode_map.get(comic.fit_mode, FitMode.FIT_PAGE), comic.zoom
+            )
         else:
             self._current_comic_id = None
             self._current_page = 0
             self._webtoon_mode = False
             self._is_manga = False
+            self.viewer.restore_view_state(FitMode.FIT_PAGE, 1.0)
 
         self.viewer.set_rtl(self._is_manga)
 
@@ -1044,6 +1053,21 @@ class MainWindow(QMainWindow):
     def _save_progress(self):
         if self._current_comic_id is not None:
             self._library.update_progress(self._current_comic_id, self._current_page)
+            self._library.set_zoom(self._current_comic_id, self.viewer.zoom_factor)
+
+    _FIT_MODE_STR = {
+        FitMode.ACTUAL_SIZE: "actual",
+        FitMode.FIT_WIDTH:   "width",
+        FitMode.FIT_PAGE:    "page",
+    }
+
+    def _set_fit_mode(self, mode: FitMode) -> None:
+        """Set viewer fit mode and immediately persist it for the current comic."""
+        self.viewer.set_fit_mode(mode)
+        if self._current_comic_id is not None:
+            self._library.set_fit_mode(
+                self._current_comic_id, self._FIT_MODE_STR.get(mode, "page")
+            )
 
     # ----- Window helpers -----
 
@@ -1128,6 +1152,7 @@ class MainWindow(QMainWindow):
         if self._scan_thread:
             self._scan_thread.quit()
             self._scan_thread.wait()
+        self._save_progress()
         self._settings.setValue("geometry", self.saveGeometry())
         if self._reader:
             self._reader.close()

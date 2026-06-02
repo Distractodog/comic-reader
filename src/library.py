@@ -66,6 +66,8 @@ class Comic:
     is_manga: bool = False
     reading_mode: str = "single"  # 'single' | 'webtoon'
     hidden: bool = False
+    fit_mode: str = "page"        # 'actual' | 'width' | 'page'
+    zoom: float = 1.0
 
 
 def _default_db_path() -> Path:
@@ -106,6 +108,8 @@ def _row_to_comic(row: sqlite3.Row) -> Comic:
         is_manga=bool(row["is_manga"]),
         reading_mode=row["reading_mode"],
         hidden=bool(row["hidden"]),
+        fit_mode=row["fit_mode"],
+        zoom=float(row["zoom"]),
     )
 
 
@@ -212,7 +216,10 @@ CREATE TABLE IF NOT EXISTS folder_covers (
 );
 """
 
-_CURRENT_VERSION = 7
+_SCHEMA_V8_FIT_MODE = "ALTER TABLE comics ADD COLUMN fit_mode TEXT NOT NULL DEFAULT 'page';"
+_SCHEMA_V8_ZOOM     = "ALTER TABLE comics ADD COLUMN zoom REAL NOT NULL DEFAULT 1.0;"
+
+_CURRENT_VERSION = 8
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -290,6 +297,13 @@ class Library:
             )
             self._conn.executescript(_SCHEMA_V7_MIGRATION)
             self._conn.execute("PRAGMA user_version = 7")
+            self._conn.commit()
+            version = 7
+        if version < 8:
+            # Per-comic viewer state: remember fit mode and zoom level.
+            self._conn.execute(_SCHEMA_V8_FIT_MODE)
+            self._conn.execute(_SCHEMA_V8_ZOOM)
+            self._conn.execute("PRAGMA user_version = 8")
             self._conn.commit()
 
     def _seed_smart_shelves(self):
@@ -876,6 +890,20 @@ class Library:
                 (1 if is_manga else 0, comic_id),
             )
 
+    def set_fit_mode(self, comic_id: int, fit_mode: str) -> None:
+        if fit_mode not in ("actual", "width", "page"):
+            raise ValueError(f"Invalid fit_mode: {fit_mode!r}")
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET fit_mode = ? WHERE id = ?", (fit_mode, comic_id)
+            )
+
+    def set_zoom(self, comic_id: int, zoom: float) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET zoom = ? WHERE id = ?", (float(zoom), comic_id)
+            )
+
     def get_comics_with_tag(
         self, tag_name: str, *, sort_by: str = "title", order: str = "asc"
     ) -> list[Comic]:
@@ -938,6 +966,8 @@ class Library:
                 "is_manga": bool(row["is_manga"]),
                 "reading_mode": row["reading_mode"],
                 "hidden": bool(row["hidden"]),
+                "fit_mode": row["fit_mode"],
+                "zoom": float(row["zoom"]),
                 "tags": self.get_tags_for_comic(comic_id),
                 "bookmarks": [
                     {
@@ -1025,6 +1055,8 @@ class Library:
                     1 if item.get("is_manga") else 0,
                     item.get("reading_mode") or "single",
                     1 if item.get("hidden") else 0,
+                    item.get("fit_mode") or "page",
+                    float(item.get("zoom") or 1.0),
                 )
                 if existing:
                     comic_id = existing["id"]
@@ -1035,7 +1067,8 @@ class Library:
                             author = ?, publisher = ?, year = ?, page_count = ?,
                             file_size = ?, cover_path = ?, date_added = ?, last_read = ?,
                             current_page = ?, read_status = ?, source_folder = ?,
-                            parent_dir = ?, is_manga = ?, reading_mode = ?, hidden = ?
+                            parent_dir = ?, is_manga = ?, reading_mode = ?, hidden = ?,
+                            fit_mode = ?, zoom = ?
                         WHERE id = ?
                         """,
                         values + (comic_id,),
@@ -1049,8 +1082,8 @@ class Library:
                              publisher, year, page_count, file_size, cover_path,
                              date_added, last_read, current_page, read_status,
                              source_folder, parent_dir, is_manga, reading_mode,
-                             hidden, file_path)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             hidden, fit_mode, zoom, file_path)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         values + (file_path,),
                     )
@@ -1237,6 +1270,16 @@ if __name__ == "__main__":
     lib.set_is_manga(id1, False)
     assert lib.get_comic_by_id(id1).is_manga is False
 
+    # Fit mode and zoom tests
+    assert lib.get_comic_by_id(id1).fit_mode == "page"
+    assert lib.get_comic_by_id(id1).zoom == 1.0
+    lib.set_fit_mode(id1, "width")
+    assert lib.get_comic_by_id(id1).fit_mode == "width"
+    lib.set_zoom(id1, 1.5)
+    assert lib.get_comic_by_id(id1).zoom == 1.5
+    lib.set_fit_mode(id1, "page")
+    lib.set_zoom(id1, 1.0)
+
     # Hide / restore tests
     id3 = lib.add_comic("/comics/spawn.cbz", page_count=20, file_size=5_000_000, title="Spawn #1")
     assert len(lib.get_all_comics()) == 2  # id1 + id3 (id2 removed earlier)
@@ -1267,6 +1310,8 @@ if __name__ == "__main__":
     lib.set_folder_cover("/comics", "/cache/custom.jpg")
     lib.set_tags_for_comic(id1, ["classic"])
     lib.toggle_bookmark(id1, 3, "Opening")
+    lib.set_fit_mode(id1, "width")
+    lib.set_zoom(id1, 1.5)
     shelf_id = lib.create_shelf("Export Shelf")
     lib.add_comic_to_shelf(id1, shelf_id)
     with tempfile.TemporaryDirectory() as tmp:
@@ -1283,6 +1328,8 @@ if __name__ == "__main__":
         assert len(imported.get_bookmarks(imported_comic.id)) == 1
         assert any(s.name == "Export Shelf" for s in imported.get_shelves())
         assert imported.get_folder_cover("/comics") == "/cache/custom.jpg"
+        assert imported_comic.fit_mode == "width"
+        assert imported_comic.zoom == 1.5
         import_stats = imported.import_from_json(export_path)
         assert import_stats["comics_added"] == 0
         assert import_stats["comics_updated"] == 2
