@@ -93,6 +93,8 @@ class _ReaderBar(QWidget):
 
 from archive_handler import ComicReader, open_comic
 from bookshelf import BookshelfView
+from dedupe_scanner import DuplicateScanner
+from duplicates_dialog import DuplicatesDialog
 from keybindings import ACTIONS, KeybindingDialog, KeybindingManager
 from library import Library, Shelf
 from library_scanner import LibraryScanner
@@ -366,6 +368,9 @@ class MainWindow(QMainWindow):
         self._scan_progress: QProgressDialog | None = None
         self._scan_queue: list[str] = []
         self._scan_totals = {"added": 0, "skipped": 0, "errors": [], "cancelled": False}
+        self._dedupe_thread: QThread | None = None
+        self._dedupe_scanner: DuplicateScanner | None = None
+        self._dedupe_progress: QProgressDialog | None = None
 
         # Reading-mode state (spread is session-only; webtoon + manga persist per-comic)
         self._spread_mode: bool = False
@@ -592,6 +597,10 @@ class MainWindow(QMainWindow):
         rescan_all_action = QAction("&Rescan All Library Folders", self)
         rescan_all_action.triggered.connect(self.rescan_all_folders)
         library_menu.addAction(rescan_all_action)
+
+        dupes_action = QAction("Scan for &Duplicates…", self)
+        dupes_action.triggered.connect(self.scan_for_duplicates)
+        library_menu.addAction(dupes_action)
 
         library_menu.addSeparator()
 
@@ -1152,6 +1161,11 @@ class MainWindow(QMainWindow):
         if self._scan_thread:
             self._scan_thread.quit()
             self._scan_thread.wait()
+        if self._dedupe_scanner:
+            self._dedupe_scanner.cancel()
+        if self._dedupe_thread:
+            self._dedupe_thread.quit()
+            self._dedupe_thread.wait()
         self._save_progress()
         self._settings.setValue("geometry", self.saveGeometry())
         if self._reader:
@@ -1363,3 +1377,60 @@ class MainWindow(QMainWindow):
         self._scan_progress = None
         self._add_folder_action.setEnabled(True)
         self._sidebar.set_add_enabled(True)
+
+    # ----- Duplicate detection -----
+
+    def scan_for_duplicates(self):
+        if self._dedupe_thread and self._dedupe_thread.isRunning():
+            return
+
+        # If everything is already hashed, skip straight to the results.
+        if not self._library.get_unhashed_comics():
+            self._show_duplicates()
+            return
+
+        self._dedupe_thread = QThread(self)
+        self._dedupe_scanner = DuplicateScanner(self._library)
+        self._dedupe_scanner.moveToThread(self._dedupe_thread)
+
+        self._dedupe_progress = QProgressDialog(
+            "Checking comics for duplicates…", "Cancel", 0, 0, self
+        )
+        self._dedupe_progress.setWindowTitle("Scanning for Duplicates")
+        self._dedupe_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._dedupe_progress.setMinimumDuration(0)
+        self._dedupe_progress.setValue(0)
+
+        self._dedupe_thread.started.connect(self._dedupe_scanner.run)
+        self._dedupe_scanner.progress.connect(self._on_dedupe_progress)
+        self._dedupe_scanner.finished.connect(self._on_dedupe_finished)
+        self._dedupe_progress.canceled.connect(self._dedupe_scanner.cancel)
+
+        self._dedupe_thread.start()
+
+    def _on_dedupe_progress(self, current: int, total: int, filename: str):
+        if self._dedupe_progress is None:
+            return
+        if self._dedupe_progress.maximum() == 0 and total > 0:
+            self._dedupe_progress.setMaximum(total)
+        self._dedupe_progress.setValue(current)
+        self._dedupe_progress.setLabelText(
+            f"Checking {current + 1} of {total}:\n{filename}"
+        )
+
+    def _on_dedupe_finished(self, result):
+        if self._dedupe_progress:
+            self._dedupe_progress.close()
+        if self._dedupe_thread:
+            self._dedupe_thread.quit()
+            self._dedupe_thread.wait()
+            self._dedupe_thread = None
+        self._dedupe_scanner = None
+        self._dedupe_progress = None
+        if not result.cancelled:
+            self._show_duplicates()
+
+    def _show_duplicates(self):
+        dlg = DuplicatesDialog(self._library, self)
+        dlg.changed.connect(self._bookshelf.refresh)
+        dlg.exec()

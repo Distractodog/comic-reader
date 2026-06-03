@@ -127,6 +127,28 @@ def _sort_comics(comics: list, sort_by: str, order: str) -> list:
     return sorted(comics, key=lambda c: (c.title or Path(c.file_path).stem).lower())
 
 
+def compute_content_signature(file_path: str) -> str:
+    """A cheap, offline content fingerprint for duplicate detection.
+
+    Hashing every byte of thousands of comics (PDFs can be hundreds of MB) is
+    too slow. Instead we hash (file_size, first 64 KB, last 64 KB) — enough to
+    identify the same file copied to multiple places without reading whole
+    archives. Returns a hex sha256 digest.
+    """
+    import hashlib
+
+    chunk = 64 * 1024
+    h = hashlib.sha256()
+    size = Path(file_path).stat().st_size
+    h.update(str(size).encode("ascii"))
+    with open(file_path, "rb") as f:
+        h.update(f.read(chunk))
+        if size > chunk:
+            f.seek(max(0, size - chunk))
+            h.update(f.read(chunk))
+    return h.hexdigest()
+
+
 def _derive_status(current_page: int, page_count: int) -> str:
     if page_count <= 0:
         return "unread"
@@ -226,7 +248,12 @@ _SCHEMA_V9_COVER_OVERRIDE = (
     "ALTER TABLE comics ADD COLUMN cover_override INTEGER NOT NULL DEFAULT 0;"
 )
 
-_CURRENT_VERSION = 9
+# Index content_hash so duplicate-detection grouping is cheap.
+_SCHEMA_V10_HASH_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_comics_content_hash ON comics(content_hash);"
+)
+
+_CURRENT_VERSION = 10
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -317,6 +344,12 @@ class Library:
             # Per-comic manual cover override flag (survives rescans).
             self._conn.execute(_SCHEMA_V9_COVER_OVERRIDE)
             self._conn.execute("PRAGMA user_version = 9")
+            self._conn.commit()
+            version = 9
+        if version < 10:
+            # Index content_hash for duplicate detection.
+            self._conn.execute(_SCHEMA_V10_HASH_INDEX)
+            self._conn.execute("PRAGMA user_version = 10")
             self._conn.commit()
 
     def _seed_smart_shelves(self):
@@ -579,6 +612,31 @@ class Library:
                 "UPDATE comics SET content_hash = ? WHERE id = ?",
                 (content_hash, comic_id),
             )
+
+    # ----- Duplicate detection -----
+
+    def get_unhashed_comics(self) -> list[Comic]:
+        """Visible comics that don't yet have a content signature."""
+        rows = self._conn.execute(
+            "SELECT * FROM comics WHERE content_hash IS NULL AND hidden = 0"
+        ).fetchall()
+        return [_row_to_comic(r) for r in rows]
+
+    def find_duplicate_groups(self) -> list[list[Comic]]:
+        """Return groups of visible comics that share a content signature.
+
+        Only groups with 2+ members are returned. Each group is sorted by
+        file path so the original (shortest/earliest) tends to come first.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM comics"
+            " WHERE content_hash IS NOT NULL AND hidden = 0"
+            " ORDER BY content_hash, file_path"
+        ).fetchall()
+        groups: dict[str, list[Comic]] = {}
+        for r in rows:
+            groups.setdefault(r["content_hash"], []).append(_row_to_comic(r))
+        return [g for g in groups.values() if len(g) > 1]
 
     # ----- Folder queries -----
 
@@ -1312,6 +1370,24 @@ if __name__ == "__main__":
     assert lib.get_comic_by_id(id1).cover_override is True
     lib.set_cover_override(id1, False)
     assert lib.get_comic_by_id(id1).cover_override is False
+
+    # Duplicate detection
+    assert lib.find_duplicate_groups() == []
+    dup_a = lib.add_comic("/comics/dupe-a.cbz", page_count=10, file_size=100)
+    dup_b = lib.add_comic("/comics/dupe-b.cbz", page_count=10, file_size=100)
+    lonely = lib.add_comic("/comics/unique.cbz", page_count=10, file_size=100)
+    assert any(c.id == dup_a for c in lib.get_unhashed_comics())
+    lib.set_content_hash(dup_a, "SAMEHASH")
+    lib.set_content_hash(dup_b, "SAMEHASH")
+    lib.set_content_hash(lonely, "OTHERHASH")
+    groups = lib.find_duplicate_groups()
+    assert len(groups) == 1
+    assert {c.id for c in groups[0]} == {dup_a, dup_b}
+    lib.set_hidden(dup_b, True)  # hiding one copy removes the group
+    assert lib.find_duplicate_groups() == []
+    for cid in (dup_a, dup_b, lonely):
+        lib.set_hidden(cid, False)
+        lib.remove_comic(cid)
 
     # Hide / restore tests
     id3 = lib.add_comic("/comics/spawn.cbz", page_count=20, file_size=5_000_000, title="Spawn #1")
