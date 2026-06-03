@@ -1079,6 +1079,15 @@ class BookshelfView(QWidget):
         comic = self._library.get_comic_by_id(comic_id)
         if comic is None:
             return
+        if not Path(comic.file_path).exists():
+            QMessageBox.warning(
+                self, "Set Cover",
+                "This comic's file is no longer on your computer:\n"
+                f"{comic.file_path}\n\n"
+                "You can still use “Choose cover image…”, or remove the comic from "
+                "your library.",
+            )
+            return
         try:
             with open_comic(comic.file_path) as reader:
                 total = reader.page_count()
