@@ -68,6 +68,7 @@ class Comic:
     hidden: bool = False
     fit_mode: str = "page"        # 'actual' | 'width' | 'page'
     zoom: float = 1.0
+    cover_override: bool = False  # cover set manually; skip auto-regeneration
 
 
 def _default_db_path() -> Path:
@@ -110,6 +111,7 @@ def _row_to_comic(row: sqlite3.Row) -> Comic:
         hidden=bool(row["hidden"]),
         fit_mode=row["fit_mode"],
         zoom=float(row["zoom"]),
+        cover_override=bool(row["cover_override"]),
     )
 
 
@@ -219,7 +221,12 @@ CREATE TABLE IF NOT EXISTS folder_covers (
 _SCHEMA_V8_FIT_MODE = "ALTER TABLE comics ADD COLUMN fit_mode TEXT NOT NULL DEFAULT 'page';"
 _SCHEMA_V8_ZOOM     = "ALTER TABLE comics ADD COLUMN zoom REAL NOT NULL DEFAULT 1.0;"
 
-_CURRENT_VERSION = 8
+# Marks a cover as a manual override so automatic regeneration leaves it alone.
+_SCHEMA_V9_COVER_OVERRIDE = (
+    "ALTER TABLE comics ADD COLUMN cover_override INTEGER NOT NULL DEFAULT 0;"
+)
+
+_CURRENT_VERSION = 9
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -304,6 +311,12 @@ class Library:
             self._conn.execute(_SCHEMA_V8_FIT_MODE)
             self._conn.execute(_SCHEMA_V8_ZOOM)
             self._conn.execute("PRAGMA user_version = 8")
+            self._conn.commit()
+            version = 8
+        if version < 9:
+            # Per-comic manual cover override flag (survives rescans).
+            self._conn.execute(_SCHEMA_V9_COVER_OVERRIDE)
+            self._conn.execute("PRAGMA user_version = 9")
             self._conn.commit()
 
     def _seed_smart_shelves(self):
@@ -547,6 +560,17 @@ class Library:
             cur.execute(
                 "UPDATE comics SET cover_path = ? WHERE id = ?",
                 (cover_path, comic_id),
+            )
+
+    def set_cover_override(self, comic_id: int, override: bool) -> None:
+        """Flag (or clear) a comic's cover as a manual override.
+
+        While set, the background scanner must not regenerate this comic's cover.
+        """
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET cover_override = ? WHERE id = ?",
+                (1 if override else 0, comic_id),
             )
 
     def set_content_hash(self, comic_id: int, content_hash: str) -> None:
@@ -968,6 +992,7 @@ class Library:
                 "hidden": bool(row["hidden"]),
                 "fit_mode": row["fit_mode"],
                 "zoom": float(row["zoom"]),
+                "cover_override": bool(row["cover_override"]),
                 "tags": self.get_tags_for_comic(comic_id),
                 "bookmarks": [
                     {
@@ -1057,6 +1082,7 @@ class Library:
                     1 if item.get("hidden") else 0,
                     item.get("fit_mode") or "page",
                     float(item.get("zoom") or 1.0),
+                    1 if item.get("cover_override") else 0,
                 )
                 if existing:
                     comic_id = existing["id"]
@@ -1068,7 +1094,7 @@ class Library:
                             file_size = ?, cover_path = ?, date_added = ?, last_read = ?,
                             current_page = ?, read_status = ?, source_folder = ?,
                             parent_dir = ?, is_manga = ?, reading_mode = ?, hidden = ?,
-                            fit_mode = ?, zoom = ?
+                            fit_mode = ?, zoom = ?, cover_override = ?
                         WHERE id = ?
                         """,
                         values + (comic_id,),
@@ -1082,8 +1108,8 @@ class Library:
                              publisher, year, page_count, file_size, cover_path,
                              date_added, last_read, current_page, read_status,
                              source_folder, parent_dir, is_manga, reading_mode,
-                             hidden, fit_mode, zoom, file_path)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             hidden, fit_mode, zoom, cover_override, file_path)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         values + (file_path,),
                     )
@@ -1280,6 +1306,13 @@ if __name__ == "__main__":
     lib.set_fit_mode(id1, "page")
     lib.set_zoom(id1, 1.0)
 
+    # Cover override flag
+    assert lib.get_comic_by_id(id1).cover_override is False
+    lib.set_cover_override(id1, True)
+    assert lib.get_comic_by_id(id1).cover_override is True
+    lib.set_cover_override(id1, False)
+    assert lib.get_comic_by_id(id1).cover_override is False
+
     # Hide / restore tests
     id3 = lib.add_comic("/comics/spawn.cbz", page_count=20, file_size=5_000_000, title="Spawn #1")
     assert len(lib.get_all_comics()) == 2  # id1 + id3 (id2 removed earlier)
@@ -1312,6 +1345,7 @@ if __name__ == "__main__":
     lib.toggle_bookmark(id1, 3, "Opening")
     lib.set_fit_mode(id1, "width")
     lib.set_zoom(id1, 1.5)
+    lib.set_cover_override(id1, True)
     shelf_id = lib.create_shelf("Export Shelf")
     lib.add_comic_to_shelf(id1, shelf_id)
     with tempfile.TemporaryDirectory() as tmp:
@@ -1330,6 +1364,7 @@ if __name__ == "__main__":
         assert imported.get_folder_cover("/comics") == "/cache/custom.jpg"
         assert imported_comic.fit_mode == "width"
         assert imported_comic.zoom == 1.5
+        assert imported_comic.cover_override is True
         import_stats = imported.import_from_json(export_path)
         assert import_stats["comics_added"] == 0
         assert import_stats["comics_updated"] == 2

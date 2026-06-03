@@ -897,6 +897,21 @@ class BookshelfView(QWidget):
                 lambda: self._ungroup_series(self._current_folder, self._current_series_name)
             )
 
+        # Cover override (single comic only)
+        if not is_multi:
+            comic = self._library.get_comic_by_id(comic_id)
+            menu.addSeparator()
+            menu.addAction("Set cover from page…").triggered.connect(
+                lambda: self._set_comic_cover_from_page(comic_id)
+            )
+            menu.addAction("Choose cover image…").triggered.connect(
+                lambda: self._set_comic_cover_from_image(comic_id)
+            )
+            if comic and comic.cover_override:
+                menu.addAction("Reset cover to default").triggered.connect(
+                    lambda: self._reset_comic_cover(comic_id)
+                )
+
         # Shelf actions
         shelves = self._library.get_shelves()
         manual_shelves = [s for s in shelves if s.kind == "manual"]
@@ -1051,6 +1066,71 @@ class BookshelfView(QWidget):
 
     def _reset_folder_cover(self, folder_path: str):
         self._library.clear_folder_cover(folder_path)
+        self._nav_transition(self._repopulate)
+
+    # ----- Per-comic cover override -----
+
+    def _set_comic_cover_from_page(self, comic_id: int):
+        from archive_handler import open_comic
+        from thumbnails import (
+            comic_cover_override_path_for,
+            generate_thumbnail_from_bytes,
+        )
+        comic = self._library.get_comic_by_id(comic_id)
+        if comic is None:
+            return
+        try:
+            with open_comic(comic.file_path) as reader:
+                total = reader.page_count()
+                if total <= 0:
+                    QMessageBox.warning(self, "Set Cover", "This comic has no pages.")
+                    return
+                page, ok = QInputDialog.getInt(
+                    self, "Set Cover from Page",
+                    f"Page number (1–{total}):", 1, 1, total,
+                )
+                if not ok:
+                    return
+                page_bytes = reader.get_page_bytes(page - 1)
+        except Exception as e:
+            QMessageBox.warning(self, "Set Cover", f"Could not read that page:\n{e}")
+            return
+        out = comic_cover_override_path_for(comic_id)
+        if generate_thumbnail_from_bytes(page_bytes, out):
+            self._library.set_cover_path(comic_id, str(out))
+            self._library.set_cover_override(comic_id, True)
+            self._nav_transition(self._repopulate)
+        else:
+            QMessageBox.warning(self, "Set Cover", "Could not build a cover from that page.")
+
+    def _set_comic_cover_from_image(self, comic_id: int):
+        from thumbnails import (
+            comic_cover_override_path_for,
+            generate_thumbnail_from_image,
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose Cover Image", str(Path.home()),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)",
+        )
+        if not path:
+            return
+        out = comic_cover_override_path_for(comic_id)
+        if generate_thumbnail_from_image(path, out):
+            self._library.set_cover_path(comic_id, str(out))
+            self._library.set_cover_override(comic_id, True)
+            self._nav_transition(self._repopulate)
+        else:
+            QMessageBox.warning(self, "Choose Cover Image", "Could not load that image file.")
+
+    def _reset_comic_cover(self, comic_id: int):
+        from thumbnails import generate_thumbnail, thumbnail_path_for
+        comic = self._library.get_comic_by_id(comic_id)
+        if comic is None:
+            return
+        out = thumbnail_path_for(comic_id)
+        if generate_thumbnail(comic.file_path, out):
+            self._library.set_cover_path(comic_id, str(out))
+        self._library.set_cover_override(comic_id, False)
         self._nav_transition(self._repopulate)
 
     def _hide_folder(self, folder_path: str):

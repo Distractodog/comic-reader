@@ -62,7 +62,7 @@ class LibraryScanner(QObject):
                 result.skipped += 1
                 existing = self._library.get_comic(str(path))
                 if existing:
-                    if existing.cover_path is None:
+                    if existing.cover_path is None and not existing.cover_override:
                         thumb_path = thumbnail_path_for(existing.id)
                         if generate_thumbnail(str(path), thumb_path):
                             self._library.set_cover_path(existing.id, str(thumb_path))
