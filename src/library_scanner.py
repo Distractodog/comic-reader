@@ -9,13 +9,47 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from archive_handler import open_comic
 from comicinfo import parse_comicinfo
+from epub_book import EpubBook, is_text_epub
 from library import Library
-from thumbnails import generate_thumbnail, thumbnail_path_for
+from thumbnails import (
+    generate_thumbnail,
+    generate_thumbnail_from_bytes,
+    thumbnail_path_for,
+)
 
 SCANNABLE_EXTENSIONS = {
     ".cbz", ".cbr", ".cb7", ".cbt", ".pdf", ".epub",
     ".zip", ".rar", ".7z", ".tar",
 }
+
+
+def _probe(path: Path) -> tuple[int, dict, bytes | None]:
+    """Inspect a file → (page/chapter count, metadata dict, cover bytes or None).
+
+    Text/novel EPUBs report their chapter count and OPF cover; everything else
+    (comics, image EPUBs) reports image page count and ComicInfo metadata.
+    """
+    if path.suffix.lower() == ".epub" and is_text_epub(str(path)):
+        with EpubBook(str(path)) as book:
+            meta: dict = {}
+            if book.title:
+                meta["title"] = book.title
+            if book.author:
+                meta["author"] = book.author
+            return book.chapter_count(), meta, book.cover_image_bytes()
+    with open_comic(str(path)) as reader:
+        page_count = reader.page_count()
+    return page_count, parse_comicinfo(str(path)) or {}, None
+
+
+def _write_cover(path: Path, comic_id: int, cover_bytes: bytes | None) -> str | None:
+    """Write a cover thumbnail (from bytes if given, else page 0). Returns its path."""
+    thumb = thumbnail_path_for(comic_id)
+    if cover_bytes is not None:
+        ok = generate_thumbnail_from_bytes(cover_bytes, thumb)
+    else:
+        ok = generate_thumbnail(str(path), thumb)
+    return str(thumb) if ok else None
 
 
 @dataclass
@@ -62,22 +96,26 @@ class LibraryScanner(QObject):
                 result.skipped += 1
                 existing = self._library.get_comic(str(path))
                 if existing:
+                    try:
+                        page_count, meta, cover_bytes = _probe(path)
+                    except Exception:
+                        continue
                     if existing.cover_path is None and not existing.cover_override:
-                        thumb_path = thumbnail_path_for(existing.id)
-                        if generate_thumbnail(str(path), thumb_path):
-                            self._library.set_cover_path(existing.id, str(thumb_path))
-                    # Backfill ComicInfo metadata if not yet populated
-                    if existing.title is None and existing.author is None:
-                        meta = parse_comicinfo(str(path))
-                        if meta:
-                            self._library.update_metadata(existing.id, **meta)
+                        cover = _write_cover(path, existing.id, cover_bytes)
+                        if cover:
+                            self._library.set_cover_path(existing.id, cover)
+                    # Backfill metadata if not yet populated
+                    if existing.title is None and existing.author is None and meta:
+                        self._library.update_metadata(existing.id, **meta)
+                    # Older scans stored text-EPUB page_count as image count (0/1);
+                    # correct it to the real chapter count.
+                    if page_count and existing.page_count != page_count:
+                        self._library.update_metadata(existing.id, page_count=page_count)
                 continue
 
             try:
-                with open_comic(str(path)) as reader:
-                    page_count = reader.page_count()
+                page_count, meta, cover_bytes = _probe(path)
                 file_size = path.stat().st_size
-                meta = parse_comicinfo(str(path)) or {}
                 comic_id = self._library.add_comic(
                     str(path),
                     page_count=page_count,
@@ -88,9 +126,9 @@ class LibraryScanner(QObject):
                 result.added += 1
                 self.comic_added.emit(comic_id)
 
-                thumb_path = thumbnail_path_for(comic_id)
-                if generate_thumbnail(str(path), thumb_path):
-                    self._library.set_cover_path(comic_id, str(thumb_path))
+                cover = _write_cover(path, comic_id, cover_bytes)
+                if cover:
+                    self._library.set_cover_path(comic_id, cover)
             except Exception as e:
                 result.errors.append((str(path), str(e)))
 

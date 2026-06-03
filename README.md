@@ -1,12 +1,13 @@
 # Comic Reader
 
-A free, local-first desktop comic book reader. Supports CBZ, CBR, CB7, CBT, PDF, image-only EPUB, and loose image folders.
+A free, local-first desktop comic book reader. Supports CBZ, CBR, CB7, CBT, PDF, EPUB (both image comics and text novels), and loose image folders.
 
 Comic Reader has no comic limit, no account requirement, no telemetry, and no required cloud service. Your library database stays on your computer and can be exported to a portable JSON backup.
 
 ## Features
 
-- Opens CBZ, CBR, CB7, CBT, PDF, image-only EPUB, and folders of images
+- Opens CBZ, CBR, CB7, CBT, PDF, EPUB (image comics and text novels), and folders of images
+- Built-in novel reader for text EPUBs — chapter navigation, adjustable font size, and remembered position
 - Local SQLite library with folder bookshelf, shelves, smart shelves, tags, series grouping, hidden/restore view, and folder cover overrides
 - Reading progress, read/unread status, bookmarks, seek bar, page thumbnails, spread mode, manga right-to-left mode, and webtoon scroll mode
 - Library export/import as JSON
@@ -18,7 +19,7 @@ Comic Reader has no comic limit, no account requirement, no telemetry, and no re
 ## Notes
 
 - CBR/RAR support uses the Python `rarfile` package. Windows CI builds bundle `unrar.exe` when the Chocolatey package is available; source builds need an `unrar`-compatible tool on PATH. CBZ/ZIP, CB7/7Z, CBT/TAR, PDF, EPUB, and image folders do not need it.
-- EPUB support is for image-based comic EPUBs. Text reflow EPUB reading is intentionally out of scope.
+- EPUB support covers both image-based comic EPUBs (shown page-by-page) and text/novel EPUBs (rendered as flowing text with Qt's built-in renderer). Comic Reader auto-detects which kind a file is. Text rendering is "good novel" fidelity, not a full web-engine layout — fonts, paragraphs, headings, and embedded images work; complex EPUB CSS may not be pixel-perfect.
 
 ## Download
 

@@ -23,7 +23,7 @@ A standalone Windows desktop comic book reader app. Single-window app that opens
   - `.cb7` / `.7z` → `py7zr` (pure Python, v1.x API — use `extractall()` not `read()`)
   - `.cbt` / `.tar` → `tarfile` (stdlib)
   - `.pdf` → `PyMuPDF` (a.k.a. `fitz`)
-  - `.epub` → image-only EPUB reader via `zipfile` + OPF spine parsing (no text reflow)
+  - `.epub` → **two readers, auto-detected** by `epub_book.is_text_epub()`: image comic EPUBs use `EPUBReader` (archive_handler) shown page-by-page; text/novel EPUBs use `EpubBook` (epub_book.py) + `EbookViewer` (ebook_viewer.py), rendered as flowing text via PyQt6 `QTextBrowser` (no web-engine dependency)
   - Loose images in a folder → direct read with `Pillow`-compatible formats
 - **Database:** SQLite via stdlib `sqlite3`, WAL mode, schema versioned via `PRAGMA user_version`
 - **Packaging:** PyInstaller via `ComicReader.spec` so bundled resources are stable
@@ -84,6 +84,7 @@ comic-reader/
   - Item 36: duplicate detection — cheap content signature (size + first/last 64 KB sha256), background `DuplicateScanner`, review dialog with per-copy hide (schema v10 indexes `content_hash`)
   - Item 34: reading statistics — `reading_events` log (schema v11), session timer in `MainWindow` (net forward pages + capped time), `StatsDialog` with paintEvent pages/day chart
   - Remaining offline order: 35 → 41 → 39 → 43 → 33, then the network tier (38, 42, AI Org)
+- **Text/novel EPUB reading** (user-requested, off-roadmap): text EPUBs now open in a dedicated `EbookViewer` (QTextBrowser, paper-themed page, chapter nav, font sizing, remembered chapter). Auto-detected vs image comic EPUBs via `epub_book.is_text_epub()`. Stack index 3. Scanner stores chapter count as `page_count` and pulls the OPF cover. No new dependency.
 
 ### Status before Phase 5 (as of 2026-05-29)
 

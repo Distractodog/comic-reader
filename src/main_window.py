@@ -96,6 +96,8 @@ from archive_handler import ComicReader, open_comic
 from bookshelf import BookshelfView
 from dedupe_scanner import DuplicateScanner
 from duplicates_dialog import DuplicatesDialog
+from ebook_viewer import EbookViewer
+from epub_book import EpubBook, is_text_epub
 from keybindings import ACTIONS, KeybindingDialog, KeybindingManager
 from library import Library, Shelf
 from library_scanner import LibraryScanner
@@ -374,6 +376,10 @@ class MainWindow(QMainWindow):
         self._dedupe_scanner: DuplicateScanner | None = None
         self._dedupe_progress: QProgressDialog | None = None
 
+        # Text-ebook (novel) reading state
+        self._ebook: EpubBook | None = None
+        self._ebook_mode: bool = False
+
         # Reading-session tracking for statistics (Item 34)
         self._session_clock: float | None = None  # time.monotonic at last flush
         self._session_pages: int = 0              # net forward pages since last flush
@@ -398,9 +404,11 @@ class MainWindow(QMainWindow):
         self._bookshelf = BookshelfView(self._library)
         self.viewer = ComicViewer()
         self._webtoon_viewer = WebtoonViewer()
+        self._ebook_viewer = EbookViewer()
         self._stack.addWidget(self._bookshelf)      # index 0
         self._stack.addWidget(self.viewer)           # index 1
         self._stack.addWidget(self._webtoon_viewer)  # index 2
+        self._stack.addWidget(self._ebook_viewer)    # index 3 — text ebooks
 
         self._seek_bar = SeekBar()
         self._seek_bar.setVisible(False)
@@ -478,6 +486,7 @@ class MainWindow(QMainWindow):
         self._thumb_strip.page_selected.connect(self.seek_to_page)
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
         self._webtoon_viewer.mouse_moved.connect(self._on_viewer_mouse_y)
+        self._ebook_viewer.chapter_changed.connect(self._on_ebook_chapter_changed)
 
         self._build_menus()
 
@@ -659,6 +668,11 @@ class MainWindow(QMainWindow):
         self._record_reading_session()
         self._session_clock = None
         self._stop_preloader()
+        if self._ebook is not None:
+            self._settings.setValue("ebook_font_pt", self._ebook_viewer.font_pt())
+            self._ebook.close()
+            self._ebook = None
+        self._ebook_mode = False
 
         def do_switch():
             self._hide_reader_bar(animated=False)
@@ -674,6 +688,10 @@ class MainWindow(QMainWindow):
     # ----- Reader ⋮ menu -----
 
     def _show_reader_menu(self) -> None:
+        if self._ebook_mode:
+            self._show_ebook_menu()
+            return
+
         menu = QMenu(self)
 
         spread_act = menu.addAction("Spread mode")
@@ -713,6 +731,29 @@ class MainWindow(QMainWindow):
                 act.setCheckable(True)
                 act.setChecked(self._webtoon_width_pct == pct)
                 act.triggered.connect(lambda checked, p=pct: self._set_webtoon_width(p))
+
+        menu.exec(self._reader_bar.menu_btn_global_pos())
+
+    def _show_ebook_menu(self) -> None:
+        menu = QMenu(self)
+
+        chapters_menu = menu.addMenu("Chapters")
+        titles = self._ebook_viewer.chapter_titles()
+        current = self._ebook_viewer.current_chapter()
+        for i, title in enumerate(titles):
+            label = f"{i + 1}. {title}"
+            act = chapters_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(i == current)
+            act.triggered.connect(lambda _checked=False, idx=i: self._ebook_viewer.show_chapter(idx))
+
+        menu.addSeparator()
+        menu.addAction("Larger text").triggered.connect(
+            lambda: self._ebook_viewer.adjust_font(+1)
+        )
+        menu.addAction("Smaller text").triggered.connect(
+            lambda: self._ebook_viewer.adjust_font(-1)
+        )
 
         menu.exec(self._reader_bar.menu_btn_global_pos())
 
@@ -849,7 +890,7 @@ class MainWindow(QMainWindow):
             self._build_menus()
 
     def _on_escape(self):
-        if self._stack.currentIndex() in (1, 2):  # single or webtoon viewer
+        if self._stack.currentIndex() in (1, 2, 3):  # comic, webtoon, or ebook
             self._back_to_library()
         elif self.isFullScreen():
             self._toggle_fullscreen()
@@ -869,6 +910,7 @@ class MainWindow(QMainWindow):
         self._sidebar.apply_theme(c)
         self._reader_bar.apply_theme(c)
         self._bookshelf.apply_theme(c)
+        self._ebook_viewer.apply_theme(c)
 
     # ----- File loading -----
 
@@ -892,6 +934,10 @@ class MainWindow(QMainWindow):
     def load_file(self, path: str):
         # Flush the previous comic's reading session before switching away.
         self._record_reading_session()
+        # Text/novel EPUBs go to the dedicated ebook reader, not the comic viewer.
+        if Path(path).suffix.lower() == ".epub" and is_text_epub(path):
+            self._load_ebook(path)
+            return
         try:
             # Stop any background threads bound to the previous reader before
             # closing it, so they can't read from a closed handle.
@@ -978,6 +1024,76 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(180, lambda: self._fade_switch(do_switch))
 
+    def _load_ebook(self, path: str):
+        """Open a text/novel EPUB in the dedicated ebook reader."""
+        # Tear down any comic reader that was active.
+        self._stop_preloader()
+        self._thumb_strip.stop()
+        if self._reader:
+            self._reader.close()
+            self._reader = None
+        if self._ebook:
+            self._ebook.close()
+            self._ebook = None
+
+        try:
+            book = EpubBook(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not open ebook:\n{e}")
+            return
+        if book.chapter_count() == 0:
+            book.close()
+            QMessageBox.warning(self, "Empty", "No readable chapters found in this EPUB.")
+            return
+
+        self._settings.setValue("last_dir", str(Path(path).parent))
+        title = book.title or Path(path).stem
+        self.setWindowTitle(f"Comic Reader — {title}")
+        self._reader_bar.set_title(title)
+        if not self.isFullScreen():
+            self._show_reader_bar(animated=False)
+
+        # Hide comic-only chrome.
+        self._seek_bar.setVisible(False)
+        self._thumb_strip.setVisible(False)
+
+        # Restore progress (current chapter) and the saved reading font size.
+        comic = self._library.get_comic(path)
+        chapters = book.chapter_count()
+        font_pt = int(self._settings.value("ebook_font_pt", 19))
+        if comic is not None:
+            self._current_comic_id = comic.id
+            start_chapter = comic.current_page if 0 <= comic.current_page < chapters else 0
+            # Keep the stored page_count in sync with the real chapter count so
+            # the bookshelf progress bar/badges are correct (older scans stored 0).
+            if comic.page_count != chapters:
+                self._library.update_metadata(comic.id, page_count=chapters)
+        else:
+            self._current_comic_id = None
+            start_chapter = 0
+
+        self._ebook = book
+        self._ebook_mode = True
+        self._webtoon_mode = False
+        self._current_page = start_chapter
+        self._ebook_viewer.load_book(book, start_chapter, font_pt)
+
+        # Start a reading session for statistics.
+        self._session_clock = time.monotonic()
+        self._session_pages = 0
+        self._session_max_page = self._current_page
+
+        def do_switch():
+            self._stack.setCurrentIndex(3)
+            self._sidebar.hide()
+
+        QTimer.singleShot(180, lambda: self._fade_switch(do_switch))
+
+    def _on_ebook_chapter_changed(self, index: int) -> None:
+        self._current_page = index
+        self._save_progress()
+        self._settings.setValue("ebook_font_pt", self._ebook_viewer.font_pt())
+
     # ----- Page navigation -----
 
     def _show_current_page(self, direction: int = 0):
@@ -1024,6 +1140,9 @@ class MainWindow(QMainWindow):
             self._seek_bar.set_progress((pair_index + 1) / pair_count)
 
     def next_page(self):
+        if self._ebook_mode:
+            self._ebook_viewer.next_chapter()
+            return
         if not self._reader:
             return
         step = 2 if self._spread_mode else 1
@@ -1037,6 +1156,9 @@ class MainWindow(QMainWindow):
             self._save_progress()
 
     def prev_page(self):
+        if self._ebook_mode:
+            self._ebook_viewer.prev_chapter()
+            return
         if not self._reader:
             return
         step = 2 if self._spread_mode else 1
@@ -1049,6 +1171,9 @@ class MainWindow(QMainWindow):
             self._save_progress()
 
     def first_page(self):
+        if self._ebook_mode:
+            self._ebook_viewer.show_chapter(0)
+            return
         if self._reader:
             self._current_page = 0
             self._show_current_page(direction=-1)
@@ -1056,6 +1181,10 @@ class MainWindow(QMainWindow):
             self._save_progress()
 
     def last_page(self):
+        if self._ebook_mode:
+            if self._ebook:
+                self._ebook_viewer.show_chapter(self._ebook.chapter_count() - 1)
+            return
         if self._reader:
             page_count = self._reader.page_count()
             self._current_page = ((page_count - 1) // 2) * 2 if self._spread_mode else page_count - 1
@@ -1125,7 +1254,7 @@ class MainWindow(QMainWindow):
     def _toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
-            if self._stack.currentIndex() in (1, 2):
+            if self._stack.currentIndex() in (1, 2, 3):
                 self._show_reader_bar(animated=False)
         else:
             self.showFullScreen()
@@ -1209,9 +1338,13 @@ class MainWindow(QMainWindow):
             self._dedupe_thread.quit()
             self._dedupe_thread.wait()
         self._save_progress()
+        if self._ebook is not None:
+            self._settings.setValue("ebook_font_pt", self._ebook_viewer.font_pt())
         self._settings.setValue("geometry", self.saveGeometry())
         if self._reader:
             self._reader.close()
+        if self._ebook:
+            self._ebook.close()
         self._library.close()
         super().closeEvent(event)
 
