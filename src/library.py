@@ -6,7 +6,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -253,7 +253,20 @@ _SCHEMA_V10_HASH_INDEX = (
     "CREATE INDEX IF NOT EXISTS idx_comics_content_hash ON comics(content_hash);"
 )
 
-_CURRENT_VERSION = 10
+# Per-day reading events, for reading statistics.
+_SCHEMA_V11_READING_EVENTS = """
+CREATE TABLE IF NOT EXISTS reading_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    comic_id   INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+    event_date TEXT    NOT NULL,
+    pages_read INTEGER NOT NULL DEFAULT 0,
+    seconds    INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(comic_id, event_date)
+);
+CREATE INDEX IF NOT EXISTS idx_reading_events_date ON reading_events(event_date);
+"""
+
+_CURRENT_VERSION = 11
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -350,6 +363,12 @@ class Library:
             # Index content_hash for duplicate detection.
             self._conn.execute(_SCHEMA_V10_HASH_INDEX)
             self._conn.execute("PRAGMA user_version = 10")
+            self._conn.commit()
+            version = 10
+        if version < 11:
+            # Reading-events log for statistics.
+            self._conn.executescript(_SCHEMA_V11_READING_EVENTS)
+            self._conn.execute("PRAGMA user_version = 11")
             self._conn.commit()
 
     def _seed_smart_shelves(self):
@@ -637,6 +656,81 @@ class Library:
         for r in rows:
             groups.setdefault(r["content_hash"], []).append(_row_to_comic(r))
         return [g for g in groups.values() if len(g) > 1]
+
+    # ----- Reading statistics -----
+
+    def record_reading(self, comic_id: int, pages_read: int, seconds: int) -> None:
+        """Accumulate reading activity into today's (UTC) event row for a comic.
+
+        ``pages_read`` should be net forward pages; both values are clamped to
+        be non-negative. A no-op when there's nothing to record.
+        """
+        pages_read = max(0, int(pages_read))
+        seconds = max(0, int(seconds))
+        if pages_read == 0 and seconds == 0:
+            return
+        today = datetime.now(timezone.utc).date().isoformat()
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO reading_events (comic_id, event_date, pages_read, seconds)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(comic_id, event_date) DO UPDATE SET"
+                " pages_read = pages_read + excluded.pages_read,"
+                " seconds = seconds + excluded.seconds",
+                (comic_id, today, pages_read, seconds),
+            )
+
+    def get_stats(self) -> dict:
+        """Aggregate reading statistics for the stats view.
+
+        Returns total pages, total hours, completion counts/rate, a
+        pages-per-day series for the last 30 days, and the current daily streak.
+        """
+        totals = self._conn.execute(
+            "SELECT COALESCE(SUM(pages_read), 0) AS pages,"
+            " COALESCE(SUM(seconds), 0) AS seconds FROM reading_events"
+        ).fetchone()
+        total_pages = totals["pages"]
+        total_seconds = totals["seconds"]
+
+        total_comics = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM comics WHERE hidden = 0"
+        ).fetchone()["n"]
+        completed = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM comics WHERE hidden = 0 AND read_status = 'read'"
+        ).fetchone()["n"]
+        completion_rate = (completed / total_comics) if total_comics else 0.0
+
+        # Pages per day for the last 30 calendar days (UTC), oldest first.
+        from datetime import timedelta
+        today = datetime.now(timezone.utc).date()
+        per_day_rows = self._conn.execute(
+            "SELECT event_date, SUM(pages_read) AS pages FROM reading_events"
+            " GROUP BY event_date"
+        ).fetchall()
+        per_day_map = {r["event_date"]: r["pages"] for r in per_day_rows}
+        pages_per_day = []
+        for i in range(29, -1, -1):
+            d = (today - timedelta(days=i)).isoformat()
+            pages_per_day.append((d, per_day_map.get(d, 0)))
+
+        # Current streak: consecutive days up to and including today with activity.
+        active_days = set(per_day_map.keys())
+        streak = 0
+        d = today
+        while d.isoformat() in active_days:
+            streak += 1
+            d = d - timedelta(days=1)
+
+        return {
+            "total_pages": total_pages,
+            "total_hours": total_seconds / 3600.0,
+            "total_comics": total_comics,
+            "comics_completed": completed,
+            "completion_rate": completion_rate,
+            "pages_per_day": pages_per_day,
+            "current_streak": streak,
+        }
 
     # ----- Folder queries -----
 
@@ -1388,6 +1482,31 @@ if __name__ == "__main__":
     for cid in (dup_a, dup_b, lonely):
         lib.set_hidden(cid, False)
         lib.remove_comic(cid)
+
+    # Reading statistics
+    stats = lib.get_stats()
+    assert stats["total_pages"] == 0 and stats["current_streak"] == 0
+    lib.record_reading(id1, pages_read=5, seconds=120)
+    lib.record_reading(id1, pages_read=3, seconds=60)  # accumulates into same day
+    lib.record_reading(id1, pages_read=0, seconds=0)   # no-op
+    stats = lib.get_stats()
+    assert stats["total_pages"] == 8
+    assert abs(stats["total_hours"] - 180 / 3600) < 1e-9
+    assert stats["current_streak"] == 1
+    # Add an event for yesterday to exercise streak + per-day series
+    _yday = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    lib._conn.execute(
+        "INSERT INTO reading_events (comic_id, event_date, pages_read, seconds)"
+        " VALUES (?, ?, ?, ?)",
+        (id1, _yday, 4, 30),
+    )
+    lib._conn.commit()
+    stats = lib.get_stats()
+    assert stats["total_pages"] == 12
+    assert stats["current_streak"] == 2
+    assert len(stats["pages_per_day"]) == 30
+    assert stats["pages_per_day"][-1][1] == 8   # today
+    assert stats["pages_per_day"][-2][1] == 4   # yesterday
 
     # Hide / restore tests
     id3 = lib.add_comic("/comics/spawn.cbz", page_count=20, file_size=5_000_000, title="Spawn #1")

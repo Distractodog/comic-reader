@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPropertyAnimation, QSettings, QThread, QTimer, pyqtSignal
@@ -99,6 +100,7 @@ from keybindings import ACTIONS, KeybindingDialog, KeybindingManager
 from library import Library, Shelf
 from library_scanner import LibraryScanner
 from preloader import PageCache, PagePreloader
+from stats_dialog import StatsDialog
 from viewer import ComicViewer, FitMode, ReadingMode, SeekBar, ThumbnailStrip, make_spread_pixmap
 from webtoon_viewer import WebtoonViewer
 import themes
@@ -372,6 +374,11 @@ class MainWindow(QMainWindow):
         self._dedupe_scanner: DuplicateScanner | None = None
         self._dedupe_progress: QProgressDialog | None = None
 
+        # Reading-session tracking for statistics (Item 34)
+        self._session_clock: float | None = None  # time.monotonic at last flush
+        self._session_pages: int = 0              # net forward pages since last flush
+        self._session_max_page: int = 0           # furthest page reached this session
+
         # Reading-mode state (spread is session-only; webtoon + manga persist per-comic)
         self._spread_mode: bool = False
         self._webtoon_mode: bool = False
@@ -602,6 +609,10 @@ class MainWindow(QMainWindow):
         dupes_action.triggered.connect(self.scan_for_duplicates)
         library_menu.addAction(dupes_action)
 
+        stats_action = QAction("Reading &Statistics…", self)
+        stats_action.triggered.connect(self.show_statistics)
+        library_menu.addAction(stats_action)
+
         library_menu.addSeparator()
 
         export_action = QAction("&Export Library...", self)
@@ -645,6 +656,8 @@ class MainWindow(QMainWindow):
         self.load_file(path)
 
     def _back_to_library(self):
+        self._record_reading_session()
+        self._session_clock = None
         self._stop_preloader()
 
         def do_switch():
@@ -877,6 +890,8 @@ class MainWindow(QMainWindow):
             self.load_file(path)
 
     def load_file(self, path: str):
+        # Flush the previous comic's reading session before switching away.
+        self._record_reading_session()
         try:
             # Stop any background threads bound to the previous reader before
             # closing it, so they can't read from a closed handle.
@@ -928,6 +943,11 @@ class MainWindow(QMainWindow):
             self.viewer.restore_view_state(FitMode.FIT_PAGE, 1.0)
 
         self.viewer.set_rtl(self._is_manga)
+
+        # Start a fresh reading session for statistics.
+        self._session_clock = time.monotonic()
+        self._session_pages = 0
+        self._session_max_page = self._current_page
 
         # Set up page cache + preloader (only in non-webtoon mode)
         self._stop_preloader()
@@ -1063,6 +1083,28 @@ class MainWindow(QMainWindow):
         if self._current_comic_id is not None:
             self._library.update_progress(self._current_comic_id, self._current_page)
             self._library.set_zoom(self._current_comic_id, self.viewer.zoom_factor)
+            self._record_reading_session()
+
+    def _record_reading_session(self) -> None:
+        """Flush elapsed time + net forward pages for the current comic into stats.
+
+        Pages are counted as net forward progress (re-reading the same pages back
+        and forth doesn't inflate the count). A single flush's time is capped so
+        leaving the app open on a page doesn't balloon the total.
+        """
+        if self._current_comic_id is None:
+            return
+        if self._current_page > self._session_max_page:
+            self._session_pages += self._current_page - self._session_max_page
+            self._session_max_page = self._current_page
+        now = time.monotonic()
+        elapsed = 0
+        if self._session_clock is not None:
+            elapsed = min(int(now - self._session_clock), 1800)
+        self._session_clock = now
+        pages = self._session_pages
+        self._session_pages = 0
+        self._library.record_reading(self._current_comic_id, pages, elapsed)
 
     _FIT_MODE_STR = {
         FitMode.ACTUAL_SIZE: "actual",
@@ -1434,3 +1476,10 @@ class MainWindow(QMainWindow):
         dlg = DuplicatesDialog(self._library, self)
         dlg.changed.connect(self._bookshelf.refresh)
         dlg.exec()
+
+    # ----- Reading statistics -----
+
+    def show_statistics(self):
+        # Flush the in-progress session so the figures are current.
+        self._record_reading_session()
+        StatsDialog(self._library, self).exec()

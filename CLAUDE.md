@@ -76,7 +76,16 @@ comic-reader/
     ```
 - **Windows build:** push to `main` → GitHub Actions runs → `.exe` appears as workflow artifact. Tag `v1.0.0` etc. to publish a Release.
 
-## Current status (as of 2026-05-29)
+## Current status (as of 2026-06-03)
+
+- **Phase 5 in progress** (see `PHASE5_PLAN.md` + `PHASE5_TASKS.md`). DB schema now at **v11**. Done so far:
+  - Item 40: per-comic fit mode + zoom (schema v8)
+  - Item 37: per-comic cover override from page or image file; `cover_override` flag (schema v9) survives rescans
+  - Item 36: duplicate detection — cheap content signature (size + first/last 64 KB sha256), background `DuplicateScanner`, review dialog with per-copy hide (schema v10 indexes `content_hash`)
+  - Item 34: reading statistics — `reading_events` log (schema v11), session timer in `MainWindow` (net forward pages + capped time), `StatsDialog` with paintEvent pages/day chart
+  - Remaining offline order: 35 → 41 → 39 → 43 → 33, then the network tier (38, 42, AI Org)
+
+### Status before Phase 5 (as of 2026-05-29)
 
 - Phase 1 complete (items 1–9 + Phase 3 pull-forwards: seek bar, click-zone nav, reader progress bar)
 - Mini-polish pass complete (page slide animation, bookshelf↔reader fade, rounded tiles, typography)
