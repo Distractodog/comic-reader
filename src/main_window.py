@@ -175,6 +175,7 @@ class _Sidebar(QWidget):
     new_shelf_clicked = pyqtSignal()
     rename_shelf_requested = pyqtSignal(int, str)  # shelf_id, current_name
     delete_shelf_requested = pyqtSignal(int)        # shelf_id
+    export_shelf_requested = pyqtSignal(int, str)   # shelf_id, shelf_name
     back_to_root_clicked = pyqtSignal()
 
     WIDTH = 180
@@ -379,10 +380,13 @@ class _Sidebar(QWidget):
     def _on_shelf_right_click(self, shelf_id: int, shelf_name: str, pos):
         menu = QMenu(self)
         rename_action = menu.addAction("Rename…")
+        export_action = menu.addAction("Export shelf…")
         delete_action = menu.addAction("Delete shelf")
         action = menu.exec(pos)
         if action == rename_action:
             self.rename_shelf_requested.emit(shelf_id, shelf_name)
+        elif action == export_action:
+            self.export_shelf_requested.emit(shelf_id, shelf_name)
         elif action == delete_action:
             self.delete_shelf_requested.emit(shelf_id)
 
@@ -524,6 +528,7 @@ class MainWindow(QMainWindow):
         self._sidebar.new_shelf_clicked.connect(self._create_new_shelf)
         self._sidebar.rename_shelf_requested.connect(self._rename_shelf)
         self._sidebar.delete_shelf_requested.connect(self._delete_shelf)
+        self._sidebar.export_shelf_requested.connect(self.export_shelf)
         self._sidebar.back_to_root_clicked.connect(self._bookshelf.go_to_root)
 
         container = QWidget()
@@ -706,6 +711,10 @@ class MainWindow(QMainWindow):
         import_action = QAction("&Import Library...", self)
         import_action.triggered.connect(self.import_library)
         library_menu.addAction(import_action)
+
+        import_shelf_action = QAction("Import &Shelf...", self)
+        import_shelf_action.triggered.connect(self.import_shelf)
+        library_menu.addAction(import_shelf_action)
 
         library_menu.addSeparator()
 
@@ -1633,6 +1642,58 @@ class MainWindow(QMainWindow):
             f"Comics updated: {stats['comics_updated']}\n"
             f"Shelves merged: {stats['shelves']}\n"
             f"Folder covers: {stats['folder_covers']}",
+        )
+
+    def export_shelf(self, shelf_id: int, shelf_name: str):
+        last_dir = self._settings.value("last_export_dir", str(Path.home()))
+        safe_name = "".join(
+            ch if ch.isalnum() or ch in " -_" else " " for ch in shelf_name
+        ).strip() or "shelf"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Shelf",
+            str(Path(last_dir) / f"{safe_name}.comic-reader-shelf.json"),
+            "Comic Reader shelf (*.json)",
+        )
+        if not path:
+            return
+        self._settings.setValue("last_export_dir", str(Path(path).parent))
+        try:
+            stats = self._library.export_shelf(shelf_id, path)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Could not export shelf:\n{e}")
+            return
+        QMessageBox.information(
+            self,
+            "Shelf Exported",
+            f"Exported '{stats['shelf_name']}'.\n\n"
+            f"Comics listed: {stats['comics']}\n\n"
+            "This file shares the shelf list only, not the comic files.",
+        )
+
+    def import_shelf(self):
+        last_dir = self._settings.value("last_export_dir", str(Path.home()))
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Shelf",
+            last_dir,
+            "Comic Reader shelf (*.json);;JSON files (*.json)",
+        )
+        if not path:
+            return
+        try:
+            stats = self._library.import_shelf(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Failed", f"Could not import shelf:\n{e}")
+            return
+        self._sidebar.refresh_shelves()
+        self._bookshelf.refresh()
+        QMessageBox.information(
+            self,
+            "Shelf Imported",
+            f"Imported '{stats['shelf_name']}'.\n\n"
+            f"Matched comics: {stats['matched']}\n"
+            f"Not in this library: {stats['unmatched']}",
         )
 
     def _start_scan(self, folder: str):

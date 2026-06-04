@@ -1020,6 +1020,94 @@ class Library:
             for r in rows
         ]
 
+    def export_shelf(self, shelf_id: int, output_path: str | Path) -> dict:
+        """Export one manual shelf as a shareable list, not the comic files."""
+        shelf = self._conn.execute(
+            "SELECT * FROM shelves WHERE id = ? AND kind = 'manual'", (shelf_id,)
+        ).fetchone()
+        if shelf is None:
+            raise ValueError("Shelf not found or is not a manual shelf.")
+        comics = self.get_comics_in_shelf(shelf_id)
+        payload = {
+            "format": "comic-reader-shelf",
+            "version": 1,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "shelf_name": shelf["name"],
+            "comics": [
+                {
+                    "title": c.title,
+                    "series": c.series,
+                    "series_number": c.series_number,
+                    "author": c.author,
+                    "content_hash": c.content_hash,
+                    "file_path": c.file_path,
+                }
+                for c in comics
+            ],
+        }
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return {"shelf_name": shelf["name"], "comics": len(comics)}
+
+    def import_shelf(self, input_path: str | Path) -> dict:
+        """Import a shared shelf by matching comics already in this library."""
+        payload = json.loads(Path(input_path).read_text(encoding="utf-8"))
+        if payload.get("format") != "comic-reader-shelf":
+            raise ValueError("This is not a Comic Reader shelf export.")
+        name = str(payload.get("shelf_name") or "Imported Shelf").strip()
+        shelf_id = self.create_shelf(name)
+        matched = 0
+        unmatched = 0
+        with self.transaction() as cur:
+            for item in payload.get("comics", []):
+                comic_id = self._match_shared_shelf_comic(cur, item)
+                if comic_id is None:
+                    unmatched += 1
+                    continue
+                cur.execute(
+                    "INSERT OR IGNORE INTO comic_shelves (comic_id, shelf_id)"
+                    " VALUES (?, ?)",
+                    (comic_id, shelf_id),
+                )
+                matched += 1
+        return {
+            "shelf_id": shelf_id,
+            "shelf_name": name,
+            "matched": matched,
+            "unmatched": unmatched,
+        }
+
+    def _match_shared_shelf_comic(self, cur, item: dict) -> int | None:
+        content_hash = item.get("content_hash")
+        if content_hash:
+            row = cur.execute(
+                "SELECT id FROM comics WHERE hidden = 0 AND content_hash = ? LIMIT 1",
+                (content_hash,),
+            ).fetchone()
+            if row:
+                return row["id"]
+        title = item.get("title")
+        series = item.get("series")
+        series_number = item.get("series_number")
+        if not (title and series):
+            return None
+        row = cur.execute(
+            """
+            SELECT id FROM comics
+            WHERE hidden = 0
+              AND title = ?
+              AND series = ?
+              AND (
+                    (? IS NULL AND series_number IS NULL)
+                    OR series_number = ?
+                  )
+            LIMIT 1
+            """,
+            (title, series, series_number, series_number),
+        ).fetchone()
+        return row["id"] if row else None
+
     # ----- Reading queue ("read next") -----
 
     def add_to_queue(self, comic_id: int) -> None:
@@ -1810,6 +1898,40 @@ if __name__ == "__main__":
         assert import_stats["comics_added"] == 0
         assert import_stats["comics_updated"] == 2
         imported.close()
+
+    # Shared shelf export/import (Item 43)
+    lib.set_content_hash(id1, "hash-batman")
+    shared_shelf = lib.create_shelf("Shared Picks")
+    lib.add_comic_to_shelf(id1, shared_shelf)
+    with tempfile.TemporaryDirectory() as tmp:
+        shelf_path = Path(tmp) / "shared-shelf.json"
+        shelf_stats = lib.export_shelf(shared_shelf, shelf_path)
+        assert shelf_stats["comics"] == 1
+        payload = json.loads(shelf_path.read_text(encoding="utf-8"))
+        payload["comics"].append({
+            "title": "Missing Book",
+            "series": "Missing",
+            "series_number": 1,
+            "author": None,
+            "content_hash": "not-present",
+            "file_path": "/elsewhere/missing.cbz",
+        })
+        shelf_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        recipient = Library(db_path=":memory:")
+        rid = recipient.add_comic(
+            "/recipient/batman-copy.cbz",
+            page_count=24,
+            file_size=10_000_000,
+            title="Different local title",
+        )
+        recipient.set_content_hash(rid, "hash-batman")
+        result = recipient.import_shelf(shelf_path)
+        assert result["matched"] == 1
+        assert result["unmatched"] == 1
+        imported_shelf = next(s for s in recipient.get_shelves() if s.name == "Shared Picks")
+        assert [c.id for c in recipient.get_comics_in_shelf(imported_shelf.id)] == [rid]
+        recipient.close()
 
     # Reading queue tests (Item 35)
     q1 = lib.add_comic("/comics/q1.cbz", page_count=10, file_size=1_000, title="Queue 1")
