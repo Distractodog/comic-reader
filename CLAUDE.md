@@ -87,7 +87,8 @@ comic-reader/
   - Item 41: per-page annotations/notes for image comic readers (schema v13), exported/imported with library JSON, reader-menu add/edit/delete dialog, seek-bar note markers
   - Item 39: batch tools — convert CBR/CB7/CBT archives to CBZ on copies, rename files from metadata, update library paths safely, and skip PDF/EPUB conversion
   - Item 43: public shelf sharing — export/import a single shelf as a portable list, matching recipient libraries by content hash first and conservative metadata fallback
-  - Remaining offline order: 33, then the network tier (38, 42, AI Org)
+  - Item 33: folder-based sync stance documented in README; synced-away files now show a friendly unavailable-file message before either comic or text-EPUB loading
+  - Offline Phase 5 block is complete. Remaining network tier requires design review before implementation: 38 (OPDS/Komga/Kavita), 42 (Comic Vine lookup), AI Organization
 - **Text/novel EPUB reading** (user-requested, off-roadmap): text EPUBs now open in a dedicated `EbookViewer` using true page-box pagination (not scroll offsets), chapter nav, font sizing, remembered font size/chapter, a whole-book seek bar, sideswipe/slide page turns, and an explicit exit path. Auto-detected vs image comic EPUBs via `epub_book.is_text_epub()`. Stack index 3. Scanner stores chapter count as `page_count` and pulls the OPF cover. No new dependency. EPUB annotations are intentionally deferred because page indices change with font/window layout.
 
 ### Status before Phase 5 (as of 2026-05-29)

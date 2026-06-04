@@ -1066,6 +1066,15 @@ class MainWindow(QMainWindow):
             self.load_file(path)
 
     def load_file(self, path: str):
+        if not Path(path).exists():
+            QMessageBox.warning(
+                self,
+                "File Unavailable",
+                "This file is not currently available on disk.\n\n"
+                "If it lives in a synced folder, wait for sync to finish or "
+                "restore the file, then rescan the library folder.",
+            )
+            return
         # Flush the previous comic's reading session before switching away.
         self._record_reading_session()
         # Text/novel EPUBs go to the dedicated ebook reader, not the comic viewer.
