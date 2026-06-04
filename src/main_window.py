@@ -504,6 +504,7 @@ class MainWindow(QMainWindow):
         self._ebook_viewer.chapter_changed.connect(self._on_ebook_chapter_changed)
         self._ebook_viewer.mouse_moved.connect(self._on_viewer_mouse_y)
         self._ebook_viewer.exit_requested.connect(self._back_to_library)
+        self._ebook_viewer.end_reached.connect(self._prompt_open_next_queued_book)
 
         self._build_menus()
 
@@ -917,6 +918,8 @@ class MainWindow(QMainWindow):
         if not in_folder:
             if self._bookshelf._show_hidden_mode:
                 self._sidebar.set_active(-2)
+            elif self._bookshelf.is_showing_queue():
+                self._sidebar.set_active(-3)
             else:
                 shelf_id = self._bookshelf._current_shelf_id
                 self._sidebar.set_active(shelf_id if shelf_id is not None else -1)
@@ -962,6 +965,11 @@ class MainWindow(QMainWindow):
             self._thumb_strip.stop()
             if self._reader:
                 self._reader.close()
+            if self._ebook is not None:
+                self._settings.setValue("ebook_font_pt", self._ebook_viewer.font_pt())
+                self._ebook.close()
+                self._ebook = None
+            self._ebook_mode = False
             self._reader = open_comic(path)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not open file:\n{e}")
@@ -1171,6 +1179,45 @@ class MainWindow(QMainWindow):
             self._show_current_page(direction=1)
             self._advance_preloader()
             self._save_progress()
+        else:
+            self._prompt_open_next_queued_book()
+
+    def _next_queued_comic(self):
+        queue = self._library.get_queue()
+        if not queue:
+            return None
+        if self._current_comic_id is None:
+            return queue[0]
+        ids = [comic.id for comic in queue]
+        if self._current_comic_id not in ids:
+            return queue[0]
+        next_index = ids.index(self._current_comic_id) + 1
+        if next_index >= len(queue):
+            return None
+        return queue[next_index]
+
+    def _prompt_open_next_queued_book(self) -> None:
+        """Offer to continue into the next queued book at the end of the current one."""
+        next_comic = self._next_queued_comic()
+        if next_comic is None:
+            return
+
+        title = next_comic.title or Path(next_comic.file_path).stem
+        reply = QMessageBox.question(
+            self,
+            "Open next queued book?",
+            f"You reached the end. Open the next book in your Reading Queue?\n\n{title}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        current_id = self._current_comic_id
+        if current_id is not None and self._library.is_in_queue(current_id):
+            self._library.remove_from_queue(current_id)
+        self.load_file(next_comic.file_path)
+        self.statusBar().showMessage(f"Opened next queued book: {title}", 3500)
 
     def prev_page(self):
         if self._ebook_mode:

@@ -290,6 +290,7 @@ class EbookViewer(QWidget):
     chapter_changed = pyqtSignal(int)  # current chapter index
     mouse_moved = pyqtSignal(int)      # viewport y — for fullscreen bar reveal
     exit_requested = pyqtSignal()      # user asked to leave the book
+    end_reached = pyqtSignal()         # user tried to advance past the final page
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -466,6 +467,8 @@ class EbookViewer(QWidget):
             self._canvas.transition(+1, lambda: self._step_page(self._page + 1))
         elif self._book and self._index < self._book.chapter_count() - 1:
             self._canvas.transition(+1, lambda: self._render_chapter(self._index + 1))
+        else:
+            self.end_reached.emit()
 
     def prev_page(self) -> None:
         if self._page > 0:
@@ -552,12 +555,10 @@ class EbookViewer(QWidget):
             f"   —   Page {self._page + 1}/{self._page_count}"
         )
         at_start = self._index == 0 and self._page == 0
-        at_end = (
-            self._index == self._book.chapter_count() - 1
-            and self._page == self._page_count - 1
-        )
         self._prev_btn.setEnabled(not at_start)
-        self._next_btn.setEnabled(not at_end)
+        # Keep Next clickable on the final page so MainWindow can offer the
+        # next queued book when the user tries to advance past the end.
+        self._next_btn.setEnabled(True)
         self._sync_seek()
 
     def _reader_font(self) -> QFont:

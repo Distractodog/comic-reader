@@ -744,6 +744,10 @@ class BookshelfView(QWidget):
             self.folder_entered.emit(False)
         self._nav_transition(do)
 
+    def is_showing_queue(self) -> bool:
+        """Return True when the Reading Queue view is the active bookshelf mode."""
+        return self._queue_mode
+
     def _clear_selection(self):
         old = set(self._selected_ids)
         self._selected_ids.clear()
@@ -1028,12 +1032,23 @@ class BookshelfView(QWidget):
             self._library.add_to_queue(comic_id)
         else:
             self._library.remove_from_queue(comic_id)
+        comic = self._library.get_comic_by_id(comic_id)
+        if comic:
+            action = "Added to" if add else "Removed from"
+            self.window().statusBar().showMessage(
+                f"{action} Reading Queue: {Path(comic.file_path).stem}", 3500
+            )
         if self._queue_mode:
             self._nav_transition(self._repopulate)
 
     def _add_comics_to_queue(self, comic_ids: list[int]):
         for cid in comic_ids:
             self._library.add_to_queue(cid)
+        self.window().statusBar().showMessage(
+            f"Added {len(comic_ids)} comics to Reading Queue", 3500
+        )
+        if self._queue_mode:
+            self._nav_transition(self._repopulate)
 
     def _move_in_queue(self, comic_id: int, direction: int):
         if direction < 0:
