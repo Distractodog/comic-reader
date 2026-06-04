@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -56,6 +57,11 @@ _PAGE_MARGIN = 34
 MIN_FONT_PT = 11
 MAX_FONT_PT = 32
 DEFAULT_FONT_PT = 19
+
+# Sub-steps the whole-book seek bar gives each chapter. The slider range is
+# chapter_count * this, so every page in a chapter stays reachable by dragging
+# even though the bar spans the entire book.
+_SEEK_PRECISION = 1000
 
 
 class _BookDocument(QTextDocument):
@@ -292,6 +298,9 @@ class EbookViewer(QWidget):
         self._page = 0
         self._page_count = 1
         self._font_pt = DEFAULT_FONT_PT
+        self._syncing = False   # guards programmatic seek-bar updates
+        self._seek_dragging = False
+        self._pending_seek: tuple[int, float] | None = None  # (chapter, local_frac)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -303,12 +312,28 @@ class EbookViewer(QWidget):
         self._canvas.resized.connect(self._reflow)
         layout.addWidget(self._canvas, 1)
 
-        # Bottom navigation bar
+        # Bottom navigation bar: a full-width page seek slider on top, button row below.
         bar = QWidget(self)
         bar.setObjectName("EbookNavBar")
         bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(12, 6, 12, 6)
+        bar_outer = QVBoxLayout(bar)
+        bar_outer.setContentsMargins(12, 6, 12, 6)
+        bar_outer.setSpacing(6)
+
+        # Draggable page seek bar (scoped to the current chapter — pages are
+        # already laid out, so scrubbing is instant with no re-pagination).
+        self._seek = QSlider(Qt.Orientation.Horizontal)
+        self._seek.setRange(0, 0)
+        self._seek.setPageStep(_SEEK_PRECISION)
+        self._seek.setToolTip("Drag to move anywhere in the book")
+        self._seek.valueChanged.connect(self._on_seek_value)
+        self._seek.sliderPressed.connect(self._on_seek_pressed)
+        self._seek.sliderReleased.connect(self._on_seek_released)
+        bar_outer.addWidget(self._seek)
+
+        button_row = QWidget()
+        bar_layout = QHBoxLayout(button_row)
+        bar_layout.setContentsMargins(0, 0, 0, 0)
         bar_layout.setSpacing(8)
 
         self._exit_btn = QPushButton("⌂ Library")
@@ -337,8 +362,78 @@ class EbookViewer(QWidget):
         bar_layout.addWidget(self._label, 1)
         bar_layout.addStretch()
         bar_layout.addWidget(self._next_btn)
+        bar_outer.addWidget(button_row)
         layout.addWidget(bar)
         self._nav_bar = bar
+
+    # ----- seek bar (whole book) -----
+
+    def _on_seek_pressed(self) -> None:
+        self._seek_dragging = True
+
+    def _on_seek_released(self) -> None:
+        self._seek_dragging = False
+        if self._pending_seek is not None:
+            chapter, frac = self._pending_seek
+            self._pending_seek = None
+            self._jump_to(chapter, frac)
+
+    def _on_seek_value(self, value: int) -> None:
+        """The slider spans the whole book: value = chapter * PRECISION + sub.
+
+        Scrubbing inside the current chapter is applied live (a cheap repaint,
+        the chapter is already paginated). Crossing into another chapter would
+        need a re-render, so during a drag we defer that to release; a direct
+        click jumps immediately. Programmatic syncs are guarded by _syncing.
+        """
+        if self._syncing or self._book is None:
+            return
+        chapter = min(value // _SEEK_PRECISION, self._book.chapter_count() - 1)
+        frac = (value % _SEEK_PRECISION) / (_SEEK_PRECISION - 1)
+        if chapter == self._index:
+            self._pending_seek = None
+            page = round(frac * (self._page_count - 1)) if self._page_count > 1 else 0
+            if page != self._page:
+                self._page = max(0, min(page, self._page_count - 1))
+                self._canvas.set_page(self._page)
+                self._update_label()
+        elif self._seek_dragging:
+            # Defer the chapter render until the user lets go; preview the target.
+            self._pending_seek = (chapter, frac)
+            self._preview_chapter(chapter)
+        else:
+            self._jump_to(chapter, frac)
+
+    def _jump_to(self, chapter: int, frac: float) -> None:
+        """Render `chapter` and land on the page at `frac` through it."""
+        self._render_chapter(chapter)
+        page = round(frac * (self._page_count - 1)) if self._page_count > 1 else 0
+        self._goto_page(max(0, min(page, self._page_count - 1)))
+
+    def _preview_chapter(self, chapter: int) -> None:
+        """While dragging across chapters, show where the user will land."""
+        titles = self._book.chapter_titles() if self._book else []
+        title = titles[chapter] if chapter < len(titles) else ""
+        total = self._book.chapter_count() if self._book else 1
+        self._label.setText(f"→ Ch {chapter + 1}/{total} · {title}   (release to jump)")
+
+    def _sync_seek(self) -> None:
+        """Reflect the whole-book position in the slider without re-triggering it.
+
+        Position = (chapter + page-within-chapter) mapped onto the book-wide
+        range chapter_count * PRECISION, so the handle shows overall progress.
+        """
+        # Don't move the handle out from under an active drag — the user owns it.
+        if self._book is None or self._seek_dragging:
+            return
+        n_ch = max(1, self._book.chapter_count())
+        local = (self._page / (self._page_count - 1)) if self._page_count > 1 else 0.0
+        value = self._index * _SEEK_PRECISION + round(local * (_SEEK_PRECISION - 1))
+        self._syncing = True
+        self._seek.setRange(0, n_ch * _SEEK_PRECISION - 1)
+        self._seek.setValue(value)
+        self._seek.setEnabled(n_ch > 1 or self._page_count > 1)
+        self._syncing = False
 
     # ----- sideswipe routing -----
 
@@ -463,6 +558,7 @@ class EbookViewer(QWidget):
         )
         self._prev_btn.setEnabled(not at_start)
         self._next_btn.setEnabled(not at_end)
+        self._sync_seek()
 
     def _reader_font(self) -> QFont:
         font = QFont()
@@ -497,4 +593,17 @@ class EbookViewer(QWidget):
             f"#EbookNavBar {{ background: {c['header_bg']};"
             f" border-top: 1px solid {c['border']}; }}"
             f"#EbookNavBar QLabel {{ background: transparent; color: {c['text']}; }}"
+        )
+        self._seek.setStyleSheet(
+            f"QSlider {{ background: transparent; }}"
+            f"QSlider::groove:horizontal {{ height: 4px; border-radius: 2px;"
+            f" background: {c['progress_track']}; }}"
+            f"QSlider::sub-page:horizontal {{ height: 4px; border-radius: 2px;"
+            f" background: {c['progress_fill']}; }}"
+            f"QSlider::handle:horizontal {{ width: 14px; height: 14px;"
+            f" margin: -6px 0; border-radius: 7px; background: {c['progress_fill']}; }}"
+            f"QSlider::handle:horizontal:hover {{ background: {c['text']}; }}"
+            f"QSlider:disabled {{ }}"
+            f"QSlider::sub-page:horizontal:disabled {{ background: {c['progress_track']}; }}"
+            f"QSlider::handle:horizontal:disabled {{ background: {c['progress_track']}; }}"
         )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPropertyAnimation, QRect, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QToolTip, QWidget
 
@@ -328,8 +328,9 @@ class ComicViewer(QGraphicsView):
             self.scale(self._zoom_factor, self._zoom_factor)
 
 
-_BAR_TRACK = QColor("#2d2d2d")
-_BAR_FILL = QColor("#4a9eff")
+_BAR_TRACK = QColor("#4a3535")        # matches dark theme progress_track
+_BAR_FILL = QColor("#c06060")         # matches dark theme progress_fill
+_BAR_HANDLE_HOVER = QColor("#f5e6e6") # matches dark theme text (handle :hover)
 _BAR_BOOKMARK = QColor("#ffffff")
 _BOOKMARK_SNAP_PX = 5  # pixels either side of a tick that triggers tooltip
 
@@ -339,17 +340,19 @@ class SeekBar(QWidget):
 
     seeked = pyqtSignal(int)  # page index to jump to
 
-    _VISUAL_H = 3   # height of the drawn bar
-    _WIDGET_H = 12  # total hit area height
+    _GROOVE_H = 4    # height of the drawn groove
+    _HANDLE_D = 14   # diameter of the round handle
+    _WIDGET_H = 16   # total hit area height (fits the handle)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(self._WIDGET_H)
-        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setMouseTracking(True)
         self._ratio: float = 0.0
         self._drag_ratio: float | None = None
         self._page_count: int = 0
+        self._hover: bool = False
         self._bookmarks: list[tuple[int, str | None]] = []  # (page_index, label)
 
     def set_page_count(self, n: int):
@@ -403,20 +406,43 @@ class SeekBar(QWidget):
             self._drag_ratio = None
             self.seeked.emit(self._page_from_ratio(ratio))
 
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+
     def paintEvent(self, event):
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
         w = self.width()
-        y = (self._WIDGET_H - self._VISUAL_H) // 2
+        cy = self._WIDGET_H / 2
+        gy = cy - self._GROOVE_H / 2
+        r = self._GROOVE_H / 2
         ratio = self._drag_ratio if self._drag_ratio is not None else self._ratio
-        painter.fillRect(0, y, w, self._VISUAL_H, _BAR_TRACK)
-        painter.fillRect(0, y, int(w * ratio), self._VISUAL_H, _BAR_FILL)
 
-        # Bookmark ticks — 2px white lines spanning full widget height
+        # Rounded groove + fill (sub-page), matching the ebook slider.
+        painter.setBrush(_BAR_TRACK)
+        painter.drawRoundedRect(QRectF(0, gy, w, self._GROOVE_H), r, r)
+        if ratio > 0:
+            painter.setBrush(_BAR_FILL)
+            painter.drawRoundedRect(QRectF(0, gy, w * ratio, self._GROOVE_H), r, r)
+
+        # Bookmark ticks — white lines spanning the full widget height.
         if self._page_count > 0 and self._bookmarks:
             painter.setPen(_BAR_BOOKMARK)
             for page_idx, _ in self._bookmarks:
                 x = int(w * page_idx / self._page_count)
                 painter.drawLine(x, 0, x, self._WIDGET_H)
+            painter.setPen(Qt.PenStyle.NoPen)
+
+        # Round handle at the current position.
+        hx = max(self._HANDLE_D / 2, min(w - self._HANDLE_D / 2, w * ratio))
+        painter.setBrush(_BAR_HANDLE_HOVER if self._hover else _BAR_FILL)
+        painter.drawEllipse(QPointF(hx, cy), self._HANDLE_D / 2, self._HANDLE_D / 2)
 
 
 # ---------------------------------------------------------------------------
