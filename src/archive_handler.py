@@ -164,6 +164,35 @@ class CBTReader(_ArchiveReader):
         self._tar.close()
 
 
+def _pdf_render_matrix(page: fitz.Page, doc: fitz.Document) -> fitz.Matrix:
+    """Pick a render scale that preserves embedded raster quality.
+
+    Many comic PDFs store a small page box (~120×180 pt) with a full-resolution
+    JPEG/JPX image drawn on top. A fixed 2× matrix only yields ~240×360 px,
+    which the viewer then upscales and looks soft. Scale to the largest
+    embedded image instead; fall back to 2× for vector-only pages.
+    """
+    _BASE_SCALE = 2.0
+    _MAX_LONG_SIDE = 8192
+
+    rect = page.rect
+    scale = _BASE_SCALE
+    if rect.width > 0 and rect.height > 0:
+        for img in page.get_images():
+            try:
+                info = doc.extract_image(img[0])
+            except Exception:
+                continue
+            scale = max(
+                scale,
+                info["width"] / rect.width,
+                info["height"] / rect.height,
+            )
+        longest_pt = max(rect.width, rect.height)
+        scale = min(scale, _MAX_LONG_SIDE / longest_pt)
+    return fitz.Matrix(scale, scale)
+
+
 class PDFReader(ComicReader):
     def __init__(self, file_path: str):
         super().__init__(file_path)
@@ -172,8 +201,7 @@ class PDFReader(ComicReader):
 
     def _read_page(self, index: int) -> bytes:
         page = self._doc.load_page(index)
-        # Render at 2x for crisp display.
-        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+        pix = page.get_pixmap(matrix=_pdf_render_matrix(page, self._doc))
         # Return uncompressed PPM rather than PNG: PNG-compressing a ~6-megapixel
         # raster (and decoding it again in Qt) is the single most expensive thing
         # we can do per page. PPM is a trivial header + raw RGB, so Qt loads it
