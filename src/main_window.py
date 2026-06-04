@@ -1141,7 +1141,7 @@ class MainWindow(QMainWindow):
 
     def next_page(self):
         if self._ebook_mode:
-            self._ebook_viewer.next_chapter()
+            self._ebook_viewer.next_page()
             return
         if not self._reader:
             return
@@ -1157,7 +1157,7 @@ class MainWindow(QMainWindow):
 
     def prev_page(self):
         if self._ebook_mode:
-            self._ebook_viewer.prev_chapter()
+            self._ebook_viewer.prev_page()
             return
         if not self._reader:
             return
