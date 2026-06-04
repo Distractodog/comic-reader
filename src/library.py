@@ -552,6 +552,19 @@ class Library:
         with self.transaction() as cur:
             cur.execute("DELETE FROM comics WHERE id = ?", (comic_id,))
 
+    def update_file_path(self, comic_id: int, new_path: str) -> None:
+        """Move a library row to a new on-disk path after a safe batch operation."""
+        new_parent = _parent_dir(new_path)
+        with self.transaction() as cur:
+            cur.execute(
+                """
+                UPDATE comics
+                SET file_path = ?, parent_dir = ?, source_folder = ?
+                WHERE id = ?
+                """,
+                (new_path, new_parent, new_parent, comic_id),
+            )
+
     # ----- Hide / restore (remove from app without deleting from disk) -----
 
     def set_hidden(self, comic_id: int, hidden: bool = True) -> None:
@@ -1577,6 +1590,13 @@ if __name__ == "__main__":
 
     assert lib.comic_exists("/comics/batman.cbz")
     assert not lib.comic_exists("/comics/missing.cbz")
+    lib.update_file_path(id2, "/renamed/xmen-renamed.cbz")
+    assert not lib.comic_exists("/comics/xmen.cbz")
+    assert lib.comic_exists("/renamed/xmen-renamed.cbz")
+    assert lib._conn.execute(
+        "SELECT parent_dir FROM comics WHERE id = ?", (id2,)
+    ).fetchone()["parent_dir"] == "/renamed"
+    lib.update_file_path(id2, "/comics/xmen.cbz")
 
     comics = lib.get_all_comics(sort_by="title", order="asc")
     assert len(comics) == 2

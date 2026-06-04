@@ -16,12 +16,14 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
+from batch_tools import BatchPlan, BatchWorker, plan_convert_to_cbz, plan_rename_from_metadata
 from library import Comic, Folder, Library, Series, Shelf
 
 TILE_W = 200
@@ -466,6 +468,9 @@ class BookshelfView(QWidget):
         self._ordered_tiles: list[_Tile] = []
         self._cover_loader: _CoverLoader | None = None
         self._cover_gen: int = 0
+        self._batch_thread: QThread | None = None
+        self._batch_worker: BatchWorker | None = None
+        self._batch_progress: QProgressDialog | None = None
 
         self._sort_by = "title"
         self._sort_order = "asc"
@@ -931,6 +936,14 @@ class BookshelfView(QWidget):
                 lambda: self._ungroup_series(self._current_folder, self._current_series_name)
             )
 
+        batch_menu = menu.addMenu("Batch")
+        batch_menu.addAction("Convert to CBZ…").triggered.connect(
+            lambda: self._plan_batch_convert(target_ids)
+        )
+        batch_menu.addAction("Rename from metadata…").triggered.connect(
+            lambda: self._plan_batch_rename(target_ids)
+        )
+
         # Cover override (single comic only)
         if not is_multi:
             comic = self._library.get_comic_by_id(comic_id)
@@ -1063,6 +1076,107 @@ class BookshelfView(QWidget):
                 self._library.remove_comic_from_shelf(cid, self._current_shelf_id)
             self._nav_transition(self._repopulate)
             self.shelf_changed.emit()
+
+    # ----- Batch tools -----
+
+    def _selected_comics_for_batch(self, comic_ids: list[int]) -> list[Comic]:
+        comics: list[Comic] = []
+        for cid in comic_ids:
+            comic = self._library.get_comic_by_id(cid)
+            if comic:
+                comics.append(comic)
+        return comics
+
+    def _plan_batch_convert(self, comic_ids: list[int]) -> None:
+        plan = plan_convert_to_cbz(self._selected_comics_for_batch(comic_ids))
+        self._confirm_and_run_batch(plan, "Convert to CBZ")
+
+    def _plan_batch_rename(self, comic_ids: list[int]) -> None:
+        plan = plan_rename_from_metadata(self._selected_comics_for_batch(comic_ids))
+        self._confirm_and_run_batch(plan, "Rename from Metadata")
+
+    def _confirm_and_run_batch(self, plan: BatchPlan, title: str) -> None:
+        if not plan.tasks:
+            skipped = "\n".join(f"- {Path(p).name}: {why}" for p, why in plan.skipped[:8])
+            QMessageBox.information(
+                self,
+                title,
+                "No files can be processed."
+                + (f"\n\nSkipped:\n{skipped}" if skipped else ""),
+            )
+            return
+
+        preview = "\n".join(
+            f"- {Path(t.source).name} → {Path(t.target).name}"
+            for t in plan.tasks[:8]
+        )
+        if len(plan.tasks) > 8:
+            preview += f"\n- ...and {len(plan.tasks) - 8} more"
+        skipped = ""
+        if plan.skipped:
+            skipped = "\n\nSkipped:\n" + "\n".join(
+                f"- {Path(p).name}: {why}" for p, why in plan.skipped[:6]
+            )
+            if len(plan.skipped) > 6:
+                skipped += f"\n- ...and {len(plan.skipped) - 6} more"
+        reply = QMessageBox.question(
+            self,
+            title,
+            f"Process {len(plan.tasks)} file(s)?\n\n{preview}{skipped}\n\n"
+            "Original files are not deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._run_batch(plan, title)
+
+    def _run_batch(self, plan: BatchPlan, title: str) -> None:
+        self._batch_thread = QThread(self)
+        self._batch_worker = BatchWorker(self._library, plan)
+        self._batch_worker.moveToThread(self._batch_thread)
+
+        self._batch_progress = QProgressDialog(title, "Cancel", 0, len(plan.tasks), self)
+        self._batch_progress.setWindowModality(Qt.WindowModality.WindowModal)
+        self._batch_progress.canceled.connect(self._batch_worker.cancel)
+
+        self._batch_thread.started.connect(self._batch_worker.run)
+        self._batch_worker.progress.connect(self._on_batch_progress)
+        self._batch_worker.finished.connect(self._on_batch_finished)
+        self._batch_worker.finished.connect(self._batch_thread.quit)
+        self._batch_thread.finished.connect(self._batch_worker.deleteLater)
+        self._batch_thread.finished.connect(self._batch_thread.deleteLater)
+        self._batch_thread.start()
+
+    def _on_batch_progress(self, current: int, total: int, name: str) -> None:
+        if not self._batch_progress:
+            return
+        self._batch_progress.setMaximum(total)
+        self._batch_progress.setValue(current)
+        self._batch_progress.setLabelText(name)
+
+    def _on_batch_finished(self, result) -> None:
+        if self._batch_progress:
+            self._batch_progress.close()
+        self._batch_thread = None
+        self._batch_worker = None
+        self._batch_progress = None
+
+        self._clear_selection()
+        self._nav_transition(self._repopulate)
+        self.shelf_changed.emit()
+
+        pieces = [f"Completed: {result.completed}"]
+        if result.skipped:
+            pieces.append(f"Skipped: {len(result.skipped)}")
+        if result.errors:
+            pieces.append(f"Errors: {len(result.errors)}")
+        detail = "\n".join(pieces)
+        if result.errors:
+            detail += "\n\n" + "\n".join(
+                f"- {Path(p).name}: {err}" for p, err in result.errors[:8]
+            )
+        QMessageBox.information(self, "Batch Complete", detail)
 
     # ----- Hide / restore -----
 
