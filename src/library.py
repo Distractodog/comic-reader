@@ -45,6 +45,16 @@ class Bookmark:
 
 
 @dataclass
+class Annotation:
+    id: int
+    comic_id: int
+    page_index: int
+    body: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass
 class Comic:
     id: int
     file_path: str
@@ -276,7 +286,19 @@ CREATE TABLE IF NOT EXISTS reading_queue (
 );
 """
 
-_CURRENT_VERSION = 12
+_SCHEMA_V13_ANNOTATIONS = """
+CREATE TABLE IF NOT EXISTS annotations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    comic_id   INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+    page_index INTEGER NOT NULL,
+    body       TEXT    NOT NULL,
+    created_at TEXT    NOT NULL,
+    updated_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_annotations_comic ON annotations(comic_id);
+"""
+
+_CURRENT_VERSION = 13
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 
@@ -385,6 +407,12 @@ class Library:
             # User-curated reading queue ("read next").
             self._conn.executescript(_SCHEMA_V12_READING_QUEUE)
             self._conn.execute("PRAGMA user_version = 12")
+            self._conn.commit()
+            version = 12
+        if version < 13:
+            # Per-page annotations for image comic readers.
+            self._conn.executescript(_SCHEMA_V13_ANNOTATIONS)
+            self._conn.execute("PRAGMA user_version = 13")
             self._conn.commit()
 
     def _seed_smart_shelves(self):
@@ -1141,6 +1169,74 @@ class Library:
         ).fetchone()
         return row is not None
 
+    # ----- Annotation CRUD -----
+
+    def add_annotation(self, comic_id: int, page_index: int, body: str) -> int:
+        body = body.strip()
+        if not body:
+            raise ValueError("Annotation body cannot be empty.")
+        now = datetime.now(timezone.utc).isoformat()
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO annotations"
+                " (comic_id, page_index, body, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (comic_id, page_index, body, now, now),
+            )
+            return int(cur.lastrowid)
+
+    def update_annotation(self, annotation_id: int, body: str) -> None:
+        body = body.strip()
+        if not body:
+            raise ValueError("Annotation body cannot be empty.")
+        now = datetime.now(timezone.utc).isoformat()
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE annotations SET body = ?, updated_at = ? WHERE id = ?",
+                (body, now, annotation_id),
+            )
+
+    def delete_annotation(self, annotation_id: int) -> None:
+        with self.transaction() as cur:
+            cur.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+
+    def get_annotations(self, comic_id: int) -> list[Annotation]:
+        rows = self._conn.execute(
+            "SELECT * FROM annotations WHERE comic_id = ? ORDER BY page_index, id",
+            (comic_id,),
+        ).fetchall()
+        return [
+            Annotation(
+                id=r["id"],
+                comic_id=r["comic_id"],
+                page_index=r["page_index"],
+                body=r["body"],
+                created_at=r["created_at"],
+                updated_at=r["updated_at"],
+            )
+            for r in rows
+        ]
+
+    def get_annotation_for_page(
+        self, comic_id: int, page_index: int
+    ) -> Annotation | None:
+        row = self._conn.execute(
+            "SELECT * FROM annotations"
+            " WHERE comic_id = ? AND page_index = ?"
+            " ORDER BY updated_at DESC, id DESC LIMIT 1",
+            (comic_id, page_index),
+        ).fetchone()
+        if row is None:
+            return None
+        return Annotation(
+            id=row["id"],
+            comic_id=row["comic_id"],
+            page_index=row["page_index"],
+            body=row["body"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
     # ----- Per-comic reading settings -----
 
     def set_reading_mode(self, comic_id: int, mode: str) -> None:
@@ -1245,6 +1341,15 @@ class Library:
                         "created_at": b.created_at,
                     }
                     for b in self.get_bookmarks(comic_id)
+                ],
+                "annotations": [
+                    {
+                        "page_index": a.page_index,
+                        "body": a.body,
+                        "created_at": a.created_at,
+                        "updated_at": a.updated_at,
+                    }
+                    for a in self.get_annotations(comic_id)
                 ],
             })
 
@@ -1385,6 +1490,26 @@ class Library:
                             bm.get("page_index") or 0,
                             bm.get("label"),
                             bm.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                        ),
+                    )
+
+                cur.execute("DELETE FROM annotations WHERE comic_id = ?", (comic_id,))
+                for note in item.get("annotations", []):
+                    body = str(note.get("body") or "").strip()
+                    if not body:
+                        continue
+                    created = note.get("created_at") or datetime.now(timezone.utc).isoformat()
+                    updated = note.get("updated_at") or created
+                    cur.execute(
+                        "INSERT INTO annotations"
+                        " (comic_id, page_index, body, created_at, updated_at)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (
+                            comic_id,
+                            note.get("page_index") or 0,
+                            body,
+                            created,
+                            updated,
                         ),
                     )
 
@@ -1630,6 +1755,11 @@ if __name__ == "__main__":
     lib.set_folder_cover("/comics", "/cache/custom.jpg")
     lib.set_tags_for_comic(id1, ["classic"])
     lib.toggle_bookmark(id1, 3, "Opening")
+    note_id = lib.add_annotation(id1, 4, "Check this panel")
+    assert lib.get_annotation_for_page(id1, 4).body == "Check this panel"
+    lib.update_annotation(note_id, "Updated note")
+    assert lib.get_annotation_for_page(id1, 4).body == "Updated note"
+    assert len(lib.get_annotations(id1)) == 1
     lib.set_fit_mode(id1, "width")
     lib.set_zoom(id1, 1.5)
     lib.set_cover_override(id1, True)
@@ -1647,6 +1777,10 @@ if __name__ == "__main__":
         assert imported_comic is not None
         assert imported.get_tags_for_comic(imported_comic.id) == ["classic"]
         assert len(imported.get_bookmarks(imported_comic.id)) == 1
+        imported_notes = imported.get_annotations(imported_comic.id)
+        assert len(imported_notes) == 1
+        assert imported_notes[0].page_index == 4
+        assert imported_notes[0].body == "Updated note"
         assert any(s.name == "Export Shelf" for s in imported.get_shelves())
         assert imported.get_folder_cover("/comics") == "/cache/custom.jpg"
         assert imported_comic.fit_mode == "width"
@@ -1684,6 +1818,9 @@ if __name__ == "__main__":
     lib.set_hidden(q2, True)                                  # hidden comics drop out of the queue view
     assert [c.id for c in lib.get_queue()] == [q3]
     lib.set_hidden(q2, False)
+
+    lib.delete_annotation(note_id)
+    assert lib.get_annotation_for_page(id1, 4) is None
 
     lib.close()
     print("library.py smoke test: OK")

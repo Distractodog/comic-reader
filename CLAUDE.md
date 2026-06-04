@@ -76,15 +76,17 @@ comic-reader/
     ```
 - **Windows build:** push to `main` → GitHub Actions runs → `.exe` appears as workflow artifact. Tag `v1.0.0` etc. to publish a Release.
 
-## Current status (as of 2026-06-03)
+## Current status (as of 2026-06-04)
 
-- **Phase 5 in progress** (see `PHASE5_PLAN.md` + `PHASE5_TASKS.md`). DB schema now at **v11**. Done so far:
+- **Phase 5 in progress** (see `PHASE5_PLAN.md` + `PHASE5_TASKS.md`). DB schema now at **v13**. Done so far:
   - Item 40: per-comic fit mode + zoom (schema v8)
   - Item 37: per-comic cover override from page or image file; `cover_override` flag (schema v9) survives rescans
   - Item 36: duplicate detection — cheap content signature (size + first/last 64 KB sha256), background `DuplicateScanner`, review dialog with per-copy hide (schema v10 indexes `content_hash`)
   - Item 34: reading statistics — `reading_events` log (schema v11), session timer in `MainWindow` (net forward pages + capped time), `StatsDialog` with paintEvent pages/day chart
-  - Remaining offline order: 35 → 41 → 39 → 43 → 33, then the network tier (38, 42, AI Org)
-- **Text/novel EPUB reading** (user-requested, off-roadmap): text EPUBs now open in a dedicated `EbookViewer` (QTextBrowser, paper-themed page, chapter nav, font sizing, remembered chapter). Auto-detected vs image comic EPUBs via `epub_book.is_text_epub()`. Stack index 3. Scanner stores chapter count as `page_count` and pulls the OPF cover. No new dependency.
+  - Item 35: Reading Queue / read-next list (schema v12), sidebar view, context-menu add/remove/reorder, whole-book EPUB seek bar, matching comic seek bar styling, and end-of-book prompt to continue into the next queued book
+  - Item 41: per-page annotations/notes for image comic readers (schema v13), exported/imported with library JSON, reader-menu add/edit/delete dialog, seek-bar note markers
+  - Remaining offline order: 39 → 43 → 33, then the network tier (38, 42, AI Org)
+- **Text/novel EPUB reading** (user-requested, off-roadmap): text EPUBs now open in a dedicated `EbookViewer` using true page-box pagination (not scroll offsets), chapter nav, font sizing, remembered font size/chapter, a whole-book seek bar, sideswipe/slide page turns, and an explicit exit path. Auto-detected vs image comic EPUBs via `epub_book.is_text_epub()`. Stack index 3. Scanner stores chapter count as `page_count` and pulls the OPF cover. No new dependency. EPUB annotations are intentionally deferred because page indices change with font/window layout.
 
 ### Status before Phase 5 (as of 2026-05-29)
 

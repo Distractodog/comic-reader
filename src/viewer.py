@@ -332,6 +332,7 @@ _BAR_TRACK = QColor("#4a3535")        # matches dark theme progress_track
 _BAR_FILL = QColor("#c06060")         # matches dark theme progress_fill
 _BAR_HANDLE_HOVER = QColor("#f5e6e6") # matches dark theme text (handle :hover)
 _BAR_BOOKMARK = QColor("#ffffff")
+_BAR_NOTE = QColor("#f0c76a")
 _BOOKMARK_SNAP_PX = 5  # pixels either side of a tick that triggers tooltip
 
 
@@ -354,6 +355,7 @@ class SeekBar(QWidget):
         self._page_count: int = 0
         self._hover: bool = False
         self._bookmarks: list[tuple[int, str | None]] = []  # (page_index, label)
+        self._notes: list[tuple[int, str]] = []              # (page_index, body)
 
     def set_page_count(self, n: int):
         self._page_count = n
@@ -366,6 +368,10 @@ class SeekBar(QWidget):
 
     def set_bookmarks(self, marks: list[tuple[int, str | None]]) -> None:
         self._bookmarks = marks
+        self.update()
+
+    def set_notes(self, notes: list[tuple[int, str]]) -> None:
+        self._notes = notes
         self.update()
 
     def _ratio_from_x(self, x: float) -> float:
@@ -388,10 +394,22 @@ class SeekBar(QWidget):
             self.update()
             return
 
-        # Show bookmark tooltip when hovering near a tick
-        if self._page_count > 0 and self._bookmarks:
+        # Show bookmark/note tooltip when hovering near a tick.
+        if self._page_count > 0 and (self._bookmarks or self._notes):
             mx = event.position().x()
             w = self.width()
+            for page_idx, body in self._notes:
+                tick_x = int(w * page_idx / self._page_count)
+                if abs(mx - tick_x) <= _BOOKMARK_SNAP_PX:
+                    preview = body.replace("\n", " ").strip()
+                    if len(preview) > 80:
+                        preview = preview[:77] + "..."
+                    QToolTip.showText(
+                        event.globalPosition().toPoint(),
+                        f"Note, page {page_idx + 1}: {preview}",
+                        self,
+                    )
+                    return
             for page_idx, label in self._bookmarks:
                 tick_x = int(w * page_idx / self._page_count)
                 if abs(mx - tick_x) <= _BOOKMARK_SNAP_PX:
@@ -437,6 +455,14 @@ class SeekBar(QWidget):
             for page_idx, _ in self._bookmarks:
                 x = int(w * page_idx / self._page_count)
                 painter.drawLine(x, 0, x, self._WIDGET_H)
+            painter.setPen(Qt.PenStyle.NoPen)
+
+        # Annotation ticks — shorter gold lines so notes and bookmarks are distinct.
+        if self._page_count > 0 and self._notes:
+            painter.setPen(_BAR_NOTE)
+            for page_idx, _ in self._notes:
+                x = int(w * page_idx / self._page_count)
+                painter.drawLine(x, 2, x, self._WIDGET_H - 2)
             painter.setPen(Qt.PenStyle.NoPen)
 
         # Round handle at the current position.

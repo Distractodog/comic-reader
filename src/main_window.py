@@ -8,6 +8,8 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPropertyAnimation, QSettings, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
@@ -17,6 +19,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressDialog,
     QPushButton,
     QScrollArea,
@@ -90,6 +93,59 @@ class _ReaderBar(QWidget):
             f" font-size: 18px; padding: 0;"
         )
         self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
+
+
+class _AnnotationDialog(QDialog):
+    """Small themed editor for one page note."""
+
+    def __init__(self, body: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Page Note")
+        self._delete_requested = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        self._editor = QPlainTextEdit()
+        self._editor.setPlainText(body)
+        self._editor.setMinimumSize(420, 180)
+        layout.addWidget(self._editor)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        if body:
+            delete_btn = buttons.addButton(
+                "Delete", QDialogButtonBox.ButtonRole.DestructiveRole
+            )
+            delete_btn.clicked.connect(self._delete)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _delete(self) -> None:
+        self._delete_requested = True
+        self.accept()
+
+    def body(self) -> str:
+        return self._editor.toPlainText().strip()
+
+    def delete_requested(self) -> bool:
+        return self._delete_requested
+
+    def apply_theme(self, c: dict) -> None:
+        self.setStyleSheet(
+            f"QDialog {{ background: {c['app_bg']}; color: {c['text']}; }}"
+            f"QPlainTextEdit {{ background: {c['input_bg']}; color: {c['text']};"
+            f" border: 1px solid {c['border']}; border-radius: 4px;"
+            f" padding: 8px; selection-background-color: {c['selection_bg']}; }}"
+            f"QPushButton {{ background: {c['sidebar_bg']}; color: {c['text']};"
+            f" border: 1px solid {c['border']}; border-radius: 4px;"
+            f" padding: 6px 14px; }}"
+            f"QPushButton:hover {{ background: {c['hover_bg']}; }}"
+        )
 
 
 from archive_handler import ComicReader, open_comic
@@ -376,6 +432,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Comic Reader")
         self.resize(1100, 1000)
 
+        self._theme = themes.DARK
         self._reader: ComicReader | None = None
         self._current_page: int = 0
         self._current_comic_id: int | None = None
@@ -734,6 +791,15 @@ class MainWindow(QMainWindow):
         bm_act = menu.addAction(bm_text)
         bm_act.triggered.connect(self._toggle_bookmark)
 
+        note = None
+        if self._current_comic_id is not None:
+            note = self._library.get_annotation_for_page(
+                self._current_comic_id, self._current_page
+            )
+        note_text = "Edit note for this page…" if note else "Add note for this page…"
+        note_act = menu.addAction(note_text)
+        note_act.triggered.connect(self._edit_page_note)
+
         menu.addSeparator()
 
         thumb_act = menu.addAction("Page thumbnails")
@@ -877,9 +943,47 @@ class MainWindow(QMainWindow):
     def _reload_bookmarks(self) -> None:
         if self._current_comic_id is None:
             self._seek_bar.set_bookmarks([])
+            self._seek_bar.set_notes([])
             return
         bookmarks = self._library.get_bookmarks(self._current_comic_id)
         self._seek_bar.set_bookmarks([(b.page_index, b.label) for b in bookmarks])
+        annotations = self._library.get_annotations(self._current_comic_id)
+        self._seek_bar.set_notes([(a.page_index, a.body) for a in annotations])
+
+    def _edit_page_note(self) -> None:
+        if self._current_comic_id is None or not self._reader:
+            return
+        if self._stack.currentIndex() not in (1, 2):
+            return
+
+        existing = self._library.get_annotation_for_page(
+            self._current_comic_id, self._current_page
+        )
+        dlg = _AnnotationDialog(existing.body if existing else "", self)
+        dlg.apply_theme(self._theme)
+        if not dlg.exec():
+            return
+
+        if dlg.delete_requested():
+            if existing:
+                self._library.delete_annotation(existing.id)
+                self.statusBar().showMessage("Page note deleted", 2500)
+            self._reload_bookmarks()
+            return
+
+        body = dlg.body()
+        if not body:
+            QMessageBox.information(self, "Page Note", "Write a note or choose Delete.")
+            return
+        if existing:
+            self._library.update_annotation(existing.id, body)
+            self.statusBar().showMessage("Page note updated", 2500)
+        else:
+            self._library.add_annotation(
+                self._current_comic_id, self._current_page, body
+            )
+            self.statusBar().showMessage("Page note added", 2500)
+        self._reload_bookmarks()
 
     # ----- Preloader helpers -----
 
@@ -926,6 +1030,7 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self, c: dict):
         from PyQt6.QtWidgets import QApplication
+        self._theme = c
         QApplication.instance().setStyleSheet(themes.app_stylesheet(c))
         self._sidebar.apply_theme(c)
         self._reader_bar.apply_theme(c)
