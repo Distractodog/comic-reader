@@ -487,6 +487,8 @@ class MainWindow(QMainWindow):
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
         self._webtoon_viewer.mouse_moved.connect(self._on_viewer_mouse_y)
         self._ebook_viewer.chapter_changed.connect(self._on_ebook_chapter_changed)
+        self._ebook_viewer.mouse_moved.connect(self._on_viewer_mouse_y)
+        self._ebook_viewer.exit_requested.connect(self._back_to_library)
 
         self._build_menus()
 

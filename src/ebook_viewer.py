@@ -3,16 +3,18 @@
 The book is rendered one chapter at a time, but instead of a single long
 scroll, each chapter is split into screen-sized **pages**. Next/Prev (buttons,
 arrow keys, space, or the mouse wheel) flip one page at a time and roll over
-into the next/previous chapter at the edges. Rendering fidelity is "good
-novel", not pixel-perfect CSS — by design (no web-engine dependency).
+into the next/previous chapter at the edges. Free scrolling is disabled so the
+view always lands on a clean page. Rendering fidelity is "good novel", not
+pixel-perfect CSS — by design (no web-engine dependency).
 """
 
 from __future__ import annotations
 
 import math
+import time
 from posixpath import normpath
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, Qt, pyqtSignal
 from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -39,9 +41,7 @@ DEFAULT_FONT_PT = 19
 
 
 class _BookTextBrowser(QTextBrowser):
-    """QTextBrowser that pulls images from the EPUB and forwards wheel turns."""
-
-    wheel_turned = pyqtSignal(int)  # +1 = next page, -1 = previous page
+    """QTextBrowser that pulls images from the EPUB and scales oversized ones."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -49,7 +49,7 @@ class _BookTextBrowser(QTextBrowser):
         self._base = ""
         self.setOpenExternalLinks(False)
         self.setOpenLinks(False)
-        # Pagination is driven explicitly; hide the scrollbar and keep keyboard
+        # Pagination is driven explicitly; hide scrollbars and keep keyboard
         # focus on the window so app shortcuts (arrows/space) reach navigation.
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -79,13 +79,11 @@ class _BookTextBrowser(QTextBrowser):
                         return img
         return super().loadResource(type_, url)
 
-    def wheelEvent(self, event):
-        self.wheel_turned.emit(1 if event.angleDelta().y() < 0 else -1)
-        event.accept()
-
 
 class EbookViewer(QWidget):
     chapter_changed = pyqtSignal(int)  # current chapter index
+    mouse_moved = pyqtSignal(int)      # viewport y — for fullscreen bar reveal
+    exit_requested = pyqtSignal()      # user asked to leave the book
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -94,6 +92,7 @@ class EbookViewer(QWidget):
         self._page = 0
         self._page_count = 1
         self._font_pt = DEFAULT_FONT_PT
+        self._last_wheel = 0.0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -105,7 +104,10 @@ class EbookViewer(QWidget):
             f"QTextBrowser {{ background: {_PAGE_BG}; color: {_PAGE_FG};"
             f" border: none; }}"
         )
-        self._browser.wheel_turned.connect(self._on_wheel)
+        # Intercept wheel (block free-scroll → page turns) and mouse-move
+        # (reveal the top bar in fullscreen) on the scroll viewport.
+        self._browser.viewport().installEventFilter(self)
+        self._browser.viewport().setMouseTracking(True)
         layout.addWidget(self._browser, 1)
 
         # Bottom navigation bar
@@ -116,6 +118,8 @@ class EbookViewer(QWidget):
         bar_layout.setContentsMargins(12, 6, 12, 6)
         bar_layout.setSpacing(8)
 
+        self._exit_btn = QPushButton("⌂ Library")
+        self._exit_btn.clicked.connect(self.exit_requested.emit)
         self._prev_btn = QPushButton("‹ Prev")
         self._prev_btn.clicked.connect(self.prev_page)
         self._next_btn = QPushButton("Next ›")
@@ -131,6 +135,8 @@ class EbookViewer(QWidget):
         self._label = QLabel("")
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        bar_layout.addWidget(self._exit_btn)
+        bar_layout.addSpacing(8)
         bar_layout.addWidget(self._prev_btn)
         bar_layout.addWidget(self._smaller_btn)
         bar_layout.addWidget(self._larger_btn)
@@ -140,6 +146,23 @@ class EbookViewer(QWidget):
         bar_layout.addWidget(self._next_btn)
         layout.addWidget(bar)
         self._nav_bar = bar
+
+    # ----- event interception (wheel = pages, move = bar reveal) -----
+
+    def eventFilter(self, obj, event):
+        if obj is self._browser.viewport():
+            if event.type() == QEvent.Type.Wheel:
+                now = time.monotonic()
+                if now - self._last_wheel >= 0.18:  # throttle to page-like steps
+                    self._last_wheel = now
+                    if event.angleDelta().y() < 0:
+                        self.next_page()
+                    else:
+                        self.prev_page()
+                return True  # always swallow → no free scrolling
+            if event.type() == QEvent.Type.MouseMove:
+                self.mouse_moved.emit(int(event.position().y()))
+        return super().eventFilter(obj, event)
 
     # ----- loading -----
 
@@ -179,9 +202,6 @@ class EbookViewer(QWidget):
         if self._index > 0:
             self._render_chapter(self._index - 1)
 
-    def _on_wheel(self, direction: int) -> None:
-        self.next_page() if direction > 0 else self.prev_page()
-
     # ----- font -----
 
     def adjust_font(self, delta: int) -> None:
@@ -191,9 +211,8 @@ class EbookViewer(QWidget):
         pt = max(MIN_FONT_PT, min(MAX_FONT_PT, int(pt)))
         if pt == self._font_pt:
             return
-        self._font_pt = pt
-        # Re-flow at the new size, keeping roughly the same spot in the chapter.
         frac = self._page / self._page_count if self._page_count else 0
+        self._font_pt = pt
         self._render_chapter(self._index, keep_index=True)
         self._goto_page(round(frac * self._page_count))
 
@@ -202,7 +221,7 @@ class EbookViewer(QWidget):
     def _render_chapter(self, index: int, to_last_page: bool = False, keep_index: bool = False) -> None:
         if self._book is None:
             return
-        chapter_switched = index != self._index or not keep_index
+        emit = (index != self._index) or (not keep_index)
         self._index = index
         html = self._book.chapter_html(index)
         base = self._book.chapter_base_dir(index)
@@ -210,9 +229,8 @@ class EbookViewer(QWidget):
         self._browser.document().setDefaultStyleSheet(self._reader_css())
         self._browser.setHtml(html)
         self._recompute_pages()
-        self._page = self._page_count - 1 if to_last_page else 0
-        self._goto_page(self._page)
-        if chapter_switched and not keep_index:
+        self._goto_page(self._page_count - 1 if to_last_page else 0)
+        if emit:
             self.chapter_changed.emit(self._index)
 
     def _page_step(self) -> int:
@@ -228,17 +246,24 @@ class EbookViewer(QWidget):
         doc.setTextWidth(vp_w)
         content_h = doc.size().height()
         max_scroll = max(0.0, content_h - vp_h)
-        if max_scroll <= 0:
-            self._page_count = 1
-        else:
-            self._page_count = math.ceil(max_scroll / self._page_step()) + 1
+        self._page_count = 1 if max_scroll <= 0 else math.ceil(max_scroll / self._page_step()) + 1
 
     def _goto_page(self, page: int) -> None:
         self._page = max(0, min(page, self._page_count - 1))
         sb = self._browser.verticalScrollBar()
         target = min(self._page * self._page_step(), sb.maximum())
         sb.setValue(int(target))
+        if self._page > 0:
+            self._snap_top_line()
         self._update_label()
+
+    def _snap_top_line(self) -> None:
+        """Nudge the scroll so the top line isn't clipped mid-glyph."""
+        cursor = self._browser.cursorForPosition(QPoint(6, 2))
+        rect = self._browser.cursorRect(cursor)
+        if rect.top() < 0:
+            sb = self._browser.verticalScrollBar()
+            sb.setValue(max(0, sb.value() + rect.top()))
 
     def _update_label(self) -> None:
         if self._book is None:
@@ -257,12 +282,23 @@ class EbookViewer(QWidget):
         self._prev_btn.setEnabled(not at_start)
         self._next_btn.setEnabled(not at_end)
 
+    def _reflow(self) -> None:
+        """Recompute pagination for the current viewport, keeping the spot."""
+        if self._book is None:
+            return
+        frac = self._page / self._page_count if self._page_count else 0
+        self._recompute_pages()
+        self._goto_page(round(frac * self._page_count))
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._book is not None:
-            frac = self._page / self._page_count if self._page_count else 0
-            self._recompute_pages()
-            self._goto_page(round(frac * self._page_count))
+        self._reflow()
+
+    def showEvent(self, event):
+        # The stack may switch to this view without a resize, so the first real
+        # pagination has to happen here, once the viewport has its true size.
+        super().showEvent(event)
+        self._reflow()
 
     def _reader_css(self) -> str:
         pt = self._font_pt
