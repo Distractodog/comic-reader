@@ -456,6 +456,7 @@ class BookshelfView(QWidget):
         self._current_shelf_name: str = ""
         self._current_series_name: str | None = None
         self._show_hidden_mode: bool = False
+        self._queue_mode: bool = False
         self._last_n_cols = 0
 
         self._selected_ids: set[int] = set()
@@ -624,6 +625,7 @@ class BookshelfView(QWidget):
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._show_hidden_mode = False
+            self._queue_mode = False
             self._header.set_folder_mode()
             self._last_n_cols = 0
             self._repopulate()
@@ -637,6 +639,7 @@ class BookshelfView(QWidget):
             self._current_shelf_name = ""
             self._current_series_name = None
             self._show_hidden_mode = False
+            self._queue_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
@@ -654,6 +657,7 @@ class BookshelfView(QWidget):
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._show_hidden_mode = False
+            self._queue_mode = False
             self._header.set_shelf_mode(shelf_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -669,6 +673,7 @@ class BookshelfView(QWidget):
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._show_hidden_mode = False
+            self._queue_mode = False
             self._header.set_series_mode(series_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -683,6 +688,7 @@ class BookshelfView(QWidget):
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._show_hidden_mode = False
+            self._queue_mode = False
             self._header.set_shelf_mode(self._current_shelf_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -695,6 +701,7 @@ class BookshelfView(QWidget):
             self._current_folder = folder_path
             self._current_series_name = None
             self._show_hidden_mode = False
+            self._queue_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
@@ -711,9 +718,27 @@ class BookshelfView(QWidget):
             self._current_shelf_name = ""
             self._current_series_name = None
             self._show_hidden_mode = True
+            self._queue_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_shelf_mode("Hidden")
+            self._last_n_cols = 0
+            self._repopulate()
+            self.folder_entered.emit(False)
+        self._nav_transition(do)
+
+    def show_queue(self):
+        """Show the Reading Queue — the user's manually ordered 'read next' list."""
+        def do():
+            self._current_folder = None
+            self._current_shelf_id = None
+            self._current_shelf_name = ""
+            self._current_series_name = None
+            self._show_hidden_mode = False
+            self._queue_mode = True
+            self._selected_ids.clear()
+            self._comic_tiles.clear()
+            self._header.set_shelf_mode("Reading Queue")
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(False)
@@ -751,7 +776,12 @@ class BookshelfView(QWidget):
         self._stop_cover_loader()
         self._ordered_tiles = []
 
-        if self._show_hidden_mode:
+        if self._queue_mode:
+            # Manual order — do NOT re-sort; get_queue() is already in position order.
+            items = self._library.get_queue()
+            empty_msg = ("Your reading queue is empty.\n"
+                         "Right-click any comic → Add to reading queue.")
+        elif self._show_hidden_mode:
             items = self._library.get_hidden_comics(
                 sort_by=self._sort_by, order=self._sort_order
             )
@@ -947,6 +977,28 @@ class BookshelfView(QWidget):
                     lambda: self._remove_comics_from_current_shelf(target_ids)
                 )
 
+        # Reading queue
+        menu.addSeparator()
+        if is_multi:
+            menu.addAction(f"Add {n} comics to reading queue").triggered.connect(
+                lambda: self._add_comics_to_queue(target_ids)
+            )
+        elif self._library.is_in_queue(comic_id):
+            menu.addAction("Remove from queue").triggered.connect(
+                lambda: self._toggle_comic_in_queue(comic_id, False)
+            )
+        else:
+            menu.addAction("Add to reading queue").triggered.connect(
+                lambda: self._toggle_comic_in_queue(comic_id, True)
+            )
+        if self._queue_mode and not is_multi:
+            menu.addAction("Move up").triggered.connect(
+                lambda: self._move_in_queue(comic_id, -1)
+            )
+            menu.addAction("Move down").triggered.connect(
+                lambda: self._move_in_queue(comic_id, +1)
+            )
+
         menu.addSeparator()
         remove_label = f"Remove {n} from library…" if is_multi else "Remove from library…"
         menu.addAction(remove_label).triggered.connect(
@@ -970,6 +1022,25 @@ class BookshelfView(QWidget):
         else:
             self._library.remove_comic_from_shelf(comic_id, shelf_id)
         self.shelf_changed.emit()
+
+    def _toggle_comic_in_queue(self, comic_id: int, add: bool):
+        if add:
+            self._library.add_to_queue(comic_id)
+        else:
+            self._library.remove_from_queue(comic_id)
+        if self._queue_mode:
+            self._nav_transition(self._repopulate)
+
+    def _add_comics_to_queue(self, comic_ids: list[int]):
+        for cid in comic_ids:
+            self._library.add_to_queue(cid)
+
+    def _move_in_queue(self, comic_id: int, direction: int):
+        if direction < 0:
+            self._library.move_up(comic_id)
+        else:
+            self._library.move_down(comic_id)
+        self._nav_transition(self._repopulate)
 
     def _remove_comics_from_current_shelf(self, comic_ids: list[int]):
         if self._current_shelf_id is not None:

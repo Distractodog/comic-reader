@@ -112,6 +112,7 @@ class _Sidebar(QWidget):
     """Left sidebar — action buttons + library/shelf navigation list."""
 
     show_folders_clicked = pyqtSignal()
+    show_queue_clicked = pyqtSignal()
     show_hidden_clicked = pyqtSignal()
     show_shelf_clicked = pyqtSignal(int, str)   # shelf_id, shelf_name
     add_folder_clicked = pyqtSignal()
@@ -125,10 +126,11 @@ class _Sidebar(QWidget):
     def __init__(self, library: Library, parent=None):
         super().__init__(parent)
         self._library = library
-        self._active_id: int = -1   # -1 = Folders, -2 = Hidden, int = shelf id
+        self._active_id: int = -1   # -1 = Folders, -2 = Hidden, -3 = Queue, int = shelf id
         self._shelf_btns: list[tuple[int, QPushButton]] = []
         self._folders_btn: QPushButton | None = None
         self._hidden_btn: QPushButton | None = None
+        self._queue_btn: QPushButton | None = None
         self._theme: dict = themes.DARK
 
         self.setFixedWidth(self.WIDTH)
@@ -215,6 +217,7 @@ class _Sidebar(QWidget):
         self._shelf_btns.clear()
         self._folders_btn = None
         self._hidden_btn = None
+        self._queue_btn = None
 
         # LIBRARY section
         self._list_layout.addWidget(self._section_label("LIBRARY"))
@@ -222,6 +225,11 @@ class _Sidebar(QWidget):
         self._folders_btn.setChecked(self._active_id == -1)
         self._folders_btn.clicked.connect(self._on_folders_clicked)
         self._list_layout.addWidget(self._folders_btn)
+
+        self._queue_btn = self._nav_btn("  Reading Queue")
+        self._queue_btn.setChecked(self._active_id == -3)
+        self._queue_btn.clicked.connect(self._on_queue_clicked)
+        self._list_layout.addWidget(self._queue_btn)
 
         self._hidden_btn = self._nav_btn("  Hidden")
         self._hidden_btn.setChecked(self._active_id == -2)
@@ -300,6 +308,10 @@ class _Sidebar(QWidget):
         self.set_active(-1)
         self.show_folders_clicked.emit()
 
+    def _on_queue_clicked(self):
+        self.set_active(-3)
+        self.show_queue_clicked.emit()
+
     def _on_hidden_clicked(self):
         self.set_active(-2)
         self.show_hidden_clicked.emit()
@@ -324,6 +336,8 @@ class _Sidebar(QWidget):
         self._active_id = active_id
         if self._folders_btn:
             self._folders_btn.setChecked(active_id == -1)
+        if self._queue_btn:
+            self._queue_btn.setChecked(active_id == -3)
         if self._hidden_btn:
             self._hidden_btn.setChecked(active_id == -2)
         for sid, btn in self._shelf_btns:
@@ -446,6 +460,7 @@ class MainWindow(QMainWindow):
 
         self._sidebar = _Sidebar(self._library)
         self._sidebar.show_folders_clicked.connect(self._bookshelf.go_to_root)
+        self._sidebar.show_queue_clicked.connect(self._bookshelf.show_queue)
         self._sidebar.show_hidden_clicked.connect(self._bookshelf.show_hidden)
         self._sidebar.show_shelf_clicked.connect(self._bookshelf.show_shelf)
         self._sidebar.add_folder_clicked.connect(self.add_folder_to_library)
