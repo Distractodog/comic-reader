@@ -725,14 +725,6 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._thumb_strip)
         content_layout.addWidget(self._seek_bar)
 
-        self._chrome_restore_btn = QPushButton("⛶", content)
-        self._chrome_restore_btn.setFlat(True)
-        self._chrome_restore_btn.setFixedSize(40, 36)
-        self._chrome_restore_btn.setToolTip("Show reader bars")
-        self._chrome_restore_btn.hide()
-        self._chrome_restore_btn.clicked.connect(self._show_reading_chrome)
-        self._chrome_restore_btn.raise_()
-
         self._sidebar = _Sidebar(self._library, hidden_nav_ids=self._sidebar_hidden_nav_ids)
         self._sidebar.show_folders_clicked.connect(self._bookshelf.go_to_root)
         self._sidebar.show_queue_clicked.connect(self._bookshelf.show_queue)
@@ -977,7 +969,6 @@ class MainWindow(QMainWindow):
 
         def do_switch():
             self._chrome_hidden = False
-            self._chrome_restore_btn.hide()
             self._hide_reader_bar(animated=False)
             self._seek_bar.setVisible(False)
             self._thumb_strip.setVisible(False)
@@ -1287,12 +1278,6 @@ class MainWindow(QMainWindow):
         QApplication.instance().setStyleSheet(themes.app_stylesheet(c))
         self._sidebar.apply_theme(c)
         self._reader_bar.apply_theme(c)
-        self._chrome_restore_btn.setStyleSheet(
-            f"QPushButton {{ background: {c['reader_bar_bg']}; color: {c['accent']};"
-            f" border: 1px solid {c['border']}; border-radius: 6px;"
-            f" font-size: 18px; }}"
-            f"QPushButton:hover {{ background: {c['hover_bg']}; }}"
-        )
         self._bookshelf.apply_theme(c)
         self._ebook_viewer.apply_theme(c)
 
@@ -1690,29 +1675,13 @@ class MainWindow(QMainWindow):
     def _is_reading_view(self) -> bool:
         return self._stack.currentIndex() in (1, 2, 3)
 
-    def _position_chrome_restore_btn(self) -> None:
-        if not self._chrome_restore_btn.isVisible():
-            return
-        margin = 10
-        x = self._content.width() - self._chrome_restore_btn.width() - margin
-        self._chrome_restore_btn.move(max(margin, x), margin)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._position_chrome_restore_btn()
-
     def _apply_reading_chrome(self) -> None:
         """Top + bottom reader bars: always on unless chrome-hidden mode is active."""
         self._reader_bar.set_chrome_hidden(self._chrome_hidden)
         if not self._is_reading_view():
-            self._chrome_restore_btn.hide()
             return
 
         hidden = self._chrome_hidden
-        self._chrome_restore_btn.setVisible(hidden)
-        if hidden:
-            self._position_chrome_restore_btn()
-
         if hidden:
             self._thumb_strip_before_chrome = self._thumb_strip.isVisible()
             self._hide_reader_bar(animated=False)
