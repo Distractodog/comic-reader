@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -582,6 +583,56 @@ class Library:
                 "UPDATE comics SET hidden = 1 WHERE parent_dir = ?", (folder_path,)
             )
 
+    def rename_folder(self, folder_path: str, new_name: str) -> str:
+        """Rename a folder on disk and update every comic path in the library."""
+        new_name = new_name.strip()
+        if not new_name or new_name in (".", ".."):
+            raise ValueError("Enter a valid folder name.")
+        if new_name != Path(new_name).name:
+            raise ValueError("Folder name cannot include / or \\.")
+        invalid = '<>:"/\\|?*'
+        if any(ch in new_name for ch in invalid):
+            raise ValueError("Folder name contains invalid characters.")
+
+        old = Path(folder_path)
+        if not old.is_dir():
+            raise FileNotFoundError("This folder was not found on disk.")
+
+        new_path = str(old.parent / new_name)
+        if new_path == folder_path:
+            return folder_path
+        if Path(new_path).exists():
+            raise FileExistsError("A folder with that name already exists here.")
+
+        rows = self._conn.execute(
+            "SELECT id, file_path FROM comics WHERE parent_dir = ?", (folder_path,)
+        ).fetchall()
+        if not rows:
+            raise ValueError("No comics in the library use this folder.")
+
+        os.rename(old, new_path)
+        try:
+            with self.transaction() as cur:
+                for row in rows:
+                    new_file = str(Path(new_path) / Path(row["file_path"]).name)
+                    cur.execute(
+                        """
+                        UPDATE comics
+                        SET file_path = ?, parent_dir = ?
+                        WHERE id = ?
+                        """,
+                        (new_file, new_path, row["id"]),
+                    )
+                cur.execute(
+                    "UPDATE folder_covers SET folder_path = ? WHERE folder_path = ?",
+                    (new_path, folder_path),
+                )
+        except Exception:
+            if Path(new_path).is_dir() and not Path(folder_path).is_dir():
+                os.rename(new_path, folder_path)
+            raise
+        return new_path
+
     def get_hidden_comics(
         self, *, sort_by: str = "title", order: str = "asc"
     ) -> list[Comic]:
@@ -948,6 +999,24 @@ class Library:
                 "INSERT OR IGNORE INTO comic_shelves (comic_id, shelf_id) VALUES (?, ?)",
                 (comic_id, shelf_id),
             )
+
+    def add_folder_to_shelf(self, folder_path: str, shelf_id: int) -> int:
+        """Add every comic in folder_path to a manual shelf. Returns comics linked."""
+        row = self._conn.execute(
+            "SELECT kind FROM shelves WHERE id = ?", (shelf_id,)
+        ).fetchone()
+        if row is None or row["kind"] != "manual":
+            return 0
+        comics = self.get_comics_in_folder(folder_path)
+        if not comics:
+            return 0
+        with self.transaction() as cur:
+            for comic in comics:
+                cur.execute(
+                    "INSERT OR IGNORE INTO comic_shelves (comic_id, shelf_id) VALUES (?, ?)",
+                    (comic.id, shelf_id),
+                )
+        return len(comics)
 
     def remove_comic_from_shelf(self, comic_id: int, shelf_id: int) -> None:
         with self.transaction() as cur:

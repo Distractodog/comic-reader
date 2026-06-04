@@ -65,10 +65,19 @@ class LibraryScanner(QObject):
     comic_added = pyqtSignal(int)         # comic_id
     finished = pyqtSignal(object)         # ScanResult
 
-    def __init__(self, library: Library, folder: Path, parent=None):
+    def __init__(
+        self,
+        library: Library,
+        folder: Path | None = None,
+        paths: list[Path] | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self._library = library
         self._folder = folder
+        self._paths = [Path(p) for p in paths] if paths else None
+        if self._folder is None and not self._paths:
+            raise ValueError("LibraryScanner requires folder or paths")
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -77,14 +86,19 @@ class LibraryScanner(QObject):
     def run(self) -> None:
         result = ScanResult()
 
-        # Pass 1: collect all comic file paths (fast — no file opening)
-        comic_paths = [
-            p for p in self._folder.rglob("*")
-            if p.is_file() and p.suffix.lower() in SCANNABLE_EXTENSIONS
-        ]
+        if self._paths is not None:
+            comic_paths = [
+                p.resolve()
+                for p in self._paths
+                if p.is_file() and p.suffix.lower() in SCANNABLE_EXTENSIONS
+            ]
+        else:
+            comic_paths = [
+                p for p in self._folder.rglob("*")
+                if p.is_file() and p.suffix.lower() in SCANNABLE_EXTENSIONS
+            ]
         total = len(comic_paths)
 
-        # Pass 2: open each file, read page count, insert into library
         for i, path in enumerate(comic_paths):
             if self._cancelled:
                 result.cancelled = True
@@ -116,11 +130,16 @@ class LibraryScanner(QObject):
             try:
                 page_count, meta, cover_bytes = _probe(path)
                 file_size = path.stat().st_size
+                source_folder = (
+                    str(path.parent)
+                    if self._paths is not None
+                    else str(self._folder)
+                )
                 comic_id = self._library.add_comic(
                     str(path),
                     page_count=page_count,
                     file_size=file_size,
-                    source_folder=str(self._folder),
+                    source_folder=source_folder,
                     **meta,
                 )
                 result.added += 1

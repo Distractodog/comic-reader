@@ -13,3 +13,5 @@ dist/
 .vscode/
 *.egg-info/
 test_data/
+build/gcide-cache/
+src/data/dictionary.db

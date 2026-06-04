@@ -19,6 +19,7 @@ from PyQt6.QtCore import (
     QEasingCurve,
     QParallelAnimationGroup,
     QPropertyAnimation,
+    QPointF,
     QRect,
     QRectF,
     QSizeF,
@@ -33,10 +34,12 @@ from PyQt6.QtGui import (
     QPainter,
     QPalette,
     QPixmap,
+    QTextCursor,
     QTextDocument,
 )
 from PyQt6.QtWidgets import (
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QPushButton,
     QSlider,
@@ -44,6 +47,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from dictionary_dialog import DictionaryDialog
 from epub_book import EpubBook
 
 # Reading page colours (a calm "paper" look, independent of the dark chrome, so
@@ -53,6 +57,9 @@ _PAGE_FG = "#2a2420"
 
 # Uniform whitespace inside every page, on all four sides.
 _PAGE_MARGIN = 34
+
+# Gap between left and right pages in spread (book) mode.
+_SPREAD_GUTTER = 14
 
 MIN_FONT_PT = 11
 MAX_FONT_PT = 32
@@ -99,6 +106,7 @@ class _PageCanvas(QWidget):
 
     mouse_moved = pyqtSignal(int)      # viewport y — for fullscreen bar reveal
     page_swiped = pyqtSignal(int)      # +1 = next page, -1 = previous (sideswipe)
+    word_lookup = pyqtSignal(str)
     resized = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -108,6 +116,7 @@ class _PageCanvas(QWidget):
         self._doc.setUseDesignMetrics(True)
         self._page = 0
         self._n_pages = 1
+        self._spread = False
         self._swipe_x = 0
         self._swipe_y = 0
         self._swipe_fired = False
@@ -138,11 +147,20 @@ class _PageCanvas(QWidget):
     def book_document(self) -> _BookDocument:
         return self._doc
 
+    def set_spread_mode(self, enabled: bool) -> None:
+        self._spread = enabled
+
+    def spread_mode(self) -> bool:
+        return self._spread
+
     def _content_size(self) -> tuple[int, int]:
-        return (
-            max(1, self.width() - 2 * _PAGE_MARGIN),
-            max(1, self.height() - 2 * _PAGE_MARGIN),
-        )
+        """Page-box size passed to QTextDocument pagination (one column)."""
+        inner_w = max(1, self.width() - 2 * _PAGE_MARGIN)
+        h = max(1, self.height() - 2 * _PAGE_MARGIN)
+        if self._spread:
+            col_w = max(1, (inner_w - _SPREAD_GUTTER) // 2)
+            return col_w, h
+        return inner_w, h
 
     def relayout(self) -> None:
         """Re-fit the document to the current page (content) size and recount.
@@ -240,20 +258,82 @@ class _PageCanvas(QWidget):
         self._overlay.hide()
         self._overlay_new.hide()
 
+    def _paint_page_column(self, painter: QPainter, x: int, page: int) -> None:
+        cw, ch = self._content_size()
+        painter.save()
+        painter.translate(x, _PAGE_MARGIN)
+        painter.setClipRect(QRectF(0, 0, cw, ch))
+        self._render_page(page, painter)
+        painter.restore()
+
     def paintEvent(self, event):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(_PAGE_BG))
         cw, ch = self._content_size()
-        # Inset by the margin, clip to the content box, then draw the current
-        # page's slice of the document at the top of that box.
-        p.translate(_PAGE_MARGIN, _PAGE_MARGIN)
-        p.setClipRect(QRectF(0, 0, cw, ch))
-        self._render_page(self._page, p)
+        if self._spread:
+            right_x = _PAGE_MARGIN + cw + _SPREAD_GUTTER
+            self._paint_page_column(p, _PAGE_MARGIN, self._page)
+            if self._page + 1 < self._n_pages:
+                self._paint_page_column(p, right_x, self._page + 1)
+        else:
+            p.translate(_PAGE_MARGIN, _PAGE_MARGIN)
+            p.setClipRect(QRectF(0, 0, cw, ch))
+            self._render_page(self._page, p)
         p.end()
+
+    def _doc_hit(self, pos) -> tuple[int, float, float] | None:
+        """Map a widget click to (page_index, x, y) in document layout coords."""
+        cw, ch = self._content_size()
+        x = pos.x()
+        y = pos.y()
+        if y < _PAGE_MARGIN or y >= _PAGE_MARGIN + ch:
+            return None
+        local_y = y - _PAGE_MARGIN
+        if self._spread:
+            right_x = _PAGE_MARGIN + cw + _SPREAD_GUTTER
+            if _PAGE_MARGIN <= x < _PAGE_MARGIN + cw:
+                page = self._page
+                return page, x - _PAGE_MARGIN, page * ch + local_y
+            if right_x <= x < right_x + cw and self._page + 1 < self._n_pages:
+                page = self._page + 1
+                return page, x - right_x, page * ch + local_y
+            return None
+        if x < _PAGE_MARGIN or x >= _PAGE_MARGIN + cw:
+            return None
+        page = self._page
+        return page, x - _PAGE_MARGIN, page * ch + local_y
+
+    def word_at(self, pos) -> str | None:
+        hit = self._doc_hit(pos)
+        if hit is None:
+            return None
+        _page, doc_x, doc_y = hit
+        layout = self._doc.documentLayout()
+        char_pos = layout.hitTest(
+            QPointF(doc_x, doc_y),
+            Qt.HitTestAccuracy.ExactHit,
+        )
+        if char_pos < 0 or char_pos >= self._doc.characterCount():
+            return None
+        cur = QTextCursor(self._doc)
+        cur.setPosition(char_pos)
+        cur.select(QTextCursor.SelectionType.WordUnderCursor)
+        word = cur.selectedText().replace("\u2029", " ").strip()
+        word = word.strip(".,;:!?\"'()[]{}—–-")
+        return word if len(word) >= 2 else None
 
     def mouseMoveEvent(self, event):
         self.mouse_moved.emit(int(event.position().y()))
         super().mouseMoveEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        try:
+            word = self.word_at(event.position())
+        except Exception:
+            word = None
+        if word:
+            self.word_lookup.emit(word)
+        event.accept()
 
     def wheelEvent(self, event):
         # Same trackpad sideswipe handling as the comic viewer: accumulate the
@@ -299,6 +379,7 @@ class EbookViewer(QWidget):
         self._page = 0
         self._page_count = 1
         self._font_pt = DEFAULT_FONT_PT
+        self._spread_mode = False
         self._syncing = False   # guards programmatic seek-bar updates
         self._seek_dragging = False
         self._pending_seek: tuple[int, float] | None = None  # (chapter, local_frac)
@@ -310,6 +391,7 @@ class EbookViewer(QWidget):
         self._canvas = _PageCanvas(self)
         self._canvas.mouse_moved.connect(self.mouse_moved.emit)
         self._canvas.page_swiped.connect(self._on_swipe)
+        self._canvas.word_lookup.connect(self._show_dictionary)
         self._canvas.resized.connect(self._reflow)
         layout.addWidget(self._canvas, 1)
 
@@ -344,21 +426,12 @@ class EbookViewer(QWidget):
         self._next_btn = QPushButton("Next ›")
         self._next_btn.clicked.connect(self.next_page)
 
-        self._smaller_btn = QPushButton("A−")
-        self._smaller_btn.setFixedWidth(40)
-        self._smaller_btn.clicked.connect(lambda: self.adjust_font(-1))
-        self._larger_btn = QPushButton("A+")
-        self._larger_btn.setFixedWidth(40)
-        self._larger_btn.clicked.connect(lambda: self.adjust_font(+1))
-
         self._label = QLabel("")
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         bar_layout.addWidget(self._exit_btn)
         bar_layout.addSpacing(8)
         bar_layout.addWidget(self._prev_btn)
-        bar_layout.addWidget(self._smaller_btn)
-        bar_layout.addWidget(self._larger_btn)
         bar_layout.addStretch()
         bar_layout.addWidget(self._label, 1)
         bar_layout.addStretch()
@@ -394,6 +467,8 @@ class EbookViewer(QWidget):
         if chapter == self._index:
             self._pending_seek = None
             page = round(frac * (self._page_count - 1)) if self._page_count > 1 else 0
+            if self._spread_mode:
+                page = (page // 2) * 2
             if page != self._page:
                 self._page = max(0, min(page, self._page_count - 1))
                 self._canvas.set_page(self._page)
@@ -409,6 +484,8 @@ class EbookViewer(QWidget):
         """Render `chapter` and land on the page at `frac` through it."""
         self._render_chapter(chapter)
         page = round(frac * (self._page_count - 1)) if self._page_count > 1 else 0
+        if self._spread_mode:
+            page = (page // 2) * 2
         self._goto_page(max(0, min(page, self._page_count - 1)))
 
     def _preview_chapter(self, chapter: int) -> None:
@@ -438,6 +515,14 @@ class EbookViewer(QWidget):
 
     # ----- sideswipe routing -----
 
+    def _show_dictionary(self, word: str) -> None:
+        DictionaryDialog(word, self).exec()
+
+    def prompt_dictionary(self) -> None:
+        word, ok = QInputDialog.getText(self, "Look up word", "Word:")
+        if ok and word.strip():
+            self._show_dictionary(word.strip())
+
     def _on_swipe(self, direction: int) -> None:
         if direction > 0:
             self.next_page()
@@ -462,8 +547,30 @@ class EbookViewer(QWidget):
 
     # ----- page navigation -----
 
+    def spread_mode(self) -> bool:
+        return self._spread_mode
+
+    def set_spread_mode(self, enabled: bool) -> None:
+        """Toggle two-page spread; re-paginates at half-column width."""
+        if enabled == self._spread_mode:
+            return
+        frac = self._page / self._page_count if self._page_count else 0.0
+        self._spread_mode = enabled
+        self._canvas.set_spread_mode(enabled)
+        self._render_chapter(self._index, keep_index=True)
+        page = round(frac * (self._page_count - 1)) if self._page_count > 1 else 0
+        if enabled:
+            page = (page // 2) * 2
+        self._goto_page(max(0, min(page, self._page_count - 1)))
+
+    def _page_step(self) -> int:
+        return 2 if self._spread_mode else 1
+
     def next_page(self) -> None:
-        if self._page < self._page_count - 1:
+        step = self._page_step()
+        if self._page + step < self._page_count:
+            self._canvas.transition(+1, lambda: self._step_page(self._page + step))
+        elif not self._spread_mode and self._page < self._page_count - 1:
             self._canvas.transition(+1, lambda: self._step_page(self._page + 1))
         elif self._book and self._index < self._book.chapter_count() - 1:
             self._canvas.transition(+1, lambda: self._render_chapter(self._index + 1))
@@ -471,8 +578,11 @@ class EbookViewer(QWidget):
             self.end_reached.emit()
 
     def prev_page(self) -> None:
-        if self._page > 0:
-            self._canvas.transition(-1, lambda: self._step_page(self._page - 1))
+        step = self._page_step()
+        if self._page >= step:
+            self._canvas.transition(-1, lambda: self._step_page(self._page - step))
+        elif self._page > 0:
+            self._canvas.transition(-1, lambda: self._step_page(0))
         elif self._index > 0:
             self._canvas.transition(
                 -1, lambda: self._render_chapter(self._index - 1, to_last_page=True)
@@ -526,6 +636,8 @@ class EbookViewer(QWidget):
             self.chapter_changed.emit(self._index)
 
     def _goto_page(self, page: int) -> None:
+        if self._spread_mode:
+            page = (page // 2) * 2
         self._canvas.set_page(page)
         self._page = self._canvas.page_index()
         self._update_label()
@@ -550,9 +662,13 @@ class EbookViewer(QWidget):
             return
         titles = self._book.chapter_titles()
         title = titles[self._index] if self._index < len(titles) else ""
+        if self._spread_mode and self._page + 1 < self._page_count:
+            page_part = f"Pages {self._page + 1}–{self._page + 2}/{self._page_count}"
+        else:
+            page_part = f"Page {self._page + 1}/{self._page_count}"
         self._label.setText(
             f"Ch {self._index + 1}/{self._book.chapter_count()} · {title}"
-            f"   —   Page {self._page + 1}/{self._page_count}"
+            f"   —   {page_part}"
         )
         at_start = self._index == 0 and self._page == 0
         self._prev_btn.setEnabled(not at_start)
@@ -587,6 +703,10 @@ class EbookViewer(QWidget):
 
     def chapter_titles(self) -> list[str]:
         return self._book.chapter_titles() if self._book else []
+
+    def set_reader_chrome_visible(self, visible: bool) -> None:
+        """Show or hide the bottom page/chapter navigation bar."""
+        self._nav_bar.setVisible(visible)
 
     def apply_theme(self, c: dict) -> None:
         # The reading page stays "paper"; only the nav bar follows the app theme.

@@ -12,6 +12,8 @@ binary_name = os.environ.get("COMIC_READER_BINARY_NAME", "ComicReader")
 
 datas = [
     (str(ROOT / "src" / "fonts"), "fonts"),
+    (str(ROOT / "src" / "data" / "dictionary.db"), "data"),
+    (str(ROOT / "src" / "data" / "dictionary_seed.db"), "data"),
 ]
 datas += collect_data_files("py7zr")
 

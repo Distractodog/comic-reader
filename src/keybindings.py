@@ -30,7 +30,7 @@ ACTIONS: dict[str, dict] = {
     "actual_size":      {"label": "Actual Size",           "default": "3",       "extras": []},
     "zoom_in":          {"label": "Zoom In",               "default": "Ctrl++",  "extras": ["Ctrl+="]},
     "zoom_out":         {"label": "Zoom Out",              "default": "Ctrl+-",  "extras": []},
-    "fullscreen":       {"label": "Fullscreen",            "default": "F11",     "extras": []},
+    "fullscreen":       {"label": "Hide reader bars",      "default": "F11",     "extras": []},
     "back_to_library":  {"label": "Back to Library",       "default": "Escape",  "extras": []},
     "bookmark":         {"label": "Toggle Bookmark",       "default": "B",       "extras": []},
     "prev_bookmark":    {"label": "Previous Bookmark",     "default": "[",       "extras": []},

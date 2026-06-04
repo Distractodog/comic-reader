@@ -490,6 +490,7 @@ class BookshelfView(QWidget):
         self._header.back_clicked.connect(self._on_back_clicked)
         self._header.search_changed.connect(self._on_search_changed)
         self._header.sort_changed.connect(self._on_sort_changed)
+        self._header.customContextMenuRequested.connect(self._on_header_folder_menu)
         root.addWidget(self._header)
 
         self._search_timer = QTimer(self)
@@ -520,6 +521,11 @@ class BookshelfView(QWidget):
         self._scroll.setWidget(self._grid_widget)
 
         self._show_folders()
+        self.shelf_changed.connect(self._on_shelf_membership_changed)
+
+    def _on_shelf_membership_changed(self) -> None:
+        if self._current_shelf_id is not None:
+            self._nav_transition(self._repopulate)
 
     def focus_search(self) -> None:
         self._header._search_input.setFocus()
@@ -762,10 +768,24 @@ class BookshelfView(QWidget):
                 self._comic_tiles[cid].update()
 
     def _n_cols(self) -> int:
-        w = self._scroll.viewport().width()
-        return max(1, w // (TILE_W + TILE_SPACING))
+        w = self._scroll.viewport().width() - 2 * TILE_SPACING
+        return max(1, (w + TILE_SPACING) // (TILE_W + TILE_SPACING))
+
+    def _sync_header_folder_menu(self) -> None:
+        """Allow header right-click folder actions when inside a folder view."""
+        enabled = (
+            self._current_folder is not None
+            and not self._show_hidden_mode
+            and not self._queue_mode
+        )
+        self._header.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+            if enabled
+            else Qt.ContextMenuPolicy.DefaultContextMenu
+        )
 
     def _repopulate(self):
+        self._sync_header_folder_menu()
         n_cols = self._n_cols()
         self._last_n_cols = n_cols
 
@@ -820,7 +840,10 @@ class BookshelfView(QWidget):
             empty_msg = "No comics found in this series."
         elif self._current_folder is None:
             items = self._library.get_folders()
-            empty_msg = "No comics yet.\nUse Library → Add Folder to Library to get started."
+            empty_msg = (
+                "No comics yet.\n"
+                "Use Library → Add Folder or Add Files to Library to get started."
+            )
         else:
             # Folder view: series groups first, then ungrouped comics
             series_list = self._library.get_series_in_folder(self._current_folder)
@@ -845,6 +868,8 @@ class BookshelfView(QWidget):
 
         for i, item in enumerate(items):
             if i % n_cols == 0:
+                if row_layout is not None:
+                    row_layout.addStretch()
                 row_widget = QWidget()
                 row_layout = QHBoxLayout(row_widget)
                 row_layout.setContentsMargins(0, 0, 0, TILE_SPACING)
@@ -936,6 +961,7 @@ class BookshelfView(QWidget):
                 lambda: self._ungroup_series(self._current_folder, self._current_series_name)
             )
 
+        menu.addSeparator()
         batch_menu = menu.addMenu("Batch")
         batch_menu.addAction("Convert to CBZ…").triggered.connect(
             lambda: self._plan_batch_convert(target_ids)
@@ -958,6 +984,10 @@ class BookshelfView(QWidget):
                 menu.addAction("Reset cover to default").triggered.connect(
                     lambda: self._reset_comic_cover(comic_id)
                 )
+            if comic and comic.cover_path:
+                menu.addAction("Set as folder cover").triggered.connect(
+                    lambda: self._use_comic_as_folder_cover(comic_id)
+                )
 
         # Shelf actions
         shelves = self._library.get_shelves()
@@ -969,9 +999,7 @@ class BookshelfView(QWidget):
                 for shelf in manual_shelves:
                     sid = shelf.id
                     add_menu.addAction(shelf.name).triggered.connect(
-                        lambda checked=False, s=sid: [
-                            self._library.add_comic_to_shelf(cid, s) for cid in target_ids
-                        ] or self.shelf_changed.emit()
+                        lambda checked=False, s=sid, ids=target_ids: self._add_comics_to_shelf(ids, s)
                     )
             else:
                 comic_shelf_ids = {s.id for s in self._library.get_shelves_for_comic(comic_id)}
@@ -1033,11 +1061,27 @@ class BookshelfView(QWidget):
             self._comic_tiles[comic_id].set_selected(comic_id in self._selected_ids)
             self._comic_tiles[comic_id].update()
 
+    def _add_comics_to_shelf(self, comic_ids: list[int], shelf_id: int) -> None:
+        for cid in comic_ids:
+            self._library.add_comic_to_shelf(cid, shelf_id)
+        self.shelf_changed.emit()
+
     def _toggle_comic_in_shelf(self, comic_id: int, shelf_id: int, add: bool):
         if add:
             self._library.add_comic_to_shelf(comic_id, shelf_id)
         else:
             self._library.remove_comic_from_shelf(comic_id, shelf_id)
+        self.shelf_changed.emit()
+
+    def _add_folder_to_shelf(self, folder_path: str, shelf_id: int) -> None:
+        n = self._library.add_folder_to_shelf(folder_path, shelf_id)
+        shelf = next((s for s in self._library.get_shelves() if s.id == shelf_id), None)
+        shelf_name = shelf.name if shelf else "shelf"
+        folder_name = Path(folder_path).name
+        self.window().statusBar().showMessage(
+            f"Added {n} comic{'s' if n != 1 else ''} from “{folder_name}” to “{shelf_name}”",
+            4000,
+        )
         self.shelf_changed.emit()
 
     def _toggle_comic_in_queue(self, comic_id: int, add: bool):
@@ -1206,46 +1250,142 @@ class BookshelfView(QWidget):
 
     # ----- Folder context menu (rescan / cover / hide) -----
 
+    def _on_header_folder_menu(self, pos) -> None:
+        if not self._current_folder:
+            return
+        gp = self._header.mapToGlobal(pos)
+        self._show_folder_menu(self._current_folder, gp.x(), gp.y())
+
     def _on_folder_context_menu(self, folder_path: str, gx: int, gy: int):
+        self._show_folder_menu(folder_path, gx, gy)
+
+    def _show_folder_menu(self, folder_path: str, gx: int, gy: int) -> None:
         menu = QMenu(self)
         menu.addAction("Rescan folder").triggered.connect(
             lambda: self.folder_rescan_requested.emit(folder_path)
         )
-        # Cover + hide only make sense in the plain folder grid.
-        if self._current_shelf_id is None and not self._search_query:
+        if self._show_hidden_mode:
+            menu.exec(QPoint(gx, gy))
+            return
+
+        menu.addAction("Rename folder…").triggered.connect(
+            lambda: self._rename_folder(folder_path)
+        )
+
+        manual_shelves = [
+            s for s in self._library.get_shelves() if s.kind == "manual"
+        ]
+        if manual_shelves:
             menu.addSeparator()
-            menu.addAction("Set cover from comic…").triggered.connect(
-                lambda: self._set_folder_cover_from_comic(folder_path)
-            )
-            menu.addAction("Choose cover image…").triggered.connect(
-                lambda: self._set_folder_cover_from_image(folder_path)
-            )
-            if self._library.get_folder_cover(folder_path):
-                menu.addAction("Reset cover to default").triggered.connect(
-                    lambda: self._reset_folder_cover(folder_path)
+            add_menu = menu.addMenu("Add folder to shelf")
+            for shelf in manual_shelves:
+                sid = shelf.id
+                add_menu.addAction(shelf.name).triggered.connect(
+                    lambda checked=False, fp=folder_path, s=sid: self._add_folder_to_shelf(fp, s)
                 )
-            menu.addSeparator()
-            menu.addAction("Hide this folder").triggered.connect(
-                lambda: self._hide_folder(folder_path)
+
+        if self._current_shelf_id is not None:
+            shelf_obj = next(
+                (s for s in self._library.get_shelves() if s.id == self._current_shelf_id),
+                None,
             )
+            if shelf_obj and shelf_obj.kind == "manual":
+                menu.addSeparator()
+                menu.addAction("Remove folder from this shelf").triggered.connect(
+                    lambda: self._remove_folder_from_shelf(folder_path)
+                )
+
+        menu.addSeparator()
+        menu.addAction("Choose cover image…").triggered.connect(
+            lambda: self._set_folder_cover_from_image(folder_path)
+        )
+        if self._library.get_folder_cover(folder_path):
+            menu.addAction("Reset cover to default").triggered.connect(
+                lambda: self._reset_folder_cover(folder_path)
+            )
+        menu.addSeparator()
+        menu.addAction("Hide this folder").triggered.connect(
+            lambda: self._hide_folder(folder_path)
+        )
         menu.exec(QPoint(gx, gy))
 
-    def _set_folder_cover_from_comic(self, folder_path: str):
-        comics = [c for c in self._library.get_comics_in_folder(folder_path) if c.cover_path]
-        if not comics:
-            QMessageBox.information(
-                self, "Set Folder Cover",
-                "No comics with cover images in this folder yet.",
+    def _remove_folder_from_shelf(self, folder_path: str) -> None:
+        if self._current_shelf_id is None:
+            return
+        comics = self._library.get_comics_in_shelf_for_folder(
+            self._current_shelf_id, folder_path
+        )
+        for comic in comics:
+            self._library.remove_comic_from_shelf(comic.id, self._current_shelf_id)
+        self.window().statusBar().showMessage(
+            f"Removed “{Path(folder_path).name}” from {self._current_shelf_name}",
+            4000,
+        )
+        self.shelf_changed.emit()
+
+    def _rename_folder(self, folder_path: str) -> None:
+        current_name = Path(folder_path).name
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename Folder",
+            "New folder name:",
+            text=current_name,
+        )
+        if not ok or not new_name.strip():
+            return
+        try:
+            new_path = self._library.rename_folder(folder_path, new_name.strip())
+        except FileExistsError:
+            QMessageBox.warning(
+                self,
+                "Rename Folder",
+                "A folder with that name already exists in this location.",
             )
             return
-        names = [c.title or Path(c.file_path).stem for c in comics]
-        name, ok = QInputDialog.getItem(
-            self, "Set Folder Cover", "Use the cover from:", names, 0, False
+        except FileNotFoundError:
+            QMessageBox.warning(
+                self,
+                "Rename Folder",
+                "This folder was not found on disk. Try rescanning the library folder.",
+            )
+            return
+        except ValueError as exc:
+            QMessageBox.warning(self, "Rename Folder", str(exc))
+            return
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "Rename Folder",
+                f"Could not rename the folder:\n{exc}",
+            )
+            return
+
+        if self._current_folder == folder_path:
+            self._current_folder = new_path
+        self._nav_transition(self._repopulate)
+        self.window().statusBar().showMessage(
+            f"Folder renamed to “{Path(new_path).name}”",
+            4000,
         )
-        if ok and name:
-            chosen = comics[names.index(name)]
-            self._library.set_folder_cover(folder_path, chosen.cover_path)
-            self._nav_transition(self._repopulate)
+
+    def _use_comic_as_folder_cover(self, comic_id: int) -> None:
+        comic = self._library.get_comic_by_id(comic_id)
+        if comic is None or not comic.cover_path:
+            QMessageBox.information(
+                self,
+                "Set Folder Cover",
+                "This comic does not have a cover image yet.",
+            )
+            return
+        folder_path = str(Path(comic.file_path).parent)
+        self._library.set_folder_cover(folder_path, comic.cover_path)
+        self._nav_transition(self._repopulate)
+        folder_name = Path(folder_path).name
+        comic_name = comic.title or Path(comic.file_path).stem
+        self.window().statusBar().showMessage(
+            f"Folder “{folder_name}” now uses the cover from “{comic_name}”",
+            4000,
+        )
 
     def _set_folder_cover_from_image(self, folder_path: str):
         from thumbnails import folder_cover_path_for, generate_thumbnail_from_image

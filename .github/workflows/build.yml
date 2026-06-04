@@ -55,6 +55,9 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Build offline dictionary (GCIDE)
+        run: python scripts/build_dictionary.py
+
       - name: Build with PyInstaller
         env:
           COMIC_READER_BINARY_NAME: ${{ matrix.binary_name }}

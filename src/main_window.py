@@ -5,9 +5,20 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPropertyAnimation, QSettings, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QEasingCurve,
+    QParallelAnimationGroup,
+    QPoint,
+    QPropertyAnimation,
+    QSettings,
+    QThread,
+    QTimer,
+    Qt,
+    pyqtSignal,
+)
 from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -29,9 +40,10 @@ from PyQt6.QtWidgets import (
 )
 
 class _ReaderBar(QWidget):
-    """Top bar shown while reading — back button, comic title, and ⋮ menu."""
+    """Top bar shown while reading — back, title, fullscreen, and ⋮ menu."""
     back_clicked = pyqtSignal()
     menu_requested = pyqtSignal()
+    fullscreen_clicked = pyqtSignal()
     HEIGHT = 56
 
     def __init__(self, parent=None):
@@ -62,6 +74,16 @@ class _ReaderBar(QWidget):
         layout.addWidget(self._title)
         layout.addStretch()
 
+        self._fullscreen_btn = QPushButton("⛶")
+        self._fullscreen_btn.setFlat(True)
+        self._fullscreen_btn.setFixedSize(36, 36)
+        self._fullscreen_btn.setToolTip("Hide reader bars")
+        self._fullscreen_btn.setStyleSheet(
+            "color: #8b2a2a; border: none; font-size: 18px; padding: 0;"
+        )
+        self._fullscreen_btn.clicked.connect(self.fullscreen_clicked.emit)
+        layout.addWidget(self._fullscreen_btn)
+
         self._menu_btn = QPushButton("⋮")
         self._menu_btn.setFlat(True)
         self._menu_btn.setFixedSize(36, 36)
@@ -88,11 +110,18 @@ class _ReaderBar(QWidget):
         self._back_btn.setStyleSheet(
             f"background: transparent; color: {c['accent']}; border: none; padding: 4px 8px;"
         )
-        self._menu_btn.setStyleSheet(
+        btn_style = (
             f"background: transparent; color: {c['accent']}; border: none;"
             f" font-size: 18px; padding: 0;"
         )
+        self._fullscreen_btn.setStyleSheet(btn_style)
+        self._menu_btn.setStyleSheet(btn_style)
         self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
+
+    def set_chrome_hidden(self, hidden: bool) -> None:
+        self._fullscreen_btn.setToolTip(
+            "Show reader bars" if hidden else "Hide reader bars"
+        )
 
 
 class _AnnotationDialog(QDialog):
@@ -148,6 +177,95 @@ class _AnnotationDialog(QDialog):
         )
 
 
+# Sidebar nav ids: negative = library views, positive = shelf ids.
+_SIDEBAR_LIBRARY_NAV = (
+    (-1, "Folders"),
+    (-3, "Reading Queue"),
+    (-2, "Hidden"),
+)
+
+
+class _HideSidebarDialog(QDialog):
+    """Pick which library views and shelves to hide from the sidebar."""
+
+    def __init__(
+        self,
+        library_items: list[tuple[int, str]],
+        shelves: list[Shelf],
+        hidden_ids: set[int],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Hide Sidebar Items")
+        self.resize(320, 400)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        hint = QLabel("Checked items are hidden from the sidebar.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setContentsMargins(0, 0, 0, 0)
+        inner_layout.setSpacing(4)
+
+        self._checks: list[tuple[int, QCheckBox]] = []
+
+        lib_lbl = QLabel("LIBRARY")
+        lib_lbl.setStyleSheet(
+            "color: rgba(255,255,255,0.45); font-size: 10px; letter-spacing: 1px;"
+        )
+        inner_layout.addWidget(lib_lbl)
+        for nav_id, label in library_items:
+            cb = QCheckBox(label)
+            cb.setChecked(nav_id in hidden_ids)
+            inner_layout.addWidget(cb)
+            self._checks.append((nav_id, cb))
+
+        if shelves:
+            shelf_lbl = QLabel("SHELVES")
+            shelf_lbl.setStyleSheet(
+                "color: rgba(255,255,255,0.45); font-size: 10px;"
+                " letter-spacing: 1px; padding-top: 8px;"
+            )
+            inner_layout.addWidget(shelf_lbl)
+            for shelf in shelves:
+                cb = QCheckBox(shelf.name)
+                cb.setChecked(shelf.id in hidden_ids)
+                inner_layout.addWidget(cb)
+                self._checks.append((shelf.id, cb))
+
+        inner_layout.addStretch()
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, stretch=1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def hidden_ids(self) -> set[int]:
+        return {nav_id for nav_id, cb in self._checks if cb.isChecked()}
+
+    def apply_theme(self, c: dict) -> None:
+        self.setStyleSheet(
+            f"QDialog {{ background: {c['app_bg']}; color: {c['text']}; }}"
+            f"QCheckBox {{ color: {c['text']}; spacing: 6px; }}"
+            f"QPushButton {{ background: {c['sidebar_bg']}; color: {c['text']};"
+            f" border: 1px solid {c['border']}; border-radius: 4px; padding: 6px 14px; }}"
+            f"QPushButton:hover {{ background: {c['hover_bg']}; }}"
+        )
+
+
 from archive_handler import ComicReader, open_comic
 from bookshelf import BookshelfView
 from dedupe_scanner import DuplicateScanner
@@ -156,7 +274,7 @@ from ebook_viewer import EbookViewer
 from epub_book import EpubBook, is_text_epub
 from keybindings import ACTIONS, KeybindingDialog, KeybindingManager
 from library import Library, Shelf
-from library_scanner import LibraryScanner
+from library_scanner import SCANNABLE_EXTENSIONS, LibraryScanner
 from preloader import PageCache, PagePreloader
 from stats_dialog import StatsDialog
 from viewer import ComicViewer, FitMode, ReadingMode, SeekBar, ThumbnailStrip, make_spread_pixmap
@@ -177,10 +295,11 @@ class _Sidebar(QWidget):
     delete_shelf_requested = pyqtSignal(int)        # shelf_id
     export_shelf_requested = pyqtSignal(int, str)   # shelf_id, shelf_name
     back_to_root_clicked = pyqtSignal()
+    hidden_nav_changed = pyqtSignal(object)  # set[int]
 
     WIDTH = 180
 
-    def __init__(self, library: Library, parent=None):
+    def __init__(self, library: Library, hidden_nav_ids: set[int] | None = None, parent=None):
         super().__init__(parent)
         self._library = library
         self._active_id: int = -1   # -1 = Folders, -2 = Hidden, -3 = Queue, int = shelf id
@@ -188,6 +307,7 @@ class _Sidebar(QWidget):
         self._folders_btn: QPushButton | None = None
         self._hidden_btn: QPushButton | None = None
         self._queue_btn: QPushButton | None = None
+        self._hidden_nav_ids: set[int] = set(hidden_nav_ids or ())
         self._theme: dict = themes.DARK
 
         self.setFixedWidth(self.WIDTH)
@@ -228,13 +348,28 @@ class _Sidebar(QWidget):
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        outer.addWidget(self._scroll)
+        outer.addWidget(self._scroll, stretch=1)
 
         self._list_widget = QWidget()
         self._list_layout = QVBoxLayout(self._list_widget)
-        self._list_layout.setContentsMargins(0, 4, 0, 8)
+        self._list_layout.setContentsMargins(0, 4, 0, 4)
         self._list_layout.setSpacing(0)
         self._scroll.setWidget(self._list_widget)
+
+        self._new_shelf_btn = QPushButton("  + New Shelf")
+        self._new_shelf_btn.setFlat(True)
+        self._new_shelf_btn.clicked.connect(self.new_shelf_clicked)
+
+        footer = QWidget()
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(6, 4, 6, 8)
+        footer_layout.setSpacing(0)
+        self._hide_nav_btn = QPushButton("Hide items…")
+        self._hide_nav_btn.setFlat(True)
+        self._hide_nav_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._hide_nav_btn.clicked.connect(self._open_hide_nav_dialog)
+        footer_layout.addWidget(self._hide_nav_btn)
+        outer.addWidget(footer)
 
         self._build_list()
         self._apply_btn_styles()
@@ -269,36 +404,41 @@ class _Sidebar(QWidget):
     def _build_list(self):
         while self._list_layout.count():
             item = self._list_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+            widget = item.widget()
+            if widget and widget is not self._new_shelf_btn:
+                widget.deleteLater()
         self._shelf_btns.clear()
         self._folders_btn = None
         self._hidden_btn = None
         self._queue_btn = None
 
-        # LIBRARY section
-        self._list_layout.addWidget(self._section_label("LIBRARY"))
-        self._folders_btn = self._nav_btn("  Folders")
-        self._folders_btn.setChecked(self._active_id == -1)
-        self._folders_btn.clicked.connect(self._on_folders_clicked)
-        self._list_layout.addWidget(self._folders_btn)
-
-        self._queue_btn = self._nav_btn("  Reading Queue")
-        self._queue_btn.setChecked(self._active_id == -3)
-        self._queue_btn.clicked.connect(self._on_queue_clicked)
-        self._list_layout.addWidget(self._queue_btn)
-
-        self._hidden_btn = self._nav_btn("  Hidden")
-        self._hidden_btn.setChecked(self._active_id == -2)
-        self._hidden_btn.clicked.connect(self._on_hidden_clicked)
-        self._list_layout.addWidget(self._hidden_btn)
-
-        # SHELVES section
-        self._list_layout.addWidget(self._section_label("SHELVES"))
+        library_items = [
+            (nav_id, label) for nav_id, label in _SIDEBAR_LIBRARY_NAV
+            if nav_id not in self._hidden_nav_ids
+        ]
+        if library_items:
+            self._list_layout.addWidget(self._section_label("LIBRARY"))
+            for nav_id, label in library_items:
+                btn = self._nav_btn(f"  {label}")
+                btn.setChecked(self._active_id == nav_id)
+                if nav_id == -1:
+                    btn.clicked.connect(self._on_folders_clicked)
+                    self._folders_btn = btn
+                elif nav_id == -3:
+                    btn.clicked.connect(self._on_queue_clicked)
+                    self._queue_btn = btn
+                else:
+                    btn.clicked.connect(self._on_hidden_clicked)
+                    self._hidden_btn = btn
+                self._list_layout.addWidget(btn)
 
         shelves = self._library.get_shelves()
-        smart = [s for s in shelves if s.kind == "smart"]
-        manual = [s for s in shelves if s.kind == "manual"]
+        visible = [s for s in shelves if s.id not in self._hidden_nav_ids]
+        smart = [s for s in visible if s.kind == "smart"]
+        manual = [s for s in visible if s.kind == "manual"]
+
+        if visible:
+            self._list_layout.addWidget(self._section_label("SHELVES"))
 
         for shelf in smart:
             btn = self._nav_btn(f"  {shelf.name}")
@@ -326,18 +466,8 @@ class _Sidebar(QWidget):
                 self._shelf_btns.append((shelf.id, btn))
                 self._list_layout.addWidget(btn)
 
-        self._list_layout.addStretch()
-
-        new_btn = QPushButton("  + New Shelf")
-        new_btn.setFlat(True)
-        new_btn.setStyleSheet(
-            "QPushButton { text-align: left; padding: 8px 14px; border: none;"
-            " background: transparent; color: rgba(255,255,255,0.40); font-size: 12px;"
-            " font-family: 'Libre Baskerville'; border-radius: 4px; margin: 1px 6px; }"
-            "QPushButton:hover { color: rgba(255,255,255,0.80); background: rgba(255,255,255,0.07); }"
-        )
-        new_btn.clicked.connect(self.new_shelf_clicked)
-        self._list_layout.addWidget(new_btn)
+        self._list_layout.addStretch(1)
+        self._list_layout.addWidget(self._new_shelf_btn)
 
     def _apply_btn_styles(self):
         c = self._theme
@@ -358,6 +488,20 @@ class _Sidebar(QWidget):
         )
         self._btn_back.setStyleSheet(btn_css)
         self._btn_add.setStyleSheet(add_css)
+        new_shelf_css = (
+            "QPushButton { text-align: left; padding: 8px 14px; border: none;"
+            " background: transparent; color: rgba(255,255,255,0.40); font-size: 12px;"
+            " font-family: 'Libre Baskerville'; border-radius: 4px; margin: 1px 6px; }"
+            "QPushButton:hover { color: rgba(255,255,255,0.80); background: rgba(255,255,255,0.07); }"
+        )
+        self._new_shelf_btn.setStyleSheet(new_shelf_css)
+        self._hide_nav_btn.setStyleSheet(
+            f"QPushButton {{ text-align: left; padding: 6px 10px; border: 1px solid {c['border']};"
+            f" border-radius: 4px; background: {c['app_bg']}; color: {c['text_secondary']};"
+            f" font-size: 11px; font-family: 'Libre Baskerville'; }}"
+            f"QPushButton:hover {{ background: {c['hover_bg']}; color: {c['text']}; }}"
+            f"QPushButton:pressed {{ background: {c['border']}; }}"
+        )
 
     # ----- Slots -----
 
@@ -381,6 +525,7 @@ class _Sidebar(QWidget):
         menu = QMenu(self)
         rename_action = menu.addAction("Rename…")
         export_action = menu.addAction("Export shelf…")
+        menu.addSeparator()
         delete_action = menu.addAction("Delete shelf")
         action = menu.exec(pos)
         if action == rename_action:
@@ -389,6 +534,48 @@ class _Sidebar(QWidget):
             self.export_shelf_requested.emit(shelf_id, shelf_name)
         elif action == delete_action:
             self.delete_shelf_requested.emit(shelf_id)
+
+    def _open_hide_nav_dialog(self):
+        dlg = _HideSidebarDialog(
+            list(_SIDEBAR_LIBRARY_NAV),
+            self._library.get_shelves(),
+            self._hidden_nav_ids,
+            self,
+        )
+        dlg.apply_theme(self._theme)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.set_hidden_nav_ids(dlg.hidden_ids())
+
+    def _valid_nav_ids(self) -> set[int]:
+        return {nav_id for nav_id, _ in _SIDEBAR_LIBRARY_NAV} | {
+            s.id for s in self._library.get_shelves()
+        }
+
+    def _go_to_first_visible(self):
+        for nav_id, _ in _SIDEBAR_LIBRARY_NAV:
+            if nav_id not in self._hidden_nav_ids:
+                if nav_id == -1:
+                    self._on_folders_clicked()
+                elif nav_id == -3:
+                    self._on_queue_clicked()
+                else:
+                    self._on_hidden_clicked()
+                return
+        for shelf in self._library.get_shelves():
+            if shelf.id not in self._hidden_nav_ids:
+                self._on_shelf_clicked(shelf.id, shelf.name)
+                return
+
+    def set_hidden_nav_ids(self, ids: set[int]):
+        self._hidden_nav_ids = set(ids) & self._valid_nav_ids()
+        if self._active_id in self._hidden_nav_ids:
+            self._go_to_first_visible()
+        self._build_list()
+        self.hidden_nav_changed.emit(self._hidden_nav_ids)
+
+    def hidden_nav_ids(self) -> set[int]:
+        return set(self._hidden_nav_ids)
 
     # ----- Public API -----
 
@@ -430,6 +617,16 @@ SUPPORTED_FILTERS = [
 ]
 
 
+def _setup_comic_file_dialog(dialog: QFileDialog) -> None:
+    """macOS often greys out comics unless 'All files' is the active filter."""
+    dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+    filters = ["All files (*)"] + [
+        f for f in SUPPORTED_FILTERS if not f.startswith("All files")
+    ]
+    dialog.setNameFilters(filters)
+    dialog.selectNameFilter("All files (*)")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -442,6 +639,11 @@ class MainWindow(QMainWindow):
         self._current_comic_id: int | None = None
         self._settings = QSettings("ComicReader", "ComicReader")
         self._library = Library()
+        self._sidebar_hidden_nav_ids = self._load_sidebar_hidden_nav_ids()
+        valid_nav_ids = {nav_id for nav_id, _ in _SIDEBAR_LIBRARY_NAV} | {
+            s.id for s in self._library.get_shelves()
+        }
+        self._sidebar_hidden_nav_ids &= valid_nav_ids
         self._scan_thread: QThread | None = None
         self._scanner: LibraryScanner | None = None
         self._scan_progress: QProgressDialog | None = None
@@ -493,6 +695,7 @@ class MainWindow(QMainWindow):
 
         self._reader_bar = _ReaderBar()
         self._reader_bar.back_clicked.connect(self._back_to_library)
+        self._reader_bar.fullscreen_clicked.connect(self._toggle_reading_chrome)
         self._reader_bar_opacity = QGraphicsOpacityEffect(self._reader_bar)
         self._reader_bar.setGraphicsEffect(self._reader_bar_opacity)
         self._reader_bar_opacity.setOpacity(1.0)
@@ -509,8 +712,11 @@ class MainWindow(QMainWindow):
         self._reader_bar_anim.finished.connect(self._on_reader_bar_anim_finished)
         self._reader_bar_should_hide = False
         self._reader_bar_target_visible = False
+        self._chrome_hidden = False
+        self._thumb_strip_before_chrome = False
 
         content = QWidget()
+        self._content = content
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
@@ -519,7 +725,15 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._thumb_strip)
         content_layout.addWidget(self._seek_bar)
 
-        self._sidebar = _Sidebar(self._library)
+        self._chrome_restore_btn = QPushButton("⛶", content)
+        self._chrome_restore_btn.setFlat(True)
+        self._chrome_restore_btn.setFixedSize(40, 36)
+        self._chrome_restore_btn.setToolTip("Show reader bars")
+        self._chrome_restore_btn.hide()
+        self._chrome_restore_btn.clicked.connect(self._show_reading_chrome)
+        self._chrome_restore_btn.raise_()
+
+        self._sidebar = _Sidebar(self._library, hidden_nav_ids=self._sidebar_hidden_nav_ids)
         self._sidebar.show_folders_clicked.connect(self._bookshelf.go_to_root)
         self._sidebar.show_queue_clicked.connect(self._bookshelf.show_queue)
         self._sidebar.show_hidden_clicked.connect(self._bookshelf.show_hidden)
@@ -530,6 +744,7 @@ class MainWindow(QMainWindow):
         self._sidebar.delete_shelf_requested.connect(self._delete_shelf)
         self._sidebar.export_shelf_requested.connect(self.export_shelf)
         self._sidebar.back_to_root_clicked.connect(self._bookshelf.go_to_root)
+        self._sidebar.hidden_nav_changed.connect(self._set_sidebar_hidden_nav)
 
         container = QWidget()
         h_layout = QHBoxLayout(container)
@@ -557,14 +772,11 @@ class MainWindow(QMainWindow):
         self._bookshelf.folder_rescan_requested.connect(self.rescan_folder)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
-        self.viewer.mouse_moved.connect(self._on_viewer_mouse_y)
         self._seek_bar.seeked.connect(self.seek_to_page)
         self._reader_bar.menu_requested.connect(self._show_reader_menu)
         self._thumb_strip.page_selected.connect(self.seek_to_page)
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
-        self._webtoon_viewer.mouse_moved.connect(self._on_viewer_mouse_y)
         self._ebook_viewer.chapter_changed.connect(self._on_ebook_chapter_changed)
-        self._ebook_viewer.mouse_moved.connect(self._on_viewer_mouse_y)
         self._ebook_viewer.exit_requested.connect(self._back_to_library)
         self._ebook_viewer.end_reached.connect(self._prompt_open_next_queued_book)
 
@@ -634,9 +846,9 @@ class MainWindow(QMainWindow):
         view_menu.addAction(zoom_out)
 
         view_menu.addSeparator()
-        fullscreen = QAction("&Fullscreen", self)
+        fullscreen = QAction("Hide &Reader Bars", self)
         fullscreen.setShortcuts(_shortcuts("fullscreen"))
-        fullscreen.triggered.connect(self._toggle_fullscreen)
+        fullscreen.triggered.connect(self._toggle_reading_chrome)
         view_menu.addAction(fullscreen)
 
         view_menu.addSeparator()
@@ -689,6 +901,11 @@ class MainWindow(QMainWindow):
         self._add_folder_action.setShortcut("Ctrl+L")
         self._add_folder_action.triggered.connect(self.add_folder_to_library)
         library_menu.addAction(self._add_folder_action)
+
+        self._add_files_action = QAction("Add &Files to Library...", self)
+        self._add_files_action.setShortcut("Ctrl+Shift+L")
+        self._add_files_action.triggered.connect(self.add_files_to_library)
+        library_menu.addAction(self._add_files_action)
 
         rescan_all_action = QAction("&Rescan All Library Folders", self)
         rescan_all_action.triggered.connect(self.rescan_all_folders)
@@ -759,6 +976,8 @@ class MainWindow(QMainWindow):
         self._ebook_mode = False
 
         def do_switch():
+            self._chrome_hidden = False
+            self._chrome_restore_btn.hide()
             self._hide_reader_bar(animated=False)
             self._seek_bar.setVisible(False)
             self._thumb_strip.setVisible(False)
@@ -830,6 +1049,13 @@ class MainWindow(QMainWindow):
     def _show_ebook_menu(self) -> None:
         menu = QMenu(self)
 
+        spread_act = menu.addAction("Spread mode (two pages)")
+        spread_act.setCheckable(True)
+        spread_act.setChecked(self._spread_mode)
+        spread_act.triggered.connect(self._toggle_spread)
+
+        menu.addSeparator()
+
         chapters_menu = menu.addMenu("Chapters")
         titles = self._ebook_viewer.chapter_titles()
         current = self._ebook_viewer.current_chapter()
@@ -841,11 +1067,8 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda _checked=False, idx=i: self._ebook_viewer.show_chapter(idx))
 
         menu.addSeparator()
-        menu.addAction("Larger text").triggered.connect(
-            lambda: self._ebook_viewer.adjust_font(+1)
-        )
-        menu.addAction("Smaller text").triggered.connect(
-            lambda: self._ebook_viewer.adjust_font(-1)
+        menu.addAction("Look up word…").triggered.connect(
+            self._ebook_viewer.prompt_dictionary
         )
 
         menu.exec(self._reader_bar.menu_btn_global_pos())
@@ -856,6 +1079,9 @@ class MainWindow(QMainWindow):
         if self._webtoon_mode:
             return  # spread is meaningless in webtoon mode
         self._spread_mode = not self._spread_mode
+        if self._ebook_mode:
+            self._ebook_viewer.set_spread_mode(self._spread_mode)
+            return
         if not self._reader:
             return
         page_count = self._reader.page_count()
@@ -1021,10 +1247,11 @@ class MainWindow(QMainWindow):
             self._build_menus()
 
     def _on_escape(self):
-        if self._stack.currentIndex() in (1, 2, 3):  # comic, webtoon, or ebook
+        if self._is_reading_view():
+            if self._chrome_hidden:
+                self._show_reading_chrome()
+                return
             self._back_to_library()
-        elif self.isFullScreen():
-            self._toggle_fullscreen()
 
     def _on_folder_level_changed(self, in_folder: bool):
         self._sidebar.set_back_visible(in_folder)
@@ -1037,12 +1264,35 @@ class MainWindow(QMainWindow):
                 shelf_id = self._bookshelf._current_shelf_id
                 self._sidebar.set_active(shelf_id if shelf_id is not None else -1)
 
+    def _load_sidebar_hidden_nav_ids(self) -> set[int]:
+        if self._settings.value("sidebar_nav_hidden", False, type=bool):
+            self._settings.remove("sidebar_nav_hidden")
+        raw = self._settings.value("sidebar_hidden_nav_ids", "")
+        if not raw:
+            raw = self._settings.value("sidebar_hidden_shelf_ids", "")
+        if not raw:
+            return set()
+        return {int(part) for part in str(raw).split(",") if part.strip().lstrip("-").isdigit()}
+
+    def _set_sidebar_hidden_nav(self, hidden_ids: set[int]) -> None:
+        self._sidebar_hidden_nav_ids = set(hidden_ids)
+        self._settings.setValue(
+            "sidebar_hidden_nav_ids",
+            ",".join(str(nid) for nid in sorted(self._sidebar_hidden_nav_ids)),
+        )
+
     def apply_theme(self, c: dict):
         from PyQt6.QtWidgets import QApplication
         self._theme = c
         QApplication.instance().setStyleSheet(themes.app_stylesheet(c))
         self._sidebar.apply_theme(c)
         self._reader_bar.apply_theme(c)
+        self._chrome_restore_btn.setStyleSheet(
+            f"QPushButton {{ background: {c['reader_bar_bg']}; color: {c['accent']};"
+            f" border: 1px solid {c['border']}; border-radius: 6px;"
+            f" font-size: 18px; }}"
+            f"QPushButton:hover {{ background: {c['hover_bg']}; }}"
+        )
         self._bookshelf.apply_theme(c)
         self._ebook_viewer.apply_theme(c)
 
@@ -1052,8 +1302,7 @@ class MainWindow(QMainWindow):
         last_dir = self._settings.value("last_dir", str(Path.home()))
         dialog = QFileDialog(self, "Open Comic", last_dir)
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
-        dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
-        dialog.setNameFilters(SUPPORTED_FILTERS)
+        _setup_comic_file_dialog(dialog)
         if dialog.exec():
             files = dialog.selectedFiles()
             if files:
@@ -1106,9 +1355,6 @@ class MainWindow(QMainWindow):
         title = Path(path).stem
         self.setWindowTitle(f"Comic Reader — {title}")
         self._reader_bar.set_title(title)
-        if not self.isFullScreen():
-            self._show_reader_bar(animated=False)
-
         # Reset session state
         self._spread_mode = False
         self._thumb_strip.setVisible(False)
@@ -1169,6 +1415,8 @@ class MainWindow(QMainWindow):
             self._seek_bar.setVisible(True)
             self._stack.setCurrentIndex(target_index)
             self._sidebar.hide()
+            self._chrome_hidden = False
+            self._apply_reading_chrome()
 
         QTimer.singleShot(180, lambda: self._fade_switch(do_switch))
 
@@ -1198,9 +1446,6 @@ class MainWindow(QMainWindow):
         title = book.title or Path(path).stem
         self.setWindowTitle(f"Comic Reader — {title}")
         self._reader_bar.set_title(title)
-        if not self.isFullScreen():
-            self._show_reader_bar(animated=False)
-
         # Hide comic-only chrome.
         self._seek_bar.setVisible(False)
         self._thumb_strip.setVisible(False)
@@ -1223,7 +1468,9 @@ class MainWindow(QMainWindow):
         self._ebook = book
         self._ebook_mode = True
         self._webtoon_mode = False
+        self._spread_mode = False
         self._current_page = start_chapter
+        self._ebook_viewer.set_spread_mode(False)
         self._ebook_viewer.load_book(book, start_chapter, font_pt)
 
         # Start a reading session for statistics.
@@ -1234,6 +1481,8 @@ class MainWindow(QMainWindow):
         def do_switch():
             self._stack.setCurrentIndex(3)
             self._sidebar.hide()
+            self._chrome_hidden = False
+            self._apply_reading_chrome()
 
         QTimer.singleShot(180, lambda: self._fade_switch(do_switch))
 
@@ -1438,25 +1687,61 @@ class MainWindow(QMainWindow):
 
     # ----- Window helpers -----
 
-    def _toggle_fullscreen(self):
-        if self.isFullScreen():
-            self.showNormal()
-            if self._stack.currentIndex() in (1, 2, 3):
-                self._show_reader_bar(animated=False)
-        else:
-            self.showFullScreen()
-            self._hide_reader_bar(animated=True)
+    def _is_reading_view(self) -> bool:
+        return self._stack.currentIndex() in (1, 2, 3)
 
-    def _on_viewer_mouse_y(self, y: int):
-        # Windowed mode always shows the bar. In fullscreen it's hidden for immersive
-        # reading but reveals when the cursor moves to the top edge, and hides again
-        # when the cursor moves away — otherwise there's no way to reach the menu/back.
-        if not self.isFullScreen():
+    def _position_chrome_restore_btn(self) -> None:
+        if not self._chrome_restore_btn.isVisible():
             return
-        if y < 60:
-            self._show_reader_bar(animated=True)
-        elif y > _ReaderBar.HEIGHT + 60:
-            self._hide_reader_bar(animated=True)
+        margin = 10
+        x = self._content.width() - self._chrome_restore_btn.width() - margin
+        self._chrome_restore_btn.move(max(margin, x), margin)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_chrome_restore_btn()
+
+    def _apply_reading_chrome(self) -> None:
+        """Top + bottom reader bars: always on unless chrome-hidden mode is active."""
+        self._reader_bar.set_chrome_hidden(self._chrome_hidden)
+        if not self._is_reading_view():
+            self._chrome_restore_btn.hide()
+            return
+
+        hidden = self._chrome_hidden
+        self._chrome_restore_btn.setVisible(hidden)
+        if hidden:
+            self._position_chrome_restore_btn()
+
+        if hidden:
+            self._thumb_strip_before_chrome = self._thumb_strip.isVisible()
+            self._hide_reader_bar(animated=False)
+        else:
+            self._show_reader_bar(animated=False)
+
+        if self._ebook_mode:
+            self._ebook_viewer.set_reader_chrome_visible(not hidden)
+            self._seek_bar.setVisible(False)
+            self._thumb_strip.setVisible(False)
+        else:
+            self._seek_bar.setVisible(not hidden)
+            if hidden:
+                self._thumb_strip.hide()
+            elif self._thumb_strip_before_chrome:
+                self._thumb_strip.show()
+
+    def _toggle_reading_chrome(self) -> None:
+        """Hide/show reader bars only — window size and mode stay the same."""
+        if not self._is_reading_view():
+            return
+        self._chrome_hidden = not self._chrome_hidden
+        self._apply_reading_chrome()
+
+    def _show_reading_chrome(self) -> None:
+        if not self._chrome_hidden:
+            return
+        self._chrome_hidden = False
+        self._apply_reading_chrome()
 
     def _show_reader_bar(self, animated: bool):
         if self._reader_bar_target_visible and self._reader_bar.isVisible():
@@ -1464,6 +1749,7 @@ class MainWindow(QMainWindow):
         self._reader_bar_target_visible = True
         self._reader_bar_should_hide = False
         self._reader_bar_anim.stop()
+        self._reader_bar.setMinimumHeight(_ReaderBar.HEIGHT)
         self._reader_bar.show()
         self._reader_bar.raise_()
         if not animated:
@@ -1479,6 +1765,7 @@ class MainWindow(QMainWindow):
         self._reader_bar_should_hide = True
         self._reader_bar_anim.stop()
         if not animated:
+            self._reader_bar.setMinimumHeight(0)
             self._reader_bar.setMaximumHeight(0)
             self._reader_bar_opacity.setOpacity(0.0)
             self._reader_bar.hide()
@@ -1494,6 +1781,7 @@ class MainWindow(QMainWindow):
 
     def _on_reader_bar_anim_finished(self):
         if self._reader_bar_should_hide:
+            self._reader_bar.setMinimumHeight(0)
             self._reader_bar.hide()
 
     def _restore_window_state(self):
@@ -1575,10 +1863,34 @@ class MainWindow(QMainWindow):
         if not folder:
             return
         self._settings.setValue("last_library_dir", folder)
-        self._start_scan(folder)
+        self._start_scan(folder=folder)
+
+    def add_files_to_library(self):
+        last_dir = self._settings.value("last_library_dir", str(Path.home()))
+        dialog = QFileDialog(self, "Add Files to Library", last_dir)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        _setup_comic_file_dialog(dialog)
+        if not dialog.exec():
+            return
+        files = dialog.selectedFiles()
+        if not files:
+            return
+        comic_files = [
+            f for f in files if Path(f).suffix.lower() in SCANNABLE_EXTENSIONS
+        ]
+        if not comic_files:
+            QMessageBox.warning(
+                self,
+                "Add Files to Library",
+                "No supported comic files were selected.\n\n"
+                "Supported types: CBZ, CBR, CB7, CBT, PDF, EPUB, and common archive extensions.",
+            )
+            return
+        self._settings.setValue("last_library_dir", str(Path(comic_files[0]).parent))
+        self._start_scan(paths=comic_files)
 
     def rescan_folder(self, folder_path: str):
-        self._start_scan(folder_path)
+        self._start_scan(folder=folder_path)
 
     def rescan_all_folders(self):
         folders = self._library.get_source_folders()
@@ -1591,7 +1903,7 @@ class MainWindow(QMainWindow):
             return
         self._scan_queue = folders[1:]
         self._scan_totals = {"added": 0, "skipped": 0, "errors": [], "cancelled": False}
-        self._start_scan(folders[0])
+        self._start_scan(folder=folders[0])
 
     def export_library(self):
         last_dir = self._settings.value("last_export_dir", str(Path.home()))
@@ -1705,19 +2017,27 @@ class MainWindow(QMainWindow):
             f"Not in this library: {stats['unmatched']}",
         )
 
-    def _start_scan(self, folder: str):
+    def _start_scan(self, *, folder: str | None = None, paths: list[str] | None = None):
         if self._scan_thread and self._scan_thread.isRunning():
             return
 
         self._add_folder_action.setEnabled(False)
+        self._add_files_action.setEnabled(False)
         self._sidebar.set_add_enabled(False)
 
         self._scan_thread = QThread(self)
-        self._scanner = LibraryScanner(self._library, Path(folder))
+        if paths:
+            self._scanner = LibraryScanner(self._library, paths=[Path(p) for p in paths])
+            progress_label = "Adding files…"
+            progress_title = "Adding to Library"
+        else:
+            self._scanner = LibraryScanner(self._library, folder=Path(folder))
+            progress_label = "Finding comic files…"
+            progress_title = "Scanning Library"
         self._scanner.moveToThread(self._scan_thread)
 
-        self._scan_progress = QProgressDialog("Finding comic files…", "Cancel", 0, 0, self)
-        self._scan_progress.setWindowTitle("Scanning Library")
+        self._scan_progress = QProgressDialog(progress_label, "Cancel", 0, 0, self)
+        self._scan_progress.setWindowTitle(progress_title)
         self._scan_progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._scan_progress.setMinimumDuration(0)
         self._scan_progress.setValue(0)
@@ -1750,7 +2070,7 @@ class MainWindow(QMainWindow):
             self._scan_totals["cancelled"] = self._scan_totals["cancelled"] or result.cancelled
             if self._scan_queue and not result.cancelled:
                 next_folder = self._scan_queue.pop(0)
-                self._start_scan(next_folder)
+                self._start_scan(folder=next_folder)
                 return
             self._scan_queue.clear()
             result.added = self._scan_totals["added"]
@@ -1790,6 +2110,7 @@ class MainWindow(QMainWindow):
         self._scanner = None
         self._scan_progress = None
         self._add_folder_action.setEnabled(True)
+        self._add_files_action.setEnabled(True)
         self._sidebar.set_add_enabled(True)
 
     # ----- Duplicate detection -----
