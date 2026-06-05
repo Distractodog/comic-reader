@@ -925,6 +925,21 @@ class Library:
         series_comics = [c for c in comics if c.series == series_name]
         return sorted(series_comics, key=lambda c: (c.series_number or 0, (c.title or "").lower()))
 
+    def get_next_in_series(self, comic_id: int) -> Comic | None:
+        """Return the next issue in the same folder series, or None if not in a series."""
+        comic = self.get_comic_by_id(comic_id)
+        if comic is None or not comic.series:
+            return None
+        folder = _parent_dir(comic.file_path)
+        series_comics = self.get_comics_in_series(folder, comic.series)
+        ids = [c.id for c in series_comics]
+        if comic_id not in ids:
+            return None
+        next_index = ids.index(comic_id) + 1
+        if next_index >= len(series_comics):
+            return None
+        return series_comics[next_index]
+
     def search_library(
         self, query: str, sort_by: str = "title", order: str = "asc"
     ) -> tuple[list[Folder], list[Comic]]:
@@ -2086,6 +2101,23 @@ if __name__ == "__main__":
 
     lib.delete_annotation(note_id)
     assert lib.get_annotation_for_page(id1, 4) is None
+
+    s1 = lib.add_comic(
+        "/comics/series/a1.cbz", page_count=10, file_size=1_000,
+        title="Alpha #1", series="Alpha", series_number=1,
+    )
+    s2 = lib.add_comic(
+        "/comics/series/a2.cbz", page_count=10, file_size=2_000,
+        title="Alpha #2", series="Alpha", series_number=2,
+    )
+    s3 = lib.add_comic(
+        "/comics/series/a3.cbz", page_count=10, file_size=3_000,
+        title="Alpha #3", series="Alpha", series_number=3,
+    )
+    assert lib.get_next_in_series(s1).id == s2
+    assert lib.get_next_in_series(s2).id == s3
+    assert lib.get_next_in_series(s3) is None
+    assert lib.get_next_in_series(id1) is None
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:

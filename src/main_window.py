@@ -785,7 +785,7 @@ class MainWindow(QMainWindow):
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
         self._ebook_viewer.chapter_changed.connect(self._on_ebook_chapter_changed)
         self._ebook_viewer.exit_requested.connect(self._back_to_library)
-        self._ebook_viewer.end_reached.connect(self._prompt_open_next_queued_book)
+        self._ebook_viewer.end_reached.connect(self._prompt_continue_after_book)
 
         self._build_menus()
 
@@ -1587,23 +1587,51 @@ class MainWindow(QMainWindow):
             self._seek_bar.set_progress((pair_index + 1) / pair_count)
             self._seek_bar.set_current_index(pair_index)
 
+    def _last_spread_start(self, page_count: int) -> int:
+        return ((page_count - 1) // 2) * 2
+
+    def _effective_progress_page(self) -> int:
+        """Page index stored in the library (last spread counts as finished)."""
+        if not self._reader:
+            return self._current_page
+        page_count = self._reader.page_count()
+        if page_count <= 0:
+            return self._current_page
+        limit = page_count - 1
+        if self._spread_mode and self._current_page >= self._last_spread_start(page_count):
+            return limit
+        return self._current_page
+
     def next_page(self):
         if self._ebook_mode:
             self._ebook_viewer.next_page()
             return
         if not self._reader:
             return
-        step = 2 if self._spread_mode else 1
-        limit = self._reader.page_count() - 1
+        page_count = self._reader.page_count()
+        if page_count <= 0:
+            return
+        limit = page_count - 1
+
+        if self._spread_mode:
+            last_spread = self._last_spread_start(page_count)
+            if self._current_page >= last_spread:
+                self._save_progress()
+                self._prompt_continue_after_book()
+                return
+            self._current_page = min(self._current_page + 2, last_spread)
+            self._show_current_page(direction=1)
+            self._advance_preloader()
+            self._save_progress()
+            return
+
         if self._current_page < limit:
-            self._current_page = min(self._current_page + step, limit)
-            if self._spread_mode:
-                self._current_page = (self._current_page // 2) * 2
+            self._current_page += 1
             self._show_current_page(direction=1)
             self._advance_preloader()
             self._save_progress()
         else:
-            self._prompt_open_next_queued_book()
+            self._prompt_continue_after_book()
 
     def _next_queued_comic(self):
         queue = self._library.get_queue()
@@ -1618,6 +1646,27 @@ class MainWindow(QMainWindow):
         if next_index >= len(queue):
             return None
         return queue[next_index]
+
+    def _prompt_continue_after_book(self) -> None:
+        """At end of book: offer the next series issue, otherwise the reading queue."""
+        if self._current_comic_id is not None:
+            next_in_series = self._library.get_next_in_series(self._current_comic_id)
+            if next_in_series is not None:
+                title = next_in_series.title or Path(next_in_series.file_path).stem
+                reply = QMessageBox.question(
+                    self,
+                    "Open next in series?",
+                    f"You reached the end. Open the next issue in this series?\n\n{title}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                self.load_file(next_in_series.file_path)
+                self.statusBar().showMessage(f"Opened next in series: {title}", 3500)
+                return
+
+        self._prompt_open_next_queued_book()
 
     def _prompt_open_next_queued_book(self) -> None:
         """Offer to continue into the next queued book at the end of the current one."""
@@ -1697,7 +1746,9 @@ class MainWindow(QMainWindow):
 
     def _save_progress(self):
         if self._current_comic_id is not None:
-            self._library.update_progress(self._current_comic_id, self._current_page)
+            self._library.update_progress(
+                self._current_comic_id, self._effective_progress_page()
+            )
             self._library.set_zoom(self._current_comic_id, self.viewer.zoom_factor)
             self._record_reading_session()
 
@@ -1710,9 +1761,10 @@ class MainWindow(QMainWindow):
         """
         if self._current_comic_id is None:
             return
-        if self._current_page > self._session_max_page:
-            self._session_pages += self._current_page - self._session_max_page
-            self._session_max_page = self._current_page
+        progress_page = self._effective_progress_page()
+        if progress_page > self._session_max_page:
+            self._session_pages += progress_page - self._session_max_page
+            self._session_max_page = progress_page
         now = time.monotonic()
         elapsed = 0
         if self._session_clock is not None:
