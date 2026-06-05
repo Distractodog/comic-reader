@@ -441,6 +441,7 @@ class _HeaderBar(QWidget):
     _SORT_OPTIONS = [
         ("Title A–Z",      "title",      "asc"),
         ("Title Z–A",      "title",      "desc"),
+        ("Chapter order",  "chapter",    "asc"),
         ("Recently Added", "date_added", "desc"),
         ("Last Read",      "last_read",  "desc"),
     ]
@@ -471,7 +472,7 @@ class _HeaderBar(QWidget):
         self._sort_combo = QComboBox()
         for label, _, _ in self._SORT_OPTIONS:
             self._sort_combo.addItem(label)
-        self._sort_combo.setFixedWidth(150)
+        self._sort_combo.setFixedWidth(165)
         self._sort_combo.setStyleSheet(
             "QComboBox::drop-down { border: none; width: 20px; }"
         )
@@ -973,16 +974,25 @@ class BookshelfView(QWidget):
             items = self._library.get_shelf_folders(self._current_shelf_id)
             empty_msg = "This shelf is empty."
         elif self._current_shelf_id is not None:
-            # Shelf drill-down — show comics from this folder that are on the shelf
-            items = self._library.get_comics_in_shelf_for_folder(
+            # Shelf drill-down — same series grouping as a normal folder view
+            shelf_comics = self._library.get_comics_in_shelf_for_folder(
                 self._current_shelf_id, self._current_folder,
                 sort_by=self._sort_by, order=self._sort_order,
             )
+            series_list, ungrouped = self._library.group_series_from_comics(
+                self._current_folder, shelf_comics
+            )
+            items = series_list + ungrouped
             empty_msg = "No comics from this folder on this shelf."
         elif self._current_series_name is not None:
             items = self._library.get_comics_in_series(
                 self._current_folder, self._current_series_name
             )
+            if self._current_shelf_id is not None:
+                on_shelf = {
+                    c.id for c in self._library.get_comics_in_shelf(self._current_shelf_id)
+                }
+                items = [c for c in items if c.id in on_shelf]
             empty_msg = "No comics found in this series."
         elif self._current_folder is None:
             items = self._library.get_folders()
@@ -992,12 +1002,12 @@ class BookshelfView(QWidget):
             )
         else:
             # Folder view: series groups first, then ungrouped comics
-            series_list = self._library.get_series_in_folder(self._current_folder)
-            grouped_names = {s.name for s in series_list}
             all_comics = self._library.get_comics_in_folder(
                 self._current_folder, sort_by=self._sort_by, order=self._sort_order
             )
-            ungrouped = [c for c in all_comics if not c.series or c.series not in grouped_names]
+            series_list, ungrouped = self._library.group_series_from_comics(
+                self._current_folder, all_comics
+            )
             items = series_list + ungrouped
             empty_msg = "No comics found in this folder."
 
@@ -1109,6 +1119,9 @@ class BookshelfView(QWidget):
             lambda: self._edit_metadata(target_ids)
         )
         if is_multi and self._current_folder:
+            menu.addAction("Set chapter order").triggered.connect(
+                lambda: self._set_chapter_order(target_ids)
+            )
             menu.addAction("Group as series…").triggered.connect(
                 lambda: self._group_as_series(target_ids)
             )
@@ -1533,6 +1546,14 @@ class BookshelfView(QWidget):
     def _on_folder_context_menu(self, folder_path: str, gx: int, gy: int):
         self._show_folder_menu(folder_path, gx, gy)
 
+    def _comics_for_folder_grouping(self, folder_path: str) -> list[Comic]:
+        """Comics visible in folder_path — shelf-filtered when drilling into a shelf."""
+        if self._current_shelf_id is not None and folder_path == self._current_folder:
+            return self._library.get_comics_in_shelf_for_folder(
+                self._current_shelf_id, folder_path
+            )
+        return self._library.get_comics_in_folder(folder_path)
+
     def _show_folder_menu(self, folder_path: str, gx: int, gy: int) -> None:
         menu = QMenu(self)
         menu.addAction("Rescan folder").triggered.connect(
@@ -1541,6 +1562,19 @@ class BookshelfView(QWidget):
         if self._show_hidden_mode:
             menu.exec(QPoint(gx, gy))
             return
+
+        folder_comics = self._comics_for_folder_grouping(folder_path)
+        if len(folder_comics) >= 2:
+            series_list, _ = self._library.group_series_from_comics(
+                folder_path, folder_comics
+            )
+            menu.addAction("Set chapter order").triggered.connect(
+                lambda: self._set_chapter_order([c.id for c in folder_comics])
+            )
+            if not series_list:
+                menu.addAction("Group all comics as series…").triggered.connect(
+                    lambda: self._group_as_series([c.id for c in folder_comics])
+                )
 
         menu.addAction("Rename folder…").triggered.connect(
             lambda: self._rename_folder(folder_path)
@@ -1798,10 +1832,36 @@ class BookshelfView(QWidget):
         from PyQt6.QtWidgets import QInputDialog
         name, ok = QInputDialog.getText(self, "Group as Series", "Series name:")
         if ok and name.strip():
-            for cid in comic_ids:
-                self._library.update_metadata(cid, series=name.strip())
+            self._library.group_comics_as_series(comic_ids, name.strip())
             self._clear_selection()
+            self._apply_sort("chapter", "asc")
             self._repopulate()
+
+    def _set_chapter_order(self, comic_ids: list[int]):
+        if len(comic_ids) < 2:
+            return
+        self._library.set_comics_chapter_order(comic_ids)
+        self._clear_selection()
+        self._apply_sort("chapter", "asc")
+        if self._current_series_name is not None and self._current_folder:
+            self._current_series_name = None
+            self._header.set_comic_mode(Path(self._current_folder).name)
+        self._repopulate()
+        n = len(comic_ids)
+        self.window().statusBar().showMessage(
+            f"Set {n} comic{'s' if n != 1 else ''} to chapter order",
+            4000,
+        )
+
+    def _apply_sort(self, sort_by: str, order: str):
+        self._sort_by = sort_by
+        self._sort_order = order
+        for idx, (_, key, ord_) in enumerate(self._header._SORT_OPTIONS):
+            if key == sort_by and ord_ == order:
+                self._header._sort_combo.blockSignals(True)
+                self._header._sort_combo.setCurrentIndex(idx)
+                self._header._sort_combo.blockSignals(False)
+                break
 
     def _ungroup_series(self, folder_path: str, series_name: str):
         comics = self._library.get_comics_in_series(folder_path, series_name)

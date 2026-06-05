@@ -15,3 +15,6 @@ dist/
 test_data/
 build/gcide-cache/
 src/data/dictionary.db
+.cursor/
+Cover 2.0.app/
+src/assets/app-icon.iconset/

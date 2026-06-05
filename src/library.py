@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 from contextlib import contextmanager
@@ -127,6 +128,41 @@ def _row_to_comic(row: sqlite3.Row) -> Comic:
     )
 
 
+def _natural_sort_key(name: str) -> list:
+    """Sort filenames so page2.jpg comes before page10.jpg."""
+    parts = re.split(r"(\d+)", name.lower())
+    return [int(p) if p.isdigit() else p for p in parts]
+
+
+def _infer_issue_number(stem: str) -> float | None:
+    """Best-effort issue number from a filename stem (e.g. 'Saga 042' → 42)."""
+    for pat in (
+        r"#\s*(\d+(?:\.\d+)?)\s*$",
+        r"\(\s*(\d+(?:\.\d+)?)\s*\)\s*$",
+        r"[-_\s]v(?:ol)?\.?\s*(\d+(?:\.\d+)?)\s*$",
+        r"[-_\s](\d+(?:\.\d+)?)\s*$",
+    ):
+        m = re.search(pat, stem, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
+    return None
+
+
+def _comic_series_sort_key(c: Comic) -> tuple:
+    """Sort key for comics within a series — issue # first, then filename order."""
+    stem = Path(c.file_path).stem
+    nat = _natural_sort_key(stem)
+    if c.series_number is not None:
+        return (0, c.series_number, nat)
+    inferred = _infer_issue_number(stem)
+    if inferred is not None:
+        return (0, inferred, nat)
+    return (1, nat)
+
+
 def _sort_comics(comics: list, sort_by: str, order: str) -> list:
     reverse = order.lower() == "desc"
     if sort_by == "title":
@@ -136,6 +172,9 @@ def _sort_comics(comics: list, sort_by: str, order: str) -> list:
     if sort_by == "last_read":
         has = sorted([c for c in comics if c.last_read], key=lambda c: c.last_read, reverse=reverse)
         return has + [c for c in comics if not c.last_read]
+    if sort_by == "chapter":
+        ordered = sorted(comics, key=_comic_series_sort_key)
+        return list(reversed(ordered)) if reverse else ordered
     return sorted(comics, key=lambda c: (c.title or Path(c.file_path).stem).lower())
 
 
@@ -303,6 +342,7 @@ CREATE INDEX IF NOT EXISTS idx_annotations_comic ON annotations(comic_id);
 _CURRENT_VERSION = 13
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
+_CLIENT_SORT_MODES = _VALID_SORT_COLUMNS | {"chapter"}
 
 
 class Library:
@@ -748,6 +788,28 @@ class Library:
                 f"UPDATE comics SET {set_clause} WHERE id = ?", values
             )
 
+    def group_comics_as_series(self, comic_ids: list[int], series_name: str) -> None:
+        """Assign a shared series name; auto-number from filename order when needed."""
+        comics = [c for cid in comic_ids if (c := self.get_comic_by_id(cid)) is not None]
+        comics = sorted(comics, key=_comic_series_sort_key)
+        auto_number = not any(c.series_number is not None for c in comics)
+        for i, comic in enumerate(comics, start=1):
+            fields: dict = {"series": series_name}
+            if auto_number:
+                fields["series_number"] = i
+            self.update_metadata(comic.id, **fields)
+
+    def set_comics_chapter_order(self, comic_ids: list[int]) -> None:
+        """Put comics in chapter order as separate tiles — no series grouping."""
+        comics = [c for cid in comic_ids if (c := self.get_comic_by_id(cid)) is not None]
+        comics = sorted(comics, key=_comic_series_sort_key)
+        auto_number = not any(c.series_number is not None for c in comics)
+        for i, comic in enumerate(comics, start=1):
+            fields: dict = {"series": None}
+            if auto_number:
+                fields["series_number"] = i
+            self.update_metadata(comic.id, **fields)
+
     def set_cover_path(self, comic_id: int, cover_path: str) -> None:
         with self.transaction() as cur:
             cur.execute(
@@ -897,33 +959,51 @@ class Library:
         self, folder_path: str, *, sort_by: str = "title", order: str = "asc"
     ) -> list[Comic]:
         """Return all comics whose file lives directly in folder_path."""
-        if sort_by not in _VALID_SORT_COLUMNS:
+        if sort_by not in _CLIENT_SORT_MODES:
             sort_by = "title"
         rows = self._conn.execute(
             "SELECT * FROM comics WHERE parent_dir = ? AND hidden = 0", (folder_path,)
         ).fetchall()
         return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
 
-    def get_series_in_folder(self, folder_path: str) -> list[Series]:
-        """Return series that have 2+ comics in the folder, sorted by name."""
-        comics = self.get_comics_in_folder(folder_path)
+    def group_series_from_comics(
+        self, folder_path: str, comics: list[Comic]
+    ) -> tuple[list[Series], list[Comic]]:
+        """Split a comic list into series tiles (2+ sharing a series) and ungrouped comics."""
         groups: dict[str, list[Comic]] = {}
         for c in comics:
             if c.series:
                 groups.setdefault(c.series, []).append(c)
-        result = []
+        series_list: list[Series] = []
+        grouped_names: set[str] = set()
         for name, group in groups.items():
             if len(group) >= 2:
-                sorted_group = sorted(group, key=lambda c: (c.series_number or 0, (c.title or "").lower()))
+                grouped_names.add(name)
+                sorted_group = sorted(group, key=_comic_series_sort_key)
                 cover = next((c.cover_path for c in sorted_group if c.cover_path), None)
-                result.append(Series(name=name, comic_count=len(group), cover_path=cover, folder_path=folder_path))
-        return sorted(result, key=lambda s: s.name.lower())
+                series_list.append(
+                    Series(
+                        name=name,
+                        comic_count=len(group),
+                        cover_path=cover,
+                        folder_path=folder_path,
+                    )
+                )
+        series_list.sort(key=lambda s: s.name.lower())
+        ungrouped = [c for c in comics if not c.series or c.series not in grouped_names]
+        return series_list, ungrouped
+
+    def get_series_in_folder(self, folder_path: str) -> list[Series]:
+        """Return series that have 2+ comics in the folder, sorted by name."""
+        comics = self.get_comics_in_folder(folder_path)
+        series_list, _ = self.group_series_from_comics(folder_path, comics)
+        return series_list
 
     def get_comics_in_series(self, folder_path: str, series_name: str) -> list[Comic]:
         """Return comics for a specific series within a folder, sorted by issue number."""
         comics = self.get_comics_in_folder(folder_path)
         series_comics = [c for c in comics if c.series == series_name]
-        return sorted(series_comics, key=lambda c: (c.series_number or 0, (c.title or "").lower()))
+        return sorted(series_comics, key=_comic_series_sort_key)
 
     def get_next_in_series(self, comic_id: int) -> Comic | None:
         """Return the next issue in the same folder series, or None if not in a series."""
@@ -950,7 +1030,7 @@ class Library:
         """
         if not query:
             return [], []
-        if sort_by not in _VALID_SORT_COLUMNS:
+        if sort_by not in _CLIENT_SORT_MODES:
             sort_by = "title"
         like = f"%{query}%"
 
@@ -1083,7 +1163,7 @@ class Library:
             return []
         if shelf_row["kind"] == "smart":
             return self._get_smart_shelf_comics(shelf_row["smart_key"], sort_by, order)
-        if sort_by not in _VALID_SORT_COLUMNS:
+        if sort_by not in _CLIENT_SORT_MODES:
             sort_by = "title"
         comic_rows = self._conn.execute(
             "SELECT c.* FROM comics c"
@@ -1509,7 +1589,7 @@ class Library:
         self, tag_name: str, *, sort_by: str = "title", order: str = "asc"
     ) -> list[Comic]:
         """Return all comics that have the given tag."""
-        if sort_by not in _VALID_SORT_COLUMNS:
+        if sort_by not in _CLIENT_SORT_MODES:
             sort_by = "title"
         rows = self._conn.execute(
             "SELECT c.* FROM comics c"
@@ -2118,6 +2198,52 @@ if __name__ == "__main__":
     assert lib.get_next_in_series(s2).id == s3
     assert lib.get_next_in_series(s3) is None
     assert lib.get_next_in_series(id1) is None
+
+    folder = "/comics/ungrouped"
+    u1 = lib.add_comic(
+        f"{folder}/Saga 10.cbz", page_count=10, file_size=1_000,
+        title="Saga Ten", series="Saga",
+    )
+    u2 = lib.add_comic(
+        f"{folder}/Saga 02.cbz", page_count=10, file_size=2_000,
+        title="Saga Two", series="Saga",
+    )
+    u3 = lib.add_comic(
+        f"{folder}/Saga 01.cbz", page_count=10, file_size=3_000,
+        title="Saga One", series="Saga",
+    )
+    saga_order = [c.id for c in lib.get_comics_in_series(folder, "Saga")]
+    assert saga_order == [u3, u2, u1]
+
+    g1 = lib.add_comic(f"{folder}/Beta 01.cbz", page_count=1, file_size=100)
+    g2 = lib.add_comic(f"{folder}/Beta 03.cbz", page_count=1, file_size=100)
+    g3 = lib.add_comic(f"{folder}/Beta 02.cbz", page_count=1, file_size=100)
+    lib.group_comics_as_series([g3, g1, g2], "Beta")
+    beta_order = [c.id for c in lib.get_comics_in_series(folder, "Beta")]
+    assert beta_order == [g1, g3, g2]
+    assert lib.get_comic_by_id(g1).series_number == 1
+    assert lib.get_comic_by_id(g3).series_number == 2
+    assert lib.get_comic_by_id(g2).series_number == 3
+
+    ch1 = lib.add_comic(
+        f"{folder}/Line 10.cbz", page_count=1, file_size=100,
+        title="Line Ten", series="Line",
+    )
+    ch2 = lib.add_comic(
+        f"{folder}/Line 02.cbz", page_count=1, file_size=100,
+        title="Line Two", series="Line",
+    )
+    lib.set_comics_chapter_order([ch1, ch2])
+    assert lib.get_comic_by_id(ch1).series is None
+    assert lib.get_comic_by_id(ch2).series is None
+    line_order = [c.id for c in _sort_comics(
+        [lib.get_comic_by_id(ch1), lib.get_comic_by_id(ch2)], "chapter", "asc"
+    )]
+    assert line_order == [ch2, ch1]
+
+    saga_chapter_sort = [c.id for c in lib.get_comics_in_folder(folder, sort_by="chapter", order="asc")
+                         if c.series == "Saga"]
+    assert saga_chapter_sort == [u3, u2, u1]
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:

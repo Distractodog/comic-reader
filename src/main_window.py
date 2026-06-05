@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from app_info import APP_DISPLAY_NAME
+
 from PyQt6.QtCore import (
     QEasingCurve,
     QParallelAnimationGroup,
@@ -642,7 +644,7 @@ def _setup_comic_file_dialog(dialog: QFileDialog) -> None:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Comic Reader")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self.resize(1100, 1000)
 
         self._theme = themes.DARK
@@ -996,7 +998,7 @@ class MainWindow(QMainWindow):
             self._thumb_strip.setVisible(False)
             self._stack.setCurrentIndex(0)
             self._sidebar.show()
-            self.setWindowTitle("Comic Reader")
+            self.setWindowTitle(APP_DISPLAY_NAME)
 
     def _back_to_library(self):
         self._record_reading_session()
@@ -1017,7 +1019,7 @@ class MainWindow(QMainWindow):
             self._stack.setCurrentIndex(0)
             self._sidebar.show()
         self._fade_switch(do_switch)
-        self.setWindowTitle("Comic Reader")
+        self.setWindowTitle(APP_DISPLAY_NAME)
         self._current_comic_id = None
 
     # ----- Reader ⋮ menu -----
@@ -1395,7 +1397,7 @@ class MainWindow(QMainWindow):
 
         self._settings.setValue("last_dir", str(Path(path).parent))
         title = Path(path).stem
-        self.setWindowTitle(f"Comic Reader — {title}")
+        self.setWindowTitle(f"{APP_DISPLAY_NAME} — {title}")
         self._reader_bar.set_title(title)
         # Reset session state
         self._thumb_strip.setVisible(False)
@@ -1493,7 +1495,7 @@ class MainWindow(QMainWindow):
 
         self._settings.setValue("last_dir", str(Path(path).parent))
         title = book.title or Path(path).stem
-        self.setWindowTitle(f"Comic Reader — {title}")
+        self.setWindowTitle(f"{APP_DISPLAY_NAME} — {title}")
         self._reader_bar.set_title(title)
         # Hide comic-only chrome.
         self._seek_bar.setVisible(False)

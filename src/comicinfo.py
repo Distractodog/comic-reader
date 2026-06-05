@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tarfile
 import zipfile
 import xml.etree.ElementTree as ET
@@ -28,6 +29,17 @@ def _parse_xml(data: bytes) -> dict:
             result["series_number"] = float(v)
         except (ValueError, TypeError):
             pass
+    if (title := result.get("title")):
+        m = re.search(r"(?:chapter|#)\s*(\d+(?:\.\d+)?)\b", title, re.IGNORECASE)
+        if m:
+            try:
+                title_num = float(m.group(1))
+            except ValueError:
+                title_num = None
+            if title_num is not None and (
+                "series_number" not in result or title_num != result["series_number"]
+            ):
+                result["series_number"] = title_num
     if (v := _text("Writer")):
         result["author"] = v
     if (v := _text("Publisher")):

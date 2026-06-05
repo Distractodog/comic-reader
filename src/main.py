@@ -3,9 +3,11 @@
 import sys
 from pathlib import Path
 
-from PyQt6.QtGui import QFont, QFontDatabase
+from PyQt6.QtGui import QFont, QFontDatabase, QIcon
 from PyQt6.QtWidgets import QApplication
 
+from app_info import APP_DISPLAY_NAME, APP_INTERNAL_NAME, APP_ORGANIZATION
+from macos_app_name import apply_macos_app_name
 from main_window import MainWindow
 from themes import DARK, app_stylesheet
 
@@ -16,10 +18,19 @@ def resource_path(relative: str) -> Path:
     return base / relative
 
 
+def app_icon() -> QIcon | None:
+    path = resource_path("assets/app-icon.png")
+    if path.exists():
+        return QIcon(str(path))
+    return None
+
+
 def main():
+    apply_macos_app_name(APP_DISPLAY_NAME)
     app = QApplication(sys.argv)
-    app.setApplicationName("Comic Reader")
-    app.setOrganizationName("ComicReader")
+    app.setOrganizationName(APP_ORGANIZATION)
+    app.setApplicationName(APP_INTERNAL_NAME)
+    app.setApplicationDisplayName(APP_DISPLAY_NAME)
     app.setStyle("Fusion")
 
     fonts_dir = resource_path("fonts")
@@ -30,7 +41,13 @@ def main():
     app.setFont(font)
     app.setStyleSheet(app_stylesheet(DARK))
 
+    icon = app_icon()
+    if icon is not None:
+        app.setWindowIcon(icon)
+
     window = MainWindow()
+    if icon is not None:
+        window.setWindowIcon(icon)
     window.show()
 
     # If a file path was passed on the command line, open it

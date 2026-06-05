@@ -18,7 +18,7 @@ jobs:
           - os: macos-latest
             artifact_name: ComicReader-macOS
             binary_name: ComicReader-macOS
-            artifact_path: dist/ComicReader-macOS
+            artifact_path: dist/Cover 2.0.app
           - os: ubuntu-latest
             artifact_name: ComicReader-Linux
             binary_name: ComicReader-Linux

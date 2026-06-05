@@ -9,9 +9,13 @@ from PyInstaller.utils.hooks import collect_data_files
 
 ROOT = Path.cwd()
 binary_name = os.environ.get("COMIC_READER_BINARY_NAME", "ComicReader")
+app_display_name = os.environ.get("COMIC_READER_APP_NAME", "Cover 2.0")
+
+ASSETS_DIR = ROOT / "src" / "assets"
 
 datas = [
     (str(ROOT / "src" / "fonts"), "fonts"),
+    (str(ASSETS_DIR), "assets"),
     (str(ROOT / "src" / "data" / "dictionary.db"), "data"),
     (str(ROOT / "src" / "data" / "dictionary_seed.db"), "data"),
 ]
@@ -22,6 +26,16 @@ if sys.platform.startswith("win"):
     unrar_path = os.environ.get("COMIC_READER_UNRAR")
     if unrar_path and Path(unrar_path).exists():
         binaries.append((unrar_path, "."))
+
+app_icon_path = None
+if sys.platform.startswith("win"):
+    icon_candidate = ASSETS_DIR / "app-icon.ico"
+elif sys.platform == "darwin":
+    icon_candidate = ASSETS_DIR / "app-icon.icns"
+else:
+    icon_candidate = ASSETS_DIR / "app-icon.png"
+if icon_candidate.exists():
+    app_icon_path = str(icon_candidate)
 
 
 a = Analysis(
@@ -58,4 +72,18 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=app_icon_path,
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        exe,
+        name=f"{app_display_name}.app",
+        icon=app_icon_path,
+        bundle_identifier="com.comicreader.cover",
+        info_plist={
+            "CFBundleName": app_display_name,
+            "CFBundleDisplayName": app_display_name,
+            "CFBundleShortVersionString": "2.0",
+        },
+    )
