@@ -290,6 +290,7 @@ class _Sidebar(QWidget):
     show_hidden_clicked = pyqtSignal()
     show_shelf_clicked = pyqtSignal(int, str)   # shelf_id, shelf_name
     add_folder_clicked = pyqtSignal()
+    rescan_clicked = pyqtSignal()
     new_shelf_clicked = pyqtSignal()
     rename_shelf_requested = pyqtSignal(int, str)  # shelf_id, current_name
     delete_shelf_requested = pyqtSignal(int)        # shelf_id
@@ -332,6 +333,13 @@ class _Sidebar(QWidget):
         self._btn_back.hide()
         top_layout.addWidget(self._btn_back)
         top_layout.addStretch()
+
+        self._btn_rescan = QPushButton("↻")
+        self._btn_rescan.setFixedSize(44, 56)
+        self._btn_rescan.setFlat(True)
+        self._btn_rescan.setToolTip("Refresh library — rescan all folders for new comics")
+        self._btn_rescan.clicked.connect(self.rescan_clicked.emit)
+        top_layout.addWidget(self._btn_rescan)
 
         self._btn_add = QPushButton("+")
         self._btn_add.setFixedSize(44, 56)
@@ -487,6 +495,7 @@ class _Sidebar(QWidget):
             f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
         )
         self._btn_back.setStyleSheet(btn_css)
+        self._btn_rescan.setStyleSheet(btn_css)
         self._btn_add.setStyleSheet(add_css)
         new_shelf_css = (
             "QPushButton { text-align: left; padding: 8px 14px; border: none;"
@@ -599,6 +608,9 @@ class _Sidebar(QWidget):
     def set_add_enabled(self, enabled: bool):
         self._btn_add.setEnabled(enabled)
 
+    def set_rescan_enabled(self, enabled: bool):
+        self._btn_rescan.setEnabled(enabled)
+
     def apply_theme(self, c: dict):
         self._theme = c
         self.setStyleSheet(f"QWidget {{ background: {c['sidebar_bg']}; }}")
@@ -649,6 +661,7 @@ class MainWindow(QMainWindow):
         self._scan_progress: QProgressDialog | None = None
         self._scan_queue: list[str] = []
         self._scan_totals = {"added": 0, "skipped": 0, "errors": [], "cancelled": False}
+        self._scan_generation = 0
         self._dedupe_thread: QThread | None = None
         self._dedupe_scanner: DuplicateScanner | None = None
         self._dedupe_progress: QProgressDialog | None = None
@@ -663,10 +676,10 @@ class MainWindow(QMainWindow):
         self._session_max_page: int = 0           # furthest page reached this session
 
         # Reading-mode state (spread is session-only; webtoon + manga persist per-comic)
-        self._spread_mode: bool = False
+        self._spread_mode: bool = True
         self._webtoon_mode: bool = False
         self._is_manga: bool = False
-        self._webtoon_width_pct: int = 100  # 100 / 80 / 60
+        self._webtoon_width_pct: int = 100  # 100 / 80 / 60 / 50 / 40 / 30
 
         # Page cache + preloader
         self._cache: PageCache = PageCache()
@@ -731,6 +744,7 @@ class MainWindow(QMainWindow):
         self._sidebar.show_hidden_clicked.connect(self._bookshelf.show_hidden)
         self._sidebar.show_shelf_clicked.connect(self._bookshelf.show_shelf)
         self._sidebar.add_folder_clicked.connect(self.add_folder_to_library)
+        self._sidebar.rescan_clicked.connect(self.rescan_all_folders)
         self._sidebar.new_shelf_clicked.connect(self._create_new_shelf)
         self._sidebar.rename_shelf_requested.connect(self._rename_shelf)
         self._sidebar.delete_shelf_requested.connect(self._delete_shelf)
@@ -762,6 +776,7 @@ class MainWindow(QMainWindow):
         self._bookshelf.folder_entered.connect(self._on_folder_level_changed)
         self._bookshelf.shelf_changed.connect(self._sidebar.refresh_shelves)
         self._bookshelf.folder_rescan_requested.connect(self.rescan_folder)
+        self._bookshelf.comics_delete_requested.connect(self._prepare_comics_for_deletion)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
         self._seek_bar.seeked.connect(self.seek_to_page)
@@ -899,9 +914,9 @@ class MainWindow(QMainWindow):
         self._add_files_action.triggered.connect(self.add_files_to_library)
         library_menu.addAction(self._add_files_action)
 
-        rescan_all_action = QAction("&Rescan All Library Folders", self)
-        rescan_all_action.triggered.connect(self.rescan_all_folders)
-        library_menu.addAction(rescan_all_action)
+        self._rescan_all_action = QAction("&Rescan All Library Folders", self)
+        self._rescan_all_action.triggered.connect(self.rescan_all_folders)
+        library_menu.addAction(self._rescan_all_action)
 
         dupes_action = QAction("Scan for &Duplicates…", self)
         dupes_action.triggered.connect(self.scan_for_duplicates)
@@ -956,6 +971,32 @@ class MainWindow(QMainWindow):
 
     def _open_comic_from_bookshelf(self, path: str):
         self.load_file(path)
+
+    def _prepare_comics_for_deletion(self, comic_ids: list[int]) -> None:
+        """Release open file handles before the bookshelf deletes comics from disk."""
+        if self._current_comic_id is None or self._current_comic_id not in comic_ids:
+            return
+        self._record_reading_session()
+        self._session_clock = None
+        self._stop_preloader()
+        self._thumb_strip.stop()
+        if self._reader:
+            self._reader.close()
+            self._reader = None
+        if self._ebook is not None:
+            self._settings.setValue("ebook_font_pt", self._ebook_viewer.font_pt())
+            self._ebook.close()
+            self._ebook = None
+        self._ebook_mode = False
+        self._current_comic_id = None
+        if self._stack.currentIndex() != 0:
+            self._chrome_hidden = False
+            self._hide_reader_bar(animated=False)
+            self._seek_bar.setVisible(False)
+            self._thumb_strip.setVisible(False)
+            self._stack.setCurrentIndex(0)
+            self._sidebar.show()
+            self.setWindowTitle("Comic Reader")
 
     def _back_to_library(self):
         self._record_reading_session()
@@ -1029,7 +1070,7 @@ class MainWindow(QMainWindow):
         if self._webtoon_mode:
             menu.addSeparator()
             width_menu = menu.addMenu("Webtoon width")
-            for pct in (100, 80, 60):
+            for pct in (100, 80, 60, 50, 40, 30):
                 act = width_menu.addAction(f"{pct}%")
                 act.setCheckable(True)
                 act.setChecked(self._webtoon_width_pct == pct)
@@ -1081,6 +1122,7 @@ class MainWindow(QMainWindow):
             self._seek_bar.set_page_count(max(1, (page_count + 1) // 2))
         else:
             self._seek_bar.set_page_count(page_count)
+        self._sync_seek_bar_display()
         self._show_current_page(direction=0)
 
     def _toggle_manga(self) -> None:
@@ -1101,6 +1143,7 @@ class MainWindow(QMainWindow):
             self._spread_mode = False
             self._stop_preloader()
             self._seek_bar.set_page_count(self._reader.page_count())
+            self._sync_seek_bar_display()
             self._webtoon_viewer.set_width_fraction(self._webtoon_width_pct / 100)
             self._webtoon_viewer.load_comic(self._reader, self._current_page)
             self._stack.setCurrentIndex(2)
@@ -1109,6 +1152,12 @@ class MainWindow(QMainWindow):
             self._preloader = PagePreloader(self._reader, self._cache)
             self._preloader.set_center(self._current_page)
             self._preloader.start()
+            self._seek_bar.set_page_count(
+                max(1, (self._reader.page_count() + 1) // 2)
+                if self._spread_mode
+                else self._reader.page_count()
+            )
+            self._sync_seek_bar_display()
             self._stack.setCurrentIndex(1)
             self._show_current_page(direction=0)
 
@@ -1165,6 +1214,14 @@ class MainWindow(QMainWindow):
             if b.page_index > self._current_page:
                 self.seek_to_page(b.page_index)
                 return
+
+    def _sync_seek_bar_display(self) -> None:
+        if not self._reader:
+            return
+        self._seek_bar.set_display_mode(
+            spread=self._spread_mode,
+            total_pages=self._reader.page_count(),
+        )
 
     def _reload_bookmarks(self) -> None:
         if self._current_comic_id is None:
@@ -1341,7 +1398,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Comic Reader — {title}")
         self._reader_bar.set_title(title)
         # Reset session state
-        self._spread_mode = False
         self._thumb_strip.setVisible(False)
         self._thumb_strip_loaded = False
 
@@ -1366,6 +1422,10 @@ class MainWindow(QMainWindow):
             self._webtoon_mode = False
             self._is_manga = False
             self.viewer.restore_view_state(FitMode.FIT_PAGE, 1.0)
+
+        self._spread_mode = not self._webtoon_mode
+        if self._spread_mode:
+            self._current_page = (self._current_page // 2) * 2
 
         self.viewer.set_rtl(self._is_manga)
 
@@ -1392,7 +1452,11 @@ class MainWindow(QMainWindow):
             self._webtoon_viewer.load_comic(self._reader, self._current_page)
             target_index = 2
         else:
-            self._seek_bar.set_page_count(page_count)
+            if self._spread_mode:
+                self._seek_bar.set_page_count(max(1, (page_count + 1) // 2))
+            else:
+                self._seek_bar.set_page_count(page_count)
+            self._sync_seek_bar_display()
             self._show_current_page()
             target_index = 1
 
@@ -1500,6 +1564,7 @@ class MainWindow(QMainWindow):
             self.viewer.set_image(data, direction)
         if page_count > 0:
             self._seek_bar.set_progress((self._current_page + 1) / page_count)
+            self._seek_bar.set_current_index(self._current_page)
         if self._thumb_strip.isVisible():
             self._thumb_strip.set_current(self._current_page)
 
@@ -1520,6 +1585,7 @@ class MainWindow(QMainWindow):
         pair_index = p1 // 2
         if pair_count > 0:
             self._seek_bar.set_progress((pair_index + 1) / pair_count)
+            self._seek_bar.set_current_index(pair_index)
 
     def next_page(self):
         if self._ebook_mode:
@@ -1990,9 +2056,14 @@ class MainWindow(QMainWindow):
         if self._scan_thread and self._scan_thread.isRunning():
             return
 
+        self._scan_generation += 1
+        self._active_scan_generation = self._scan_generation
+
         self._add_folder_action.setEnabled(False)
         self._add_files_action.setEnabled(False)
+        self._rescan_all_action.setEnabled(False)
         self._sidebar.set_add_enabled(False)
+        self._sidebar.set_rescan_enabled(False)
 
         self._scan_thread = QThread(self)
         if paths:
@@ -2019,14 +2090,22 @@ class MainWindow(QMainWindow):
         self._scan_thread.start()
 
     def _on_scan_progress(self, current: int, total: int, filename: str):
-        if self._scan_progress is None:
+        if getattr(self, "_active_scan_generation", 0) != self._scan_generation:
             return
-        if self._scan_progress.maximum() == 0 and total > 0:
-            self._scan_progress.setMaximum(total)
-        self._scan_progress.setValue(current)
-        self._scan_progress.setLabelText(
-            f"Processing {current + 1} of {total}:\n{filename}"
-        )
+        dlg = self._scan_progress
+        if dlg is None:
+            return
+        label = f"Processing {current + 1} of {total}:\n{filename}"
+        try:
+            if dlg.maximum() == 0 and total > 0:
+                dlg.setMaximum(total)
+            dlg.setValue(current)
+            # setValue can process events and finish the scan — re-check the dialog.
+            if self._scan_progress is not dlg:
+                return
+            dlg.setLabelText(label)
+        except RuntimeError:
+            pass
 
     def _on_scan_finished(self, result):
         if self._scan_progress:
@@ -2072,6 +2151,13 @@ class MainWindow(QMainWindow):
         msg.exec()
 
     def _cleanup_scan(self):
+        scanner = self._scanner
+        if scanner is not None:
+            try:
+                scanner.progress.disconnect(self._on_scan_progress)
+                scanner.finished.disconnect(self._on_scan_finished)
+            except (TypeError, RuntimeError):
+                pass
         if self._scan_thread:
             self._scan_thread.quit()
             self._scan_thread.wait()
@@ -2080,7 +2166,9 @@ class MainWindow(QMainWindow):
         self._scan_progress = None
         self._add_folder_action.setEnabled(True)
         self._add_files_action.setEnabled(True)
+        self._rescan_all_action.setEnabled(True)
         self._sidebar.set_add_enabled(True)
+        self._sidebar.set_rescan_enabled(True)
 
     # ----- Duplicate detection -----
 

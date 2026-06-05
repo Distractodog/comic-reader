@@ -4,8 +4,30 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QEasingCurve, QEvent, QPoint, QPropertyAnimation, QRect, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PyQt6.QtCore import (
+    Qt,
+    QEasingCurve,
+    QEvent,
+    QMimeData,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDrag,
+    QFont,
+    QFontMetrics,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -42,6 +64,8 @@ _HOVER_OVERLAY = QColor(100, 30, 30, 22)
 _PROGRESS_TRACK = QColor("#c4aeae")
 _PROGRESS_FILL = QColor("#8b2a2a")
 _PLACEHOLDER_FG = QColor("#b0a0a0")
+_QUEUE_DRAG_MIME = "application/x-comic-reader-queue-id"
+_QUEUE_DRAG_THRESHOLD = 12
 
 
 class _CoverLoader(QThread):
@@ -190,15 +214,27 @@ class FolderTile(_Tile):
 class ComicTile(_Tile):
     shelf_action_requested = pyqtSignal(int, int, int)  # comic_id, global_x, global_y
     select_toggled = pyqtSignal(int)                    # comic_id
+    queue_reorder_drop = pyqtSignal(int, int)           # dragged_id, insert_before_id
 
     def __init__(self, comic: Comic, selected: bool = False, parent=None):
         super().__init__(parent)
         self._comic = comic
         self._selected = selected
         self.cover_path = comic.cover_path
+        self._queue_reorder_enabled = False
+        self._press_pos: QPoint | None = None
+        self._drag_started = False
+        self._drop_highlight = False
 
     def set_selected(self, selected: bool):
         self._selected = selected
+
+    def set_queue_reorder_enabled(self, enabled: bool) -> None:
+        self._queue_reorder_enabled = enabled
+        self.setAcceptDrops(enabled)
+        self.setCursor(
+            Qt.CursorShape.OpenHandCursor if enabled else Qt.CursorShape.PointingHandCursor
+        )
 
     def contextMenuEvent(self, event):
         self.shelf_action_requested.emit(
@@ -210,14 +246,120 @@ class ComicTile(_Tile):
             mods = event.modifiers()
             if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
                 self.select_toggled.emit(self._comic.id)
-            else:
+                return
+            if self._queue_reorder_enabled:
+                self._press_pos = event.position().toPoint()
+                self._drag_started = False
+                return
+            self._on_click()
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._queue_reorder_enabled
+            and self._press_pos is not None
+            and not self._drag_started
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            delta = event.position().toPoint() - self._press_pos
+            if delta.manhattanLength() >= _QUEUE_DRAG_THRESHOLD:
+                self._start_queue_drag()
+                return
+        if not self._queue_reorder_enabled:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._queue_reorder_enabled and event.button() == Qt.MouseButton.LeftButton:
+            if not self._drag_started and not ComicTile._is_deleted(self):
                 self._on_click()
+            self._press_pos = None
+            self._drag_started = False
+            return
+        super().mouseReleaseEvent(event)
+
+    def _start_queue_drag(self) -> None:
+        self._drag_started = True
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(_QUEUE_DRAG_MIME, str(self._comic.id).encode())
+        drag.setMimeData(mime)
+        if self._pixmap and not self._pixmap.isNull():
+            thumb = self._pixmap.scaled(
+                100, 150,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            drag.setPixmap(thumb)
+            drag.setHotSpot(QPoint(thumb.width() // 2, thumb.height() // 2))
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def _queue_dragged_id(self, event) -> int | None:
+        if not event.mimeData().hasFormat(_QUEUE_DRAG_MIME):
+            return None
+        try:
+            return int(bytes(event.mimeData().data(_QUEUE_DRAG_MIME)).decode())
+        except (TypeError, ValueError):
+            return None
+
+    def dragEnterEvent(self, event):
+        dragged_id = self._queue_dragged_id(event)
+        if (
+            self._queue_reorder_enabled
+            and dragged_id is not None
+            and dragged_id != self._comic.id
+        ):
+            event.acceptProposedAction()
+            self._drop_highlight = True
+            if not ComicTile._is_deleted(self):
+                self.update()
+
+    def dragMoveEvent(self, event):
+        dragged_id = self._queue_dragged_id(event)
+        if (
+            self._queue_reorder_enabled
+            and dragged_id is not None
+            and dragged_id != self._comic.id
+        ):
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        if self._drop_highlight:
+            self._drop_highlight = False
+            if not ComicTile._is_deleted(self):
+                self.update()
+
+    @staticmethod
+    def _is_deleted(widget: QWidget) -> bool:
+        try:
+            from PyQt6 import sip
+            return sip.isdeleted(widget)
+        except Exception:
+            return False
+
+    def dropEvent(self, event):
+        dragged_id = self._queue_dragged_id(event)
+        if (
+            self._queue_reorder_enabled
+            and dragged_id is not None
+            and dragged_id != self._comic.id
+        ):
+            self._drop_highlight = False
+            self.queue_reorder_drop.emit(dragged_id, self._comic.id)
+            event.acceptProposedAction()
+            return
+        if not ComicTile._is_deleted(self):
+            self._drop_highlight = False
+            self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self._draw_cover(painter)
         self._draw_progress(painter)
+        if self._drop_highlight:
+            pen = QPen(_PROGRESS_FILL, 3)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(1, 1, TILE_W - 2, TILE_H - 2, 8, 8)
         if self._selected:
             self._draw_selection(painter)
         title = self._comic.title or Path(self._comic.file_path).stem
@@ -415,7 +557,10 @@ class _HeaderBar(QWidget):
         self._in_comic_view = True
         self._title.setText(shelf_name)
         if not self._search_input.isVisible():
-            self._sort_combo.show()
+            if shelf_name == "Reading Queue":
+                self._sort_combo.hide()
+            else:
+                self._sort_combo.show()
 
     def set_search_mode(self):
         self._title.setText("Search Results")
@@ -449,6 +594,7 @@ class BookshelfView(QWidget):
     folder_entered = pyqtSignal(bool)
     shelf_changed = pyqtSignal()            # emitted when shelf membership changes
     folder_rescan_requested = pyqtSignal(str)  # folder_path
+    comics_delete_requested = pyqtSignal(list)  # comic ids — close reader before delete
 
     def __init__(self, library: Library, parent=None):
         super().__init__(parent)
@@ -894,6 +1040,9 @@ class BookshelfView(QWidget):
                 tile.opened.connect(self.comic_opened)
                 tile.select_toggled.connect(self._toggle_selection)
                 tile.shelf_action_requested.connect(self._on_comic_context_menu)
+                if self._queue_mode:
+                    tile.set_queue_reorder_enabled(True)
+                    tile.queue_reorder_drop.connect(self._on_queue_drag_reorder)
                 self._comic_tiles[item.id] = tile
 
             self._ordered_tiles.append(tile)
@@ -938,11 +1087,18 @@ class BookshelfView(QWidget):
 
         menu = QMenu(self)
 
-        # Hidden view — only offer restore
+        # Hidden view — restore or permanently delete
         if self._show_hidden_mode:
             restore_label = f"Restore {n} to library" if is_multi else "Restore to library"
             menu.addAction(restore_label).triggered.connect(
                 lambda: self._restore_comics(target_ids)
+            )
+            menu.addSeparator()
+            delete_label = (
+                f"Delete {n} from disk…" if is_multi else "Delete from disk…"
+            )
+            menu.addAction(delete_label).triggered.connect(
+                lambda: self._delete_comics_from_disk(target_ids)
             )
             menu.exec(QPoint(gx, gy))
             return
@@ -1049,6 +1205,10 @@ class BookshelfView(QWidget):
         menu.addAction(remove_label).triggered.connect(
             lambda: self._remove_comics_from_library(target_ids)
         )
+        delete_label = f"Delete {n} from disk…" if is_multi else "Delete from disk…"
+        menu.addAction(delete_label).triggered.connect(
+            lambda: self._delete_comics_from_disk(target_ids)
+        )
 
         menu.exec(QPoint(gx, gy))
 
@@ -1113,6 +1273,67 @@ class BookshelfView(QWidget):
         else:
             self._library.move_down(comic_id)
         self._nav_transition(self._repopulate)
+
+    def _clear_queue_drop_highlights(self) -> None:
+        for tile in self._comic_tiles.values():
+            if tile._drop_highlight:
+                tile._drop_highlight = False
+                if not ComicTile._is_deleted(tile):
+                    tile.update()
+
+    def _relayout_queue_grid(self) -> None:
+        """Reflow queue tiles to match DB order without destroying the tile widgets."""
+        if not self._queue_mode:
+            return
+        comics = self._library.get_queue()
+        ordered_tiles: list[ComicTile] = []
+        for comic in comics:
+            tile = self._comic_tiles.get(comic.id)
+            if tile is None:
+                self._repopulate()
+                return
+            ordered_tiles.append(tile)
+
+        layout = self._grid_widget.layout()
+        if layout is None:
+            return
+
+        while layout.count():
+            item = layout.takeAt(0)
+            row = item.widget()
+            if row is None:
+                continue
+            row_layout = row.layout()
+            if row_layout is not None:
+                while row_layout.count():
+                    child = row_layout.takeAt(0)
+                    tile_widget = child.widget()
+                    if tile_widget is not None:
+                        tile_widget.setParent(self._grid_widget)
+            row.deleteLater()
+
+        self._ordered_tiles = ordered_tiles
+        n_cols = self._n_cols()
+        row_layout: QHBoxLayout | None = None
+        for i, tile in enumerate(ordered_tiles):
+            if i % n_cols == 0:
+                if row_layout is not None:
+                    row_layout.addStretch()
+                row_widget = QWidget(self._grid_widget)
+                row_layout = QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(0, 0, 0, TILE_SPACING)
+                row_layout.setSpacing(TILE_SPACING)
+                layout.addWidget(row_widget)
+            row_layout.addWidget(tile)
+        if row_layout is not None:
+            row_layout.addStretch()
+        layout.addStretch()
+
+    def _on_queue_drag_reorder(self, dragged_id: int, insert_before_id: int) -> None:
+        self._library.reorder_queue(dragged_id, insert_before_id)
+        self._clear_queue_drop_highlights()
+        # Relayout after Qt finishes the drag — keeps tiles alive, only moves them.
+        QTimer.singleShot(0, self._relayout_queue_grid)
 
     def _remove_comics_from_current_shelf(self, comic_ids: list[int]):
         if self._current_shelf_id is not None:
@@ -1247,6 +1468,59 @@ class BookshelfView(QWidget):
         self._clear_selection()
         self._nav_transition(self._repopulate)
         self.shelf_changed.emit()
+
+    def _delete_comics_from_disk(self, comic_ids: list[int]):
+        comics = [
+            c for cid in comic_ids if (c := self._library.get_comic_by_id(cid)) is not None
+        ]
+        if not comics:
+            return
+
+        n = len(comics)
+        what = "this comic" if n == 1 else f"these {n} comics"
+        if n == 1:
+            detail = f"“{Path(comics[0].file_path).name}”"
+        else:
+            names = "\n".join(f"• {Path(c.file_path).name}" for c in comics[:6])
+            if n > 6:
+                names += f"\n• …and {n - 6} more"
+            detail = names
+
+        reply = QMessageBox.warning(
+            self,
+            "Delete from Disk",
+            f"Permanently delete {what}?\n\n{detail}\n\n"
+            "The file(s) will be removed from your computer. Reading progress, "
+            "bookmarks, notes, and queue entries for these comics will also be "
+            "removed from Comic Reader.\n\n"
+            "This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.comics_delete_requested.emit(comic_ids)
+
+        errors: list[str] = []
+        for cid in comic_ids:
+            err = self._library.delete_comic_from_disk(cid)
+            if err:
+                errors.append(err)
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Delete Failed",
+                "Some files could not be deleted:\n\n" + "\n".join(errors[:8]),
+            )
+
+        self._clear_selection()
+        self._nav_transition(self._repopulate)
+        self.shelf_changed.emit()
+        if not errors:
+            msg = "Deleted 1 comic" if n == 1 else f"Deleted {n} comics"
+            self.window().statusBar().showMessage(msg, 4000)
 
     # ----- Folder context menu (rescan / cover / hide) -----
 

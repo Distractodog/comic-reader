@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -38,6 +39,62 @@ def _configure_rar_tool() -> None:
 
 
 _configure_rar_tool()
+
+
+def _resolve_rar_extractor() -> tuple[str, str]:
+    """Return (executable path, backend id) for reading compressed RAR members."""
+    bundled_dir = Path(getattr(sys, "_MEIPASS", ""))
+    for name in ("unrar.exe", "UnRAR.exe", "unrar"):
+        candidate = bundled_dir / name
+        if candidate.exists():
+            return str(candidate), "unrar"
+
+    for tool, backend in (
+        (rarfile.UNRAR_TOOL, "unrar"),
+        ("unrar", "unrar"),
+        ("unar", "unar"),
+        ("7zz", "7z"),
+        ("7z", "7z"),
+        (rarfile.BSDTAR_TOOL, "bsdtar"),
+        ("bsdtar", "bsdtar"),
+    ):
+        if not tool:
+            continue
+        path = tool if Path(str(tool)).exists() else shutil.which(str(tool))
+        if path:
+            return path, backend
+
+    raise RuntimeError(
+        "CBR/RAR files need an unrar-compatible tool. Install unrar, "
+        "or use CBZ/ZIP files instead."
+    )
+
+
+def _extract_rar_member(
+    tool: str, backend: str, archive: str, member: str
+) -> bytes:
+    """Extract one archive member to memory using the given backend."""
+    if backend == "unrar":
+        cmd = [tool, "p", "-inul", "-p-", archive, member.replace("/", os.sep)]
+    elif backend == "unar":
+        cmd = [tool, "-q", "-o", "-", "-p", "", archive, member]
+    elif backend == "bsdtar":
+        # rarfile's bsdtar command line is broken on macOS (-f ends up bound to "--").
+        cmd = [tool, "-x", "--to-stdout", "-f", archive, member]
+    elif backend == "7z":
+        cmd = [tool, "e", "-so", "-bb0", "-p", archive, member]
+    else:
+        raise RuntimeError(f"Unsupported RAR backend: {backend}")
+
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        if not err:
+            err = f"exit code {proc.returncode}"
+        raise RuntimeError(f"Could not extract page from RAR archive: {err}")
+    if not proc.stdout:
+        raise RuntimeError("Could not extract page from RAR archive: no data returned")
+    return proc.stdout
 
 
 def _natural_sort_key(name: str):
@@ -115,17 +172,17 @@ class CBZReader(_ArchiveReader):
 class CBRReader(_ArchiveReader):
     def __init__(self, file_path: str):
         super().__init__(file_path)
-        tools = [rarfile.UNRAR_TOOL, "unrar", "unar", "bsdtar", "7z", "7zz"]
-        if not any(tool and (Path(str(tool)).exists() or shutil.which(str(tool))) for tool in tools):
-            raise RuntimeError(
-                "CBR/RAR files need an unrar-compatible tool. Install unrar, "
-                "or use CBZ/ZIP files instead."
-            )
+        self._tool, self._backend = _resolve_rar_extractor()
         self._rar = rarfile.RarFile(file_path)
         self.pages = self._filter_and_sort(self._rar.namelist())
 
     def _read_page(self, index: int) -> bytes:
-        return self._rar.read(self.pages[index])
+        return _extract_rar_member(
+            self._tool,
+            self._backend,
+            self.file_path,
+            self.pages[index],
+        )
 
     def _close(self):
         self._rar.close()

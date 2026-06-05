@@ -14,26 +14,30 @@ THUMB_MAX_HEIGHT = 600
 THUMB_QUALITY = 85
 
 
-def thumbnail_cache_dir() -> Path:
+def _thumbnail_cache_base() -> Path:
     base = Path(
         QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.CacheLocation
         )
     )
-    d = base / "thumbnails"
+    return base / "thumbnails"
+
+
+def thumbnail_cache_dir() -> Path:
+    d = _thumbnail_cache_base()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def thumbnail_path_for(comic_id: int) -> Path:
-    return thumbnail_cache_dir() / f"{comic_id}.jpg"
+    return _thumbnail_cache_base() / f"{comic_id}.jpg"
 
 
 def folder_cover_path_for(folder_path: str) -> Path:
     """Stable cache path for a custom folder cover, keyed by the folder's path."""
     import hashlib
     h = hashlib.md5(folder_path.encode("utf-8")).hexdigest()[:16]
-    return thumbnail_cache_dir() / f"folder_{h}.jpg"
+    return _thumbnail_cache_base() / f"folder_{h}.jpg"
 
 
 def comic_cover_override_path_for(comic_id: int) -> Path:
@@ -42,7 +46,7 @@ def comic_cover_override_path_for(comic_id: int) -> Path:
     Kept distinct from the auto thumbnail (``{id}.jpg``) so resetting to the
     default cover doesn't have to clobber the override file.
     """
-    return thumbnail_cache_dir() / f"cover_override_{comic_id}.jpg"
+    return _thumbnail_cache_base() / f"cover_override_{comic_id}.jpg"
 
 
 def generate_thumbnail_from_bytes(page_bytes: bytes, output_path: Path) -> bool:

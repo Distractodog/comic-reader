@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -552,6 +553,38 @@ class Library:
                 pass
         with self.transaction() as cur:
             cur.execute("DELETE FROM comics WHERE id = ?", (comic_id,))
+
+    def delete_comic_from_disk(self, comic_id: int) -> str | None:
+        """Delete the comic file from disk and remove its library row.
+
+        Returns None on success, or a short error message if the file could
+        not be deleted. Missing files are treated as already gone and the
+        library row is still removed.
+        """
+        comic = self.get_comic_by_id(comic_id)
+        if comic is None:
+            return "Comic not found in library."
+
+        path = Path(comic.file_path)
+        if path.exists():
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except OSError as exc:
+                return f"Could not delete “{path.name}”: {exc}"
+
+        from thumbnails import comic_cover_override_path_for, thumbnail_path_for
+
+        for thumb in (thumbnail_path_for(comic_id), comic_cover_override_path_for(comic_id)):
+            try:
+                thumb.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        self.remove_comic(comic_id)
+        return None
 
     def update_file_path(self, comic_id: int, new_path: str) -> None:
         """Move a library row to a new on-disk path after a safe batch operation."""
@@ -1222,6 +1255,25 @@ class Library:
     def move_down(self, comic_id: int) -> None:
         """Swap this comic with the one below it in the queue."""
         self._swap_with_neighbor(comic_id, +1)
+
+    def reorder_queue(self, comic_id: int, insert_before_comic_id: int) -> None:
+        """Move a queued comic so it sits immediately before another queued comic."""
+        rows = self._conn.execute(
+            "SELECT comic_id FROM reading_queue ORDER BY position"
+        ).fetchall()
+        order = [r["comic_id"] for r in rows]
+        if comic_id not in order or insert_before_comic_id not in order:
+            return
+        if comic_id == insert_before_comic_id:
+            return
+        order.remove(comic_id)
+        order.insert(order.index(insert_before_comic_id), comic_id)
+        with self.transaction() as cur:
+            for pos, cid in enumerate(order):
+                cur.execute(
+                    "UPDATE reading_queue SET position = ? WHERE comic_id = ?",
+                    (pos, cid),
+                )
 
     def _swap_with_neighbor(self, comic_id: int, direction: int) -> None:
         rows = self._conn.execute(
@@ -2019,8 +2071,10 @@ if __name__ == "__main__":
     assert [c.id for c in lib.get_queue()] == [q3, q1, q2]
     lib.move_up(q3)                                           # already top — no change
     assert [c.id for c in lib.get_queue()] == [q3, q1, q2]
+    lib.reorder_queue(q2, q3)                                 # drag q2 before q3 → q2, q3, q1
+    assert [c.id for c in lib.get_queue()] == [q2, q3, q1]
     lib.remove_from_queue(q1)                                 # positions stay contiguous
-    assert [c.id for c in lib.get_queue()] == [q3, q2]
+    assert [c.id for c in lib.get_queue()] == [q2, q3]
     assert lib.is_in_queue(q1) is False
     qpos = lib._conn.execute(
         "SELECT position FROM reading_queue ORDER BY position"
@@ -2032,6 +2086,16 @@ if __name__ == "__main__":
 
     lib.delete_annotation(note_id)
     assert lib.get_annotation_for_page(id1, 4) is None
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        comic_file = Path(tmp) / "delete-me.cbz"
+        comic_file.write_bytes(b"fake")
+        del_id = lib.add_comic(str(comic_file), page_count=1, file_size=4)
+        assert comic_file.exists()
+        assert lib.delete_comic_from_disk(del_id) is None
+        assert not comic_file.exists()
+        assert lib.get_comic_by_id(del_id) is None
 
     lib.close()
     print("library.py smoke test: OK")

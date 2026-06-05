@@ -9,6 +9,7 @@ from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QToolTip, QWidget
 
 CLICK_ZONE_FRACTION = 0.30  # left/right 30% = nav zones, middle 40% = dead zone
+_SLIDE_DURATION_MS = 120
 
 
 class FitMode(Enum):
@@ -102,12 +103,12 @@ class ComicViewer(QGraphicsView):
         self._overlay_new.hide()
 
         self._slide_anim = QPropertyAnimation(self._overlay, b"geometry", self)
-        self._slide_anim.setDuration(200)
-        self._slide_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._slide_anim.setDuration(_SLIDE_DURATION_MS)
+        self._slide_anim.setEasingCurve(QEasingCurve.Type.OutQuad)
 
         self._slide_anim_new = QPropertyAnimation(self._overlay_new, b"geometry", self)
-        self._slide_anim_new.setDuration(200)
-        self._slide_anim_new.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._slide_anim_new.setDuration(_SLIDE_DURATION_MS)
+        self._slide_anim_new.setEasingCurve(QEasingCurve.Type.OutQuad)
 
         self._anim_group = QParallelAnimationGroup(self)
         self._anim_group.addAnimation(self._slide_anim)
@@ -123,6 +124,20 @@ class ComicViewer(QGraphicsView):
         pixmap.loadFromData(image_bytes)
         self.set_image_pixmap(pixmap, direction)
 
+    def _slide_pixmap(self, scene_pixmap: QPixmap) -> QPixmap:
+        """Build a viewport-sized slide frame without an expensive widget grab."""
+        vp = self.viewport().size()
+        frame = QPixmap(vp)
+        frame.fill(Qt.GlobalColor.black)
+        if scene_pixmap.isNull():
+            return frame
+        painter = QPainter(frame)
+        x = (vp.width() - scene_pixmap.width()) // 2
+        y = (vp.height() - scene_pixmap.height()) // 2
+        painter.drawPixmap(x, y, scene_pixmap)
+        painter.end()
+        return frame
+
     def set_image_pixmap(self, pixmap: QPixmap, direction: int = 0):
         """Load a pre-built pixmap (e.g. from the page cache or spread composer)."""
         self._anim_group.stop()
@@ -130,7 +145,9 @@ class ComicViewer(QGraphicsView):
         self._overlay_new.hide()
 
         should_animate = direction != 0 and self._has_image
-        old_grab = self.viewport().grab() if should_animate else None
+        old_slide = (
+            self._slide_pixmap(self._pixmap_item.pixmap()) if should_animate else None
+        )
 
         self._source_pixmap = pixmap
         self._display_key = None
@@ -139,9 +156,8 @@ class ComicViewer(QGraphicsView):
         self._apply_display_pixmap()
         self._apply_fit()
 
-        if old_grab is not None:
-            new_grab = self.viewport().grab()
-            self._run_slide(old_grab, new_grab, direction)
+        if old_slide is not None:
+            self._run_slide(old_slide, self._slide_pixmap(self._pixmap_item.pixmap()), direction)
 
     def _apply_display_pixmap(self):
         """Put a viewport-sized pixmap in the scene for fit modes (cheap to paint),
@@ -353,6 +369,9 @@ class SeekBar(QWidget):
         self._ratio: float = 0.0
         self._drag_ratio: float | None = None
         self._page_count: int = 0
+        self._total_pages: int = 0
+        self._spread_mode: bool = False
+        self._current_index: int = 0
         self._hover: bool = False
         self._bookmarks: list[tuple[int, str | None]] = []  # (page_index, label)
         self._notes: list[tuple[int, str]] = []              # (page_index, body)
@@ -360,6 +379,15 @@ class SeekBar(QWidget):
     def set_page_count(self, n: int):
         self._page_count = n
         self.update()
+
+    def set_display_mode(self, *, spread: bool = False, total_pages: int = 0) -> None:
+        """How to label pages in hover tooltips (spread uses two-page spreads)."""
+        self._spread_mode = spread
+        self._total_pages = total_pages
+
+    def set_current_index(self, index: int) -> None:
+        """Current page (or spread-pair index) for the handle hover tooltip."""
+        self._current_index = max(0, index)
 
     def set_progress(self, ratio: float):
         self._ratio = max(0.0, min(1.0, ratio))
@@ -382,6 +410,30 @@ class SeekBar(QWidget):
         if self._page_count <= 0:
             return 0
         return min(self._page_count - 1, int(ratio * self._page_count))
+
+    def _handle_x(self) -> float:
+        w = self.width()
+        ratio = self._drag_ratio if self._drag_ratio is not None else self._ratio
+        return max(self._HANDLE_D / 2, min(w - self._HANDLE_D / 2, w * ratio))
+
+    def _near_handle(self, x: float) -> bool:
+        return abs(x - self._handle_x()) <= self._HANDLE_D / 2 + 2
+
+    def _format_page_tooltip(self, seek_index: int) -> str:
+        if self._spread_mode and self._total_pages > 0:
+            p1 = seek_index * 2
+            p2 = min(p1 + 1, self._total_pages - 1)
+            if p1 == p2:
+                return f"Page {p1 + 1}"
+            return f"Pages {p1 + 1}–{p2 + 1}"
+        return f"Page {seek_index + 1}"
+
+    def _show_page_tooltip(self, event, seek_index: int) -> None:
+        QToolTip.showText(
+            event.globalPosition().toPoint(),
+            self._format_page_tooltip(seek_index),
+            self,
+        )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -416,6 +468,17 @@ class SeekBar(QWidget):
                     text = label if label else f"Page {page_idx + 1}"
                     QToolTip.showText(event.globalPosition().toPoint(), text, self)
                     return
+
+        if self._page_count > 0:
+            mx = event.position().x()
+            if self._near_handle(mx):
+                if self._drag_ratio is not None:
+                    seek_index = self._page_from_ratio(self._drag_ratio)
+                else:
+                    seek_index = self._current_index
+                self._show_page_tooltip(event, seek_index)
+                return
+
         QToolTip.hideText()
 
     def mouseReleaseEvent(self, event):
@@ -430,6 +493,7 @@ class SeekBar(QWidget):
 
     def leaveEvent(self, event):
         self._hover = False
+        QToolTip.hideText()
         self.update()
 
     def paintEvent(self, event):
