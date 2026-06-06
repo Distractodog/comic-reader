@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from app_info import APP_DISPLAY_NAME
 
 from PyQt6.QtCore import (
     QEasingCurve,
+    QEvent,
     QParallelAnimationGroup,
     QPoint,
     QPropertyAnimation,
@@ -299,10 +301,18 @@ class _Sidebar(QWidget):
     export_shelf_requested = pyqtSignal(int, str)   # shelf_id, shelf_name
     back_to_root_clicked = pyqtSignal()
     hidden_nav_changed = pyqtSignal(object)  # set[int]
+    app_menu_requested = pyqtSignal()
 
     WIDTH = 180
 
-    def __init__(self, library: Library, hidden_nav_ids: set[int] | None = None, parent=None):
+    def __init__(
+        self,
+        library: Library,
+        hidden_nav_ids: set[int] | None = None,
+        *,
+        show_app_menu: bool = False,
+        parent=None,
+    ):
         super().__init__(parent)
         self._library = library
         self._active_id: int = -1   # -1 = Folders, -2 = Hidden, -3 = Queue, int = shelf id
@@ -326,6 +336,15 @@ class _Sidebar(QWidget):
         top_layout = QHBoxLayout(top_row)
         top_layout.setContentsMargins(4, 0, 4, 0)
         top_layout.setSpacing(0)
+
+        self._btn_menu: QPushButton | None = None
+        if show_app_menu:
+            self._btn_menu = QPushButton("☰")
+            self._btn_menu.setFixedSize(44, 56)
+            self._btn_menu.setFlat(True)
+            self._btn_menu.setToolTip("App menu")
+            self._btn_menu.clicked.connect(self.app_menu_requested.emit)
+            top_layout.addWidget(self._btn_menu)
 
         self._btn_back = QPushButton("←")
         self._btn_back.setFixedSize(44, 56)
@@ -497,6 +516,8 @@ class _Sidebar(QWidget):
             f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
         )
         self._btn_back.setStyleSheet(btn_css)
+        if self._btn_menu is not None:
+            self._btn_menu.setStyleSheet(btn_css)
         self._btn_rescan.setStyleSheet(btn_css)
         self._btn_add.setStyleSheet(add_css)
         new_shelf_css = (
@@ -729,6 +750,7 @@ class MainWindow(QMainWindow):
         self._reader_bar_target_visible = False
         self._chrome_hidden = False
         self._thumb_strip_before_chrome = False
+        self._window_fullscreen = False
 
         content = QWidget()
         self._content = content
@@ -740,7 +762,12 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._thumb_strip)
         content_layout.addWidget(self._seek_bar)
 
-        self._sidebar = _Sidebar(self._library, hidden_nav_ids=self._sidebar_hidden_nav_ids)
+        self._sidebar = _Sidebar(
+            self._library,
+            hidden_nav_ids=self._sidebar_hidden_nav_ids,
+            show_app_menu=sys.platform != "darwin",
+        )
+        self._sidebar.app_menu_requested.connect(self._show_app_menu)
         self._sidebar.show_folders_clicked.connect(self._bookshelf.go_to_root)
         self._sidebar.show_queue_clicked.connect(self._bookshelf.show_queue)
         self._sidebar.show_hidden_clicked.connect(self._bookshelf.show_hidden)
@@ -790,6 +817,9 @@ class MainWindow(QMainWindow):
         self._ebook_viewer.end_reached.connect(self._prompt_continue_after_book)
 
         self._build_menus()
+        if sys.platform != "darwin":
+            self.menuBar().setVisible(False)
+            self.statusBar().setVisible(False)
 
         self.setAcceptDrops(True)
         self._restore_window_state()
@@ -855,10 +885,14 @@ class MainWindow(QMainWindow):
         view_menu.addAction(zoom_out)
 
         view_menu.addSeparator()
-        fullscreen = QAction("Hide &Reader Bars", self)
+        fullscreen = QAction("&Fullscreen", self)
         fullscreen.setShortcuts(_shortcuts("fullscreen"))
-        fullscreen.triggered.connect(self._toggle_reading_chrome)
+        fullscreen.triggered.connect(self._toggle_window_fullscreen)
         view_menu.addAction(fullscreen)
+
+        hide_chrome = QAction("Hide &Reader Bars", self)
+        hide_chrome.triggered.connect(self._toggle_reading_chrome)
+        view_menu.addAction(hide_chrome)
 
         view_menu.addSeparator()
         shortcuts_action = QAction("Customize Shortcuts…", self)
@@ -949,6 +983,11 @@ class MainWindow(QMainWindow):
         back_action.triggered.connect(self._on_escape)
         library_menu.addAction(back_action)
 
+        self._file_menu = file_menu
+        self._view_menu = view_menu
+        self._nav_menu = nav_menu
+        self._library_menu = library_menu
+
         # Thumbnail strip shortcut (no menu entry needed — handled via ⋮)
         thumb_action = QAction(self)
         thumb_action.setShortcuts(_shortcuts("thumbnail_strip"))
@@ -1001,6 +1040,8 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(APP_DISPLAY_NAME)
 
     def _back_to_library(self):
+        if self.isFullScreen():
+            self._exit_window_fullscreen()
         self._record_reading_session()
         self._session_clock = None
         self._stop_preloader()
@@ -1297,6 +1338,9 @@ class MainWindow(QMainWindow):
             self._build_menus()
 
     def _on_escape(self):
+        if self.isFullScreen():
+            self._exit_window_fullscreen()
+            return
         if self._is_reading_view():
             if self._chrome_hidden:
                 self._show_reading_chrome()
@@ -1826,6 +1870,35 @@ class MainWindow(QMainWindow):
         self._chrome_hidden = not self._chrome_hidden
         self._apply_reading_chrome()
 
+    def _show_app_menu(self) -> None:
+        """Popup File/View/Navigate/Library menus — used on Windows/Linux."""
+        menu = QMenu(self)
+        menu.addMenu(self._file_menu)
+        menu.addMenu(self._view_menu)
+        menu.addMenu(self._nav_menu)
+        menu.addMenu(self._library_menu)
+        menu.exec(self._sidebar.mapToGlobal(QPoint(0, 56)))
+
+    def _exit_window_fullscreen(self) -> None:
+        if not self.isFullScreen():
+            return
+        self.showNormal()
+        self._window_fullscreen = False
+        if self._is_reading_view():
+            self._chrome_hidden = False
+            self._apply_reading_chrome()
+
+    def _toggle_window_fullscreen(self) -> None:
+        """F11: true OS fullscreen — hides the Windows taskbar and title bar."""
+        if self.isFullScreen():
+            self._exit_window_fullscreen()
+            return
+        if self._is_reading_view():
+            self._chrome_hidden = True
+            self._apply_reading_chrome()
+        self.showFullScreen()
+        self._window_fullscreen = True
+
     def _show_reading_chrome(self) -> None:
         if not self._chrome_hidden:
             return
@@ -1877,6 +1950,13 @@ class MainWindow(QMainWindow):
         geom = self._settings.value("geometry")
         if geom:
             self.restoreGeometry(geom)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._window_fullscreen = self.isFullScreen()
+            if sys.platform == "darwin":
+                self.menuBar().setVisible(not self._window_fullscreen)
 
     # ----- Drag and drop -----
 

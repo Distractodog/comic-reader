@@ -38,6 +38,7 @@ def main():
         QFontDatabase.addApplicationFont(str(ttf))
 
     font = QFont("Libre Baskerville", 11)
+    font.setFamilies(["Libre Baskerville", "Georgia", "Times New Roman", "serif"])
     app.setFont(font)
     app.setStyleSheet(app_stylesheet(DARK))
 
