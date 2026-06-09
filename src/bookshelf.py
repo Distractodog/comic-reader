@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
 )
 
 from batch_tools import BatchPlan, BatchWorker, plan_convert_to_cbz, plan_rename_from_metadata
-from library import Comic, Folder, Library, Series, SeriesHub, Shelf
+from library import Comic, Folder, Library, Shelf
 
 TILE_W = 200
 COVER_H = 300
@@ -410,54 +410,6 @@ class ComicTile(_Tile):
         self.opened.emit(self._comic.file_path)
 
 
-class SeriesTile(_Tile):
-    opened = pyqtSignal(str, str)  # folder_path, series_name
-
-    def __init__(self, series: Series, parent=None):
-        super().__init__(series.name, parent)
-        self._series = series
-        self.cover_path = series.cover_path
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        self._draw_cover(painter)
-        self._draw_title(painter, self._series.name)
-        n = self._series.comic_count
-        self._draw_status(painter, f"{n} issue{'s' if n != 1 else ''}")
-
-    def _on_click(self):
-        self.opened.emit(self._series.folder_path, self._series.name)
-
-
-class SeriesHubTile(_Tile):
-    opened = pyqtSignal()
-
-    def __init__(self, hub: SeriesHub, parent=None):
-        super().__init__("Series", parent)
-        self._hub = hub
-        self.cover_path = hub.cover_path
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        self._draw_cover(painter)
-        self._draw_title(painter, "Series")
-        n_series = self._hub.series_count
-        n_issues = self._hub.issue_count
-        if n_series == 1:
-            status = f"{n_issues} issue{'s' if n_issues != 1 else ''}"
-        else:
-            status = (
-                f"{n_series} series · {n_issues} issue"
-                f"{'s' if n_issues != 1 else ''}"
-            )
-        self._draw_status(painter, status)
-
-    def _on_click(self):
-        self.opened.emit()
-
-
 class _HeaderBar(QWidget):
     back_clicked = pyqtSignal()
     search_changed = pyqtSignal(str)
@@ -620,9 +572,6 @@ class BookshelfView(QWidget):
         super().__init__(parent)
         self._library = library
         self._current_folder: str | None = None
-        self._in_series_hub: bool = False
-        self._current_series: str | None = None
-        self._folder_needs_series_hub: bool = False
         self._current_shelf_id: int | None = None
         self._current_shelf_name: str = ""
         self._show_hidden_mode: bool = False
@@ -705,12 +654,6 @@ class BookshelfView(QWidget):
         self._repopulate()
 
     def _on_back_clicked(self):
-        if self._current_series is not None:
-            self._show_series_hub()
-            return
-        if self._in_series_hub and self._current_folder is not None:
-            self._show_comics(self._current_folder)
-            return
         if self._current_shelf_id is not None and self._current_folder is not None:
             self._show_shelf_folders()
             return
@@ -823,9 +766,6 @@ class BookshelfView(QWidget):
     def _show_folders(self):
         def do():
             self._current_folder = None
-            self._in_series_hub = False
-            self._current_series = None
-            self._folder_needs_series_hub = False
             self._current_shelf_id = None
             self._current_shelf_name = ""
             self._selected_ids.clear()
@@ -841,8 +781,6 @@ class BookshelfView(QWidget):
     def _show_comics(self, folder_path: str):
         def do():
             self._current_folder = folder_path
-            self._in_series_hub = False
-            self._current_series = None
             self._current_shelf_id = None
             self._current_shelf_name = ""
             self._show_hidden_mode = False
@@ -851,34 +789,6 @@ class BookshelfView(QWidget):
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
             self._restore_folder_sort(folder_path)
-            self._last_n_cols = 0
-            self._repopulate()
-            self.folder_entered.emit(True)
-        self._nav_transition(do)
-
-    def _show_series_hub(self):
-        if not self._current_folder:
-            return
-
-        def do():
-            self._in_series_hub = True
-            self._current_series = None
-            self._selected_ids.clear()
-            self._comic_tiles.clear()
-            self._header.set_comic_mode("Series")
-            self._last_n_cols = 0
-            self._repopulate()
-            self.folder_entered.emit(True)
-        self._nav_transition(do)
-
-    def _show_series(self, folder_path: str, series_name: str):
-        def do():
-            self._current_folder = folder_path
-            self._in_series_hub = True
-            self._current_series = series_name
-            self._selected_ids.clear()
-            self._comic_tiles.clear()
-            self._header.set_comic_mode(series_name)
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(True)
@@ -917,8 +827,6 @@ class BookshelfView(QWidget):
         """Drill into a specific folder's comics within the current shelf."""
         def do():
             self._current_folder = folder_path
-            self._in_series_hub = False
-            self._current_series = None
             self._show_hidden_mode = False
             self._queue_mode = False
             self._selected_ids.clear()
@@ -979,7 +887,11 @@ class BookshelfView(QWidget):
         return max(1, (w + TILE_SPACING) // (TILE_W + TILE_SPACING))
 
     def _folder_grid_items(self) -> tuple[list, str]:
-        """Build the tile list for the current folder view (series hub / flat / issues)."""
+        """Build the flat tile list for the current folder view.
+
+        Series issues and loose comics are shown together as individual tiles;
+        a 'chapter' sort keeps each detected series contiguous and in issue order.
+        """
         folder_path = self._current_folder
         assert folder_path is not None
 
@@ -992,27 +904,6 @@ class BookshelfView(QWidget):
             comics = self._library.get_comics_in_folder(
                 folder_path, sort_by=self._sort_by, order=self._sort_order
             )
-
-        if self._current_series:
-            if self._sort_by == "chapter":
-                items = self._library.get_comics_in_series(folder_path, self._current_series)
-                if self._sort_order == "desc":
-                    items = list(reversed(items))
-            else:
-                items = [c for c in comics if c.series == self._current_series]
-            return items, "No issues in this series."
-
-        layout = self._library.analyze_folder_series_layout(comics)
-        self._folder_needs_series_hub = layout.needs_hub
-
-        if self._in_series_hub:
-            series_tiles, _ = self._library.group_series_from_comics(folder_path, comics)
-            return series_tiles, "No series in this folder."
-
-        if layout.needs_hub:
-            _, loose = self._library.group_series_from_comics(folder_path, comics)
-            hub = self._library.build_series_hub(folder_path, comics)
-            return [hub] + loose, "No comics found in this folder."
 
         return comics, "No comics found in this folder."
 
@@ -1107,13 +998,7 @@ class BookshelfView(QWidget):
                 row_layout.setSpacing(TILE_SPACING)
                 layout.addWidget(row_widget)
 
-            if isinstance(item, SeriesHub):
-                tile = SeriesHubTile(item)
-                tile.opened.connect(self._show_series_hub)
-            elif isinstance(item, Series):
-                tile = SeriesTile(item)
-                tile.opened.connect(self._show_series)
-            elif isinstance(item, Folder):
+            if isinstance(item, Folder):
                 tile = FolderTile(item)
                 if self._search_query:
                     tile.opened.connect(self._open_folder_from_search)

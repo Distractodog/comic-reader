@@ -31,32 +31,6 @@ class Shelf:
 
 
 @dataclass
-class Series:
-    name: str
-    comic_count: int
-    cover_path: str | None
-    folder_path: str
-
-
-@dataclass
-class SeriesHub:
-    """Single folder-level tile grouping multiple series (and loose comics at top level)."""
-    folder_path: str
-    series_count: int
-    issue_count: int
-    cover_path: str | None
-
-
-@dataclass
-class FolderSeriesLayout:
-    """How a folder's comics should be shown in the bookshelf grid."""
-    needs_hub: bool
-    loose_comics: list[Comic]
-    series_tiles: list[Series]
-    flat_comics: list[Comic]
-
-
-@dataclass
 class Bookmark:
     id: int
     comic_id: int
@@ -1062,100 +1036,6 @@ class Library:
                     self.update_metadata(comic.id, **fields)
                     linked += 1
         return linked
-
-    @staticmethod
-    def _multi_issue_series_groups(comics: list[Comic]) -> dict[str, list[Comic]]:
-        groups: dict[str, list[Comic]] = {}
-        for comic in comics:
-            if comic.series:
-                groups.setdefault(comic.series, []).append(comic)
-        return {name: group for name, group in groups.items() if len(group) >= 2}
-
-    def analyze_folder_series_layout(
-        self, comics: list[Comic], folder_path: str = ""
-    ) -> FolderSeriesLayout:
-        """Decide hub vs flat display for a folder's comics."""
-        multi = self._multi_issue_series_groups(comics)
-        multi_ids = {c.id for group in multi.values() for c in group}
-        loose = [c for c in comics if c.id not in multi_ids]
-
-        if not multi:
-            return FolderSeriesLayout(
-                needs_hub=False,
-                loose_comics=[],
-                series_tiles=[],
-                flat_comics=comics,
-            )
-
-        series_tiles = self._series_tiles_from_groups(folder_path, multi)
-        needs_hub = len(multi) > 1 or bool(loose)
-
-        if needs_hub:
-            return FolderSeriesLayout(
-                needs_hub=True,
-                loose_comics=loose,
-                series_tiles=series_tiles,
-                flat_comics=[],
-            )
-
-        only_name = next(iter(multi))
-        return FolderSeriesLayout(
-            needs_hub=False,
-            loose_comics=[],
-            series_tiles=[],
-            flat_comics=sorted(multi[only_name], key=_comic_series_sort_key),
-        )
-
-    def build_series_hub(self, folder_path: str, comics: list[Comic]) -> SeriesHub:
-        multi = self._multi_issue_series_groups(comics)
-        cover = None
-        for group in sorted(multi.values(), key=lambda g: (g[0].series or "").lower()):
-            cover = next((c.cover_path for c in sorted(group, key=_comic_series_sort_key) if c.cover_path), None)
-            if cover:
-                break
-        return SeriesHub(
-            folder_path=folder_path,
-            series_count=len(multi),
-            issue_count=sum(len(g) for g in multi.values()),
-            cover_path=cover,
-        )
-
-    def _series_tiles_from_groups(
-        self, folder_path: str, groups: dict[str, list[Comic]]
-    ) -> list[Series]:
-        series_list: list[Series] = []
-        for name, group in groups.items():
-            sorted_group = sorted(group, key=_comic_series_sort_key)
-            cover = next((c.cover_path for c in sorted_group if c.cover_path), None)
-            series_list.append(
-                Series(
-                    name=name,
-                    comic_count=len(group),
-                    cover_path=cover,
-                    folder_path=folder_path,
-                )
-            )
-        series_list.sort(key=lambda s: s.name.lower())
-        return series_list
-
-    def group_series_from_comics(
-        self, folder_path: str, comics: list[Comic]
-    ) -> tuple[list[Series], list[Comic]]:
-        """Split comics into series tiles vs individual tiles (hub interior or loose)."""
-        layout = self.analyze_folder_series_layout(comics)
-        if layout.needs_hub:
-            tiles = self._series_tiles_from_groups(
-                folder_path, self._multi_issue_series_groups(comics)
-            )
-            return tiles, layout.loose_comics
-        shown = layout.flat_comics if layout.flat_comics else comics
-        return [], shown
-
-    def get_series_in_folder(self, folder_path: str) -> list[Series]:
-        """Return series that have 2+ comics in the folder, sorted by name."""
-        comics = self.get_comics_in_folder(folder_path)
-        series_list, _ = self.group_series_from_comics(folder_path, comics)
-        return series_list
 
     def get_comics_in_series(self, folder_path: str, series_name: str) -> list[Comic]:
         """Return comics for a specific series within a folder, sorted by issue number."""
@@ -2403,10 +2283,10 @@ if __name__ == "__main__":
                          if c.series == "Saga"]
     assert saga_chapter_sort == [u3, u2, u1]
 
+    # Folder listing is flat — series issues and any loose comics come back together.
     folder_comics = lib.get_comics_in_folder(folder)
-    layout = lib.analyze_folder_series_layout(folder_comics)
-    assert layout.needs_hub
-    assert len(layout.series_tiles) >= 2
+    assert u1 in {c.id for c in folder_comics}
+    # Series membership (set in the DB) drives end-of-issue auto-advance, no hub needed.
     assert lib.get_next_in_series(u3).id == u2
 
     solo = "/comics/solo"
@@ -2418,10 +2298,19 @@ if __name__ == "__main__":
         f"{solo}/Only 02.cbz", page_count=1, file_size=100,
         title="Only Two", series="Only",
     )
-    solo_layout = lib.analyze_folder_series_layout(lib.get_comics_in_folder(solo))
-    assert not solo_layout.needs_hub
-    assert len(solo_layout.flat_comics) == 2
+    assert len(lib.get_comics_in_folder(solo)) == 2
     assert lib.get_next_in_series(s1).id == s2
+
+    # Detection links 2+ same-name issues; a lone stray stays out of any chain.
+    scan_dir = "/comics/scan"
+    sc1 = lib.add_comic(f"{scan_dir}/Bleach 001.cbz", page_count=1, file_size=100)
+    sc2 = lib.add_comic(f"{scan_dir}/Bleach 002.cbz", page_count=1, file_size=100)
+    stray = lib.add_comic(f"{scan_dir}/Notes.cbz", page_count=1, file_size=100)
+    lib.scan_series_in_folder(scan_dir)
+    assert lib.get_comic_by_id(sc1).series == "Bleach"
+    assert lib.get_next_in_series(sc1).id == sc2
+    assert lib.get_comic_by_id(stray).series is None
+    assert lib.get_next_in_series(stray) is None
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
