@@ -278,7 +278,7 @@ from duplicates_dialog import DuplicatesDialog
 from ebook_viewer import EbookViewer
 from epub_book import EpubBook, is_text_epub
 from keybindings import ACTIONS, KeybindingDialog, KeybindingManager
-from library import Library, Shelf
+from library import Library, ReadingSettings, Shelf
 from library_scanner import SCANNABLE_EXTENSIONS, LibraryScanner
 from preloader import PageCache, PagePreloader
 from stats_dialog import StatsDialog
@@ -1124,6 +1124,10 @@ class MainWindow(QMainWindow):
         webtoon_act.setChecked(self._webtoon_mode)
         webtoon_act.triggered.connect(self._toggle_webtoon)
 
+        # Spread/webtoon/fit/zoom already auto-save to this comic's series.
+        apply_folder_act = menu.addAction("Use these settings for the whole folder")
+        apply_folder_act.triggered.connect(self._apply_reading_settings_to_folder)
+
         menu.addSeparator()
 
         is_bm = self._current_page_is_bookmarked()
@@ -1204,6 +1208,7 @@ class MainWindow(QMainWindow):
             self._seek_bar.set_page_count(page_count)
         self._sync_seek_bar_display()
         self._show_current_page(direction=0)
+        self._persist_reading_settings()
 
     def _toggle_manga(self) -> None:
         self._is_manga = not self._is_manga
@@ -1215,10 +1220,6 @@ class MainWindow(QMainWindow):
         if not self._reader:
             return
         self._webtoon_mode = not self._webtoon_mode
-        if self._current_comic_id is not None:
-            self._library.set_reading_mode(
-                self._current_comic_id, "webtoon" if self._webtoon_mode else "single"
-            )
         if self._webtoon_mode:
             self._spread_mode = False
             self._stop_preloader()
@@ -1240,6 +1241,7 @@ class MainWindow(QMainWindow):
             self._sync_seek_bar_display()
             self._stack.setCurrentIndex(1)
             self._show_current_page(direction=0)
+        self._persist_reading_settings()
 
     def _set_webtoon_width(self, pct: int) -> None:
         self._webtoon_width_pct = pct
@@ -1484,7 +1486,7 @@ class MainWindow(QMainWindow):
         self._thumb_strip.setVisible(False)
         self._thumb_strip_loaded = False
 
-        # Resume to saved page; apply per-comic settings from library
+        # Resume to saved page; apply reading settings resolved series→folder→comic
         comic = self._library.get_comic(path)
         _fit_mode_map = {
             "actual": FitMode.ACTUAL_SIZE,
@@ -1494,19 +1496,21 @@ class MainWindow(QMainWindow):
         if comic is not None:
             self._current_comic_id = comic.id
             self._current_page = comic.current_page if 0 < comic.current_page < self._reader.page_count() else 0
-            self._webtoon_mode = comic.reading_mode == "webtoon"
-            self._is_manga = comic.is_manga
+            rs = self._library.resolve_reading_settings(comic)
+            self._webtoon_mode = rs.reading_mode == "webtoon"
+            self._spread_mode = bool(rs.spread) and not self._webtoon_mode
+            self._is_manga = comic.is_manga  # reading direction stays per-comic
             self.viewer.restore_view_state(
-                _fit_mode_map.get(comic.fit_mode, FitMode.FIT_PAGE), comic.zoom
+                _fit_mode_map.get(rs.fit_mode, FitMode.FIT_PAGE), rs.zoom
             )
         else:
             self._current_comic_id = None
             self._current_page = 0
             self._webtoon_mode = False
+            self._spread_mode = True
             self._is_manga = False
             self.viewer.restore_view_state(FitMode.FIT_PAGE, 1.0)
 
-        self._spread_mode = not self._webtoon_mode
         if self._spread_mode:
             self._current_page = (self._current_page // 2) * 2
 
@@ -1859,9 +1863,49 @@ class MainWindow(QMainWindow):
             self._library.update_progress(
                 self._current_comic_id, self._effective_progress_page()
             )
-            if not self._webtoon_mode:
-                self._library.set_zoom(self._current_comic_id, self.viewer.zoom_factor)
+            self._persist_reading_settings()
             self._record_reading_session()
+
+    def _current_reading_settings(self) -> ReadingSettings:
+        return ReadingSettings(
+            reading_mode="webtoon" if self._webtoon_mode else "single",
+            spread=self._spread_mode,
+            fit_mode=self._FIT_MODE_STR.get(self.viewer.fit_mode, "page"),
+            zoom=self.viewer.zoom_factor,
+        )
+
+    def _persist_reading_settings(self) -> None:
+        """Save the current viewer settings to the comic's series (whole-series
+        scope), or to the comic itself when it isn't part of a detected series."""
+        if self._current_comic_id is None or self._ebook_mode:
+            return
+        comic = self._library.get_comic_by_id(self._current_comic_id)
+        if comic is None:
+            return
+        settings = self._current_reading_settings()
+        if comic.series:
+            folder = str(Path(comic.file_path).parent)
+            self._library.set_series_reading_settings(folder, comic.series, settings)
+        else:
+            # Loose comic: keep the legacy per-issue behavior (no series to apply to).
+            self._library.set_reading_mode(comic.id, settings.reading_mode)
+            self._library.set_fit_mode(comic.id, settings.fit_mode)
+            self._library.set_zoom(comic.id, settings.zoom)
+
+    def _apply_reading_settings_to_folder(self) -> None:
+        """Push the current viewer settings to every comic in this folder."""
+        if self._current_comic_id is None:
+            return
+        comic = self._library.get_comic_by_id(self._current_comic_id)
+        if comic is None:
+            return
+        folder = str(Path(comic.file_path).parent)
+        self._library.set_folder_reading_settings(
+            folder, self._current_reading_settings()
+        )
+        self.statusBar().showMessage(
+            f"Reading settings applied to “{Path(folder).name}”", 4000
+        )
 
     def _record_reading_session(self) -> None:
         """Flush elapsed time + net forward pages for the current comic into stats.
@@ -1892,12 +1936,9 @@ class MainWindow(QMainWindow):
     }
 
     def _set_fit_mode(self, mode: FitMode) -> None:
-        """Set viewer fit mode and immediately persist it for the current comic."""
+        """Set viewer fit mode and persist it (whole-series, or per-comic if loose)."""
         self.viewer.set_fit_mode(mode)
-        if self._current_comic_id is not None:
-            self._library.set_fit_mode(
-                self._current_comic_id, self._FIT_MODE_STR.get(mode, "page")
-            )
+        self._persist_reading_settings()
 
     # ----- Window helpers -----
 

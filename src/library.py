@@ -31,6 +31,19 @@ class Shelf:
 
 
 @dataclass
+class ReadingSettings:
+    """Viewer settings that can be set per series or per folder.
+
+    Each field is None when "inherit" — only resolve_reading_settings()
+    returns a fully-populated instance.
+    """
+    reading_mode: str | None = None   # 'single' | 'webtoon'
+    spread: bool | None = None
+    fit_mode: str | None = None       # 'actual' | 'width' | 'page'
+    zoom: float | None = None
+
+
+@dataclass
 class Bookmark:
     id: int
     comic_id: int
@@ -364,7 +377,26 @@ CREATE TABLE IF NOT EXISTS annotations (
 CREATE INDEX IF NOT EXISTS idx_annotations_comic ON annotations(comic_id);
 """
 
-_CURRENT_VERSION = 13
+_SCHEMA_V14_READING_SETTINGS = """
+CREATE TABLE IF NOT EXISTS folder_reading_settings (
+    folder_path  TEXT PRIMARY KEY,
+    reading_mode TEXT,
+    spread       INTEGER,
+    fit_mode     TEXT,
+    zoom         REAL
+);
+CREATE TABLE IF NOT EXISTS series_reading_settings (
+    folder_path  TEXT NOT NULL,
+    series_name  TEXT NOT NULL,
+    reading_mode TEXT,
+    spread       INTEGER,
+    fit_mode     TEXT,
+    zoom         REAL,
+    PRIMARY KEY (folder_path, series_name)
+);
+"""
+
+_CURRENT_VERSION = 14
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 _CLIENT_SORT_MODES = _VALID_SORT_COLUMNS | {"chapter"}
@@ -482,6 +514,12 @@ class Library:
             self._conn.execute("PRAGMA user_version = 13")
             self._conn.commit()
             version = 13
+        if version < 14:
+            # Per-series and per-folder reading settings (webtoon/spread/fit/zoom).
+            self._conn.executescript(_SCHEMA_V14_READING_SETTINGS)
+            self._conn.execute("PRAGMA user_version = 14")
+            self._conn.commit()
+            version = 14
 
     def _seed_smart_shelves(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -1623,6 +1661,131 @@ class Library:
                 "UPDATE comics SET zoom = ? WHERE id = ?", (float(zoom), comic_id)
             )
 
+    # ----- Per-series / per-folder reading settings -----
+
+    @staticmethod
+    def _row_to_reading_settings(row) -> ReadingSettings:
+        if row is None:
+            return ReadingSettings()
+        spread = row["spread"]
+        return ReadingSettings(
+            reading_mode=row["reading_mode"],
+            spread=None if spread is None else bool(spread),
+            fit_mode=row["fit_mode"],
+            zoom=None if row["zoom"] is None else float(row["zoom"]),
+        )
+
+    @staticmethod
+    def _validated_settings_values(s: ReadingSettings) -> tuple:
+        if s.reading_mode is not None and s.reading_mode not in ("single", "webtoon"):
+            raise ValueError(f"Invalid reading_mode: {s.reading_mode!r}")
+        if s.fit_mode is not None and s.fit_mode not in ("actual", "width", "page"):
+            raise ValueError(f"Invalid fit_mode: {s.fit_mode!r}")
+        return (
+            s.reading_mode,
+            None if s.spread is None else (1 if s.spread else 0),
+            s.fit_mode,
+            None if s.zoom is None else float(s.zoom),
+        )
+
+    def get_folder_reading_settings(self, folder_path: str) -> ReadingSettings:
+        row = self._conn.execute(
+            "SELECT * FROM folder_reading_settings WHERE folder_path = ?",
+            (folder_path,),
+        ).fetchone()
+        return self._row_to_reading_settings(row)
+
+    def set_folder_reading_settings(
+        self, folder_path: str, settings: ReadingSettings
+    ) -> None:
+        mode, spread, fit, zoom = self._validated_settings_values(settings)
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO folder_reading_settings"
+                " (folder_path, reading_mode, spread, fit_mode, zoom)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(folder_path) DO UPDATE SET"
+                " reading_mode = excluded.reading_mode, spread = excluded.spread,"
+                " fit_mode = excluded.fit_mode, zoom = excluded.zoom",
+                (folder_path, mode, spread, fit, zoom),
+            )
+
+    def clear_folder_reading_settings(self, folder_path: str) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM folder_reading_settings WHERE folder_path = ?",
+                (folder_path,),
+            )
+
+    def get_series_reading_settings(
+        self, folder_path: str, series_name: str
+    ) -> ReadingSettings:
+        row = self._conn.execute(
+            "SELECT * FROM series_reading_settings"
+            " WHERE folder_path = ? AND series_name = ?",
+            (folder_path, series_name),
+        ).fetchone()
+        return self._row_to_reading_settings(row)
+
+    def set_series_reading_settings(
+        self, folder_path: str, series_name: str, settings: ReadingSettings
+    ) -> None:
+        mode, spread, fit, zoom = self._validated_settings_values(settings)
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO series_reading_settings"
+                " (folder_path, series_name, reading_mode, spread, fit_mode, zoom)"
+                " VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(folder_path, series_name) DO UPDATE SET"
+                " reading_mode = excluded.reading_mode, spread = excluded.spread,"
+                " fit_mode = excluded.fit_mode, zoom = excluded.zoom",
+                (folder_path, series_name, mode, spread, fit, zoom),
+            )
+
+    def clear_series_reading_settings(
+        self, folder_path: str, series_name: str
+    ) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM series_reading_settings"
+                " WHERE folder_path = ? AND series_name = ?",
+                (folder_path, series_name),
+            )
+
+    def resolve_reading_settings(self, comic: Comic) -> ReadingSettings:
+        """Effective viewer settings for a comic.
+
+        Precedence (most specific wins): series → folder → the comic's own
+        stored columns → app defaults. Always fully populated.
+        """
+        folder = _parent_dir(comic.file_path)
+        resolved = ReadingSettings(
+            reading_mode=comic.reading_mode,
+            spread=None,                 # spread isn't stored per comic
+            fit_mode=comic.fit_mode,
+            zoom=comic.zoom,
+        )
+
+        def _overlay(src: ReadingSettings) -> None:
+            for field in ("reading_mode", "spread", "fit_mode", "zoom"):
+                val = getattr(src, field)
+                if val is not None:
+                    setattr(resolved, field, val)
+
+        _overlay(self.get_folder_reading_settings(folder))
+        if comic.series:
+            _overlay(self.get_series_reading_settings(folder, comic.series))
+
+        if resolved.reading_mode is None:
+            resolved.reading_mode = "single"
+        if resolved.fit_mode is None:
+            resolved.fit_mode = "page"
+        if resolved.zoom is None:
+            resolved.zoom = 1.0
+        if resolved.spread is None:
+            resolved.spread = resolved.reading_mode != "webtoon"
+        return resolved
+
     def get_comics_with_tag(
         self, tag_name: str, *, sort_by: str = "title", order: str = "asc"
     ) -> list[Comic]:
@@ -2311,6 +2474,36 @@ if __name__ == "__main__":
     assert lib.get_next_in_series(sc1).id == sc2
     assert lib.get_comic_by_id(stray).series is None
     assert lib.get_next_in_series(stray) is None
+
+    # Reading settings: series wins over folder wins over comic columns.
+    rset_dir = "/comics/rset"
+    rs1 = lib.add_comic(
+        f"{rset_dir}/Naruto 01.cbz", page_count=1, file_size=100, series="Naruto",
+    )
+    rs2 = lib.add_comic(
+        f"{rset_dir}/Naruto 02.cbz", page_count=1, file_size=100, series="Naruto",
+    )
+    loose = lib.add_comic(f"{rset_dir}/Extra.cbz", page_count=1, file_size=100)
+    # Default resolution: single/page/1.0, spread on (not webtoon).
+    base = lib.resolve_reading_settings(lib.get_comic_by_id(rs1))
+    assert (base.reading_mode, base.fit_mode, base.zoom, base.spread) == (
+        "single", "page", 1.0, True,
+    )
+    # Folder setting applies to every comic in the folder, including loose ones.
+    lib.set_folder_reading_settings(rset_dir, ReadingSettings(fit_mode="width"))
+    assert lib.resolve_reading_settings(lib.get_comic_by_id(loose)).fit_mode == "width"
+    # Series setting overrides the folder for that series only.
+    lib.set_series_reading_settings(
+        rset_dir, "Naruto", ReadingSettings(reading_mode="webtoon", fit_mode="actual"),
+    )
+    res = lib.resolve_reading_settings(lib.get_comic_by_id(rs2))
+    assert res.reading_mode == "webtoon"
+    assert res.fit_mode == "actual"        # series over folder
+    assert res.spread is False             # webtoon forces spread off via default
+    # Loose comic still follows the folder, not the series.
+    assert lib.resolve_reading_settings(lib.get_comic_by_id(loose)).reading_mode == "single"
+    lib.clear_series_reading_settings(rset_dir, "Naruto")
+    assert lib.resolve_reading_settings(lib.get_comic_by_id(rs2)).fit_mode == "width"
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
