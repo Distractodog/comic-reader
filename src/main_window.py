@@ -22,6 +22,7 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -708,10 +709,18 @@ class MainWindow(QMainWindow):
         self._cache: PageCache = PageCache()
         self._preloader: PagePreloader | None = None
 
+        # Debounce webtoon scroll progress — avoid SQLite writes on every page boundary
+        self._webtoon_save_timer = QTimer(self)
+        self._webtoon_save_timer.setSingleShot(True)
+        self._webtoon_save_timer.setInterval(1500)
+        self._webtoon_save_timer.timeout.connect(self._save_progress)
+
         # Thumb strip load-once guard
         self._thumb_strip_loaded: bool = False
 
         self._kb = KeybindingManager()
+        self._last_right_key_ms: int | None = None
+        self._RIGHT_DOUBLE_MS = 400
 
         self._stack = QStackedWidget()
         self._bookshelf = BookshelfView(self._library)
@@ -826,7 +835,32 @@ class MainWindow(QMainWindow):
 
         self.apply_theme(themes.DARK)
 
+        QApplication.instance().installEventFilter(self)
+
     # ----- UI construction -----
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.KeyPress and self._is_reading_view():
+            focus = QApplication.focusWidget()
+            if focus is not None and self.isAncestorOf(focus):
+                if (
+                    event.key() == Qt.Key.Key_Right
+                    and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                ):
+                    now = int(time.monotonic() * 1000)
+                    if (
+                        self._last_right_key_ms is not None
+                        and now - self._last_right_key_ms <= self._RIGHT_DOUBLE_MS
+                        and self._is_at_last_page()
+                    ):
+                        self._last_right_key_ms = None
+                        if self._advance_to_next_comic(prompt=False):
+                            return True
+                    else:
+                        self._last_right_key_ms = now
+                else:
+                    self._last_right_key_ms = None
+        return super().eventFilter(obj, event)
 
     def _build_menus(self):
         kb = self._kb
@@ -1042,6 +1076,9 @@ class MainWindow(QMainWindow):
     def _back_to_library(self):
         if self.isFullScreen():
             self._exit_window_fullscreen()
+        if self._webtoon_save_timer.isActive():
+            self._webtoon_save_timer.stop()
+            self._save_progress()
         self._record_reading_session()
         self._session_clock = None
         self._stop_preloader()
@@ -1326,7 +1363,7 @@ class MainWindow(QMainWindow):
         page_count = self._reader.page_count() if self._reader else 0
         if page_count > 0:
             self._seek_bar.set_progress((page + 1) / page_count)
-        self._save_progress()
+        self._webtoon_save_timer.start()
 
     # ----- Shortcuts dialog -----
 
@@ -1648,6 +1685,15 @@ class MainWindow(QMainWindow):
             return limit
         return self._current_page
 
+    def _is_at_last_page(self) -> bool:
+        """True when the reader is showing the final page/spread/chapter."""
+        if not self._reader:
+            return False
+        page_count = self._reader.page_count()
+        if page_count <= 0:
+            return False
+        return self._effective_progress_page() >= page_count - 1
+
     def next_page(self):
         if self._ebook_mode:
             self._ebook_viewer.next_page()
@@ -1695,24 +1741,42 @@ class MainWindow(QMainWindow):
 
     def _prompt_continue_after_book(self) -> None:
         """At end of book: offer the next series issue, otherwise the reading queue."""
+        self._advance_to_next_comic(prompt=True)
+
+    def _advance_to_next_comic(self, *, prompt: bool) -> bool:
+        """Open the next series issue, otherwise the next queued book."""
         if self._current_comic_id is not None:
             next_in_series = self._library.get_next_in_series(self._current_comic_id)
             if next_in_series is not None:
                 title = next_in_series.title or Path(next_in_series.file_path).stem
-                reply = QMessageBox.question(
-                    self,
-                    "Open next in series?",
-                    f"You reached the end. Open the next issue in this series?\n\n{title}",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Yes,
-                )
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
+                if prompt:
+                    reply = QMessageBox.question(
+                        self,
+                        "Open next in series?",
+                        f"You reached the end. Open the next issue in this series?\n\n{title}",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return False
                 self.load_file(next_in_series.file_path)
                 self.statusBar().showMessage(f"Opened next in series: {title}", 3500)
-                return
+                return True
 
-        self._prompt_open_next_queued_book()
+        if prompt:
+            self._prompt_open_next_queued_book()
+            return False
+
+        next_comic = self._next_queued_comic()
+        if next_comic is None:
+            return False
+        title = next_comic.title or Path(next_comic.file_path).stem
+        current_id = self._current_comic_id
+        if current_id is not None and self._library.is_in_queue(current_id):
+            self._library.remove_from_queue(current_id)
+        self.load_file(next_comic.file_path)
+        self.statusBar().showMessage(f"Opened next queued book: {title}", 3500)
+        return True
 
     def _prompt_open_next_queued_book(self) -> None:
         """Offer to continue into the next queued book at the end of the current one."""
@@ -1795,7 +1859,8 @@ class MainWindow(QMainWindow):
             self._library.update_progress(
                 self._current_comic_id, self._effective_progress_page()
             )
-            self._library.set_zoom(self._current_comic_id, self.viewer.zoom_factor)
+            if not self._webtoon_mode:
+                self._library.set_zoom(self._current_comic_id, self.viewer.zoom_factor)
             self._record_reading_session()
 
     def _record_reading_session(self) -> None:

@@ -10,7 +10,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from archive_handler import open_comic
 from comicinfo import parse_comicinfo
 from epub_book import EpubBook, is_text_epub
-from library import Library
+from library import Library, enrich_series_metadata
 from thumbnails import (
     generate_thumbnail,
     generate_thumbnail_from_bytes,
@@ -112,6 +112,7 @@ class LibraryScanner(QObject):
                 if existing:
                     try:
                         page_count, meta, cover_bytes = _probe(path)
+                        meta = enrich_series_metadata(str(path), meta)
                     except Exception:
                         continue
                     if existing.cover_path is None and not existing.cover_override:
@@ -121,6 +122,11 @@ class LibraryScanner(QObject):
                     # Backfill metadata if not yet populated
                     if existing.title is None and existing.author is None and meta:
                         self._library.update_metadata(existing.id, **meta)
+                    elif existing.series is None and meta.get("series"):
+                        fields = {"series": meta["series"]}
+                        if meta.get("series_number") is not None:
+                            fields["series_number"] = meta["series_number"]
+                        self._library.update_metadata(existing.id, **fields)
                     # Older scans stored text-EPUB page_count as image count (0/1);
                     # correct it to the real chapter count.
                     if page_count and existing.page_count != page_count:
@@ -129,6 +135,7 @@ class LibraryScanner(QObject):
 
             try:
                 page_count, meta, cover_bytes = _probe(path)
+                meta = enrich_series_metadata(str(path), meta)
                 file_size = path.stat().st_size
                 source_folder = (
                     str(path.parent)
@@ -150,5 +157,12 @@ class LibraryScanner(QObject):
                     self._library.set_cover_path(comic_id, cover)
             except Exception as e:
                 result.errors.append((str(path), str(e)))
+
+        if not self._cancelled:
+            if self._folder is not None:
+                self._library.scan_series_in_folder(str(self._folder))
+            elif self._paths:
+                for parent in {str(p.parent) for p in self._paths}:
+                    self._library.scan_series_in_folder(parent)
 
         self.finished.emit(result)

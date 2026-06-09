@@ -11,6 +11,7 @@ from PyQt6.QtCore import (
     QMimeData,
     QPoint,
     QPropertyAnimation,
+    QSettings,
     QRect,
     QThread,
     QTimer,
@@ -46,13 +47,13 @@ from PyQt6.QtWidgets import (
 )
 
 from batch_tools import BatchPlan, BatchWorker, plan_convert_to_cbz, plan_rename_from_metadata
-from library import Comic, Folder, Library, Series, Shelf
+from library import Comic, Folder, Library, Series, SeriesHub, Shelf
 
 TILE_W = 200
 COVER_H = 300
-TITLE_H = 28
+_TITLE_FONT_SIZE = 14
+_TITLE_PAD = 4
 STATUS_H = 22
-TILE_H = COVER_H + TITLE_H + STATUS_H
 TILE_SPACING = 18
 PROGRESS_H = 3  # overlaid on bottom of cover
 
@@ -66,6 +67,25 @@ _PROGRESS_FILL = QColor("#8b2a2a")
 _PLACEHOLDER_FG = QColor("#b0a0a0")
 _QUEUE_DRAG_MIME = "application/x-comic-reader-queue-id"
 _QUEUE_DRAG_THRESHOLD = 12
+
+
+def _title_font() -> QFont:
+    font = QFont()
+    font.setPixelSize(_TITLE_FONT_SIZE)
+    font.setWeight(QFont.Weight.Medium)
+    return font
+
+
+def _title_height_for(text: str) -> int:
+    """Height needed to show the full title with word wrap (no elision)."""
+    fm = QFontMetrics(_title_font())
+    rect = fm.boundingRect(
+        0, 0, TILE_W - 8, 10000,
+        int(Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap),
+        text or " ",
+    )
+    min_h = fm.lineSpacing() + _TITLE_PAD
+    return max(min_h, rect.height() + _TITLE_PAD)
 
 
 class _CoverLoader(QThread):
@@ -107,12 +127,14 @@ class _Tile(QWidget):
 
     opened = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, title_text: str = "", parent=None):
         super().__init__(parent)
         self._pixmap: QPixmap | None = None
         self.cover_path: str | None = None
         self._hovered = False
-        self.setFixedSize(TILE_W, TILE_H)
+        self._title_h = _title_height_for(title_text)
+        self._tile_h = COVER_H + self._title_h + STATUS_H
+        self.setFixedSize(TILE_W, self._tile_h)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def apply_cover(self, pixmap: QPixmap) -> None:
@@ -123,7 +145,7 @@ class _Tile(QWidget):
     def _draw_cover(self, painter: QPainter) -> None:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         clip = QPainterPath()
-        clip.addRoundedRect(0.0, 0.0, float(TILE_W), float(TILE_H), 8.0, 8.0)
+        clip.addRoundedRect(0.0, 0.0, float(TILE_W), float(self._tile_h), 8.0, 8.0)
         painter.setClipPath(clip)
 
         painter.fillRect(0, 0, TILE_W, COVER_H, _COVER_BG)
@@ -142,30 +164,24 @@ class _Tile(QWidget):
             painter.fillRect(0, 0, TILE_W, COVER_H, _HOVER_OVERLAY)
 
     def _draw_title(self, painter: QPainter, text: str) -> None:
-        painter.fillRect(0, COVER_H, TILE_W, TITLE_H, _BG)
+        painter.fillRect(0, COVER_H, TILE_W, self._title_h, _BG)
         painter.setPen(_TITLE_FG)
-        font = painter.font()
-        font.setPixelSize(14)
-        font.setWeight(QFont.Weight.Medium)
-        painter.setFont(font)
-        elided = QFontMetrics(font).elidedText(
-            text, Qt.TextElideMode.ElideRight, TILE_W - 8
-        )
+        painter.setFont(_title_font())
         painter.drawText(
-            QRect(4, COVER_H + 2, TILE_W - 8, TITLE_H - 4),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            elided,
+            QRect(4, COVER_H + 2, TILE_W - 8, self._title_h - 4),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
+            text,
         )
 
     def _draw_status(self, painter: QPainter, text: str) -> None:
-        painter.fillRect(0, COVER_H + TITLE_H, TILE_W, STATUS_H, _BG)
+        painter.fillRect(0, COVER_H + self._title_h, TILE_W, STATUS_H, _BG)
         painter.setPen(_STATUS_FG)
         font = painter.font()
         font.setPixelSize(12)
         font.setWeight(QFont.Weight.Normal)
         painter.setFont(font)
         painter.drawText(
-            QRect(4, COVER_H + TITLE_H + 2, TILE_W - 8, STATUS_H - 4),
+            QRect(4, COVER_H + self._title_h + 2, TILE_W - 8, STATUS_H - 4),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             text,
         )
@@ -190,7 +206,7 @@ class FolderTile(_Tile):
     menu_requested = pyqtSignal(str, int, int)  # folder_path, global_x, global_y
 
     def __init__(self, folder: Folder, parent=None):
-        super().__init__(parent)
+        super().__init__(folder.name, parent)
         self._folder = folder
         self.cover_path = folder.cover_path
 
@@ -217,7 +233,8 @@ class ComicTile(_Tile):
     queue_reorder_drop = pyqtSignal(int, int)           # dragged_id, insert_before_id
 
     def __init__(self, comic: Comic, selected: bool = False, parent=None):
-        super().__init__(parent)
+        title = comic.title or Path(comic.file_path).stem
+        super().__init__(title, parent)
         self._comic = comic
         self._selected = selected
         self.cover_path = comic.cover_path
@@ -359,7 +376,7 @@ class ComicTile(_Tile):
             pen = QPen(_PROGRESS_FILL, 3)
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(1, 1, TILE_W - 2, TILE_H - 2, 8, 8)
+            painter.drawRoundedRect(1, 1, TILE_W - 2, self._tile_h - 2, 8, 8)
         if self._selected:
             self._draw_selection(painter)
         title = self._comic.title or Path(self._comic.file_path).stem
@@ -387,18 +404,17 @@ class ComicTile(_Tile):
         pen = QPen(_PROGRESS_FILL, 2)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(2, 2, TILE_W - 4, TILE_H - 4, 7, 7)
+        painter.drawRoundedRect(2, 2, TILE_W - 4, self._tile_h - 4, 7, 7)
 
     def _on_click(self):
         self.opened.emit(self._comic.file_path)
 
 
 class SeriesTile(_Tile):
-    series_opened = pyqtSignal(str, str)    # folder_path, series_name
-    ungroup_requested = pyqtSignal(str, str)
+    opened = pyqtSignal(str, str)  # folder_path, series_name
 
     def __init__(self, series: Series, parent=None):
-        super().__init__(parent)
+        super().__init__(series.name, parent)
         self._series = series
         self.cover_path = series.cover_path
 
@@ -406,31 +422,40 @@ class SeriesTile(_Tile):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self._draw_cover(painter)
-        self._draw_series_badge(painter)
         self._draw_title(painter, self._series.name)
         n = self._series.comic_count
         self._draw_status(painter, f"{n} issue{'s' if n != 1 else ''}")
 
-    def _draw_series_badge(self, painter: QPainter) -> None:
-        badge_w, badge_h = 28, 18
-        x, y = TILE_W - badge_w - 6, 6
-        painter.fillRect(x, y, badge_w, badge_h, QColor(0, 0, 0, 140))
-        painter.setPen(QColor(255, 255, 255, 200))
-        font = painter.font()
-        font.setPixelSize(10)
-        painter.setFont(font)
-        painter.drawText(x, y, badge_w, badge_h, Qt.AlignmentFlag.AlignCenter,
-                         str(self._series.comic_count))
+    def _on_click(self):
+        self.opened.emit(self._series.folder_path, self._series.name)
 
-    def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        menu.addAction("Ungroup series").triggered.connect(
-            lambda: self.ungroup_requested.emit(self._series.folder_path, self._series.name)
-        )
-        menu.exec(event.globalPos())
+
+class SeriesHubTile(_Tile):
+    opened = pyqtSignal()
+
+    def __init__(self, hub: SeriesHub, parent=None):
+        super().__init__("Series", parent)
+        self._hub = hub
+        self.cover_path = hub.cover_path
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self._draw_cover(painter)
+        self._draw_title(painter, "Series")
+        n_series = self._hub.series_count
+        n_issues = self._hub.issue_count
+        if n_series == 1:
+            status = f"{n_issues} issue{'s' if n_issues != 1 else ''}"
+        else:
+            status = (
+                f"{n_series} series · {n_issues} issue"
+                f"{'s' if n_issues != 1 else ''}"
+            )
+        self._draw_status(painter, status)
 
     def _on_click(self):
-        self.series_opened.emit(self._series.folder_path, self._series.name)
+        self.opened.emit()
 
 
 class _HeaderBar(QWidget):
@@ -548,12 +573,6 @@ class _HeaderBar(QWidget):
         if not self._search_input.isVisible():
             self._sort_combo.show()
 
-    def set_series_mode(self, series_name: str):
-        self._in_comic_view = True
-        self._title.setText(series_name)
-        if not self._search_input.isVisible():
-            self._sort_combo.hide()  # series always sorted by issue number
-
     def set_shelf_mode(self, shelf_name: str):
         self._in_comic_view = True
         self._title.setText(shelf_name)
@@ -601,9 +620,11 @@ class BookshelfView(QWidget):
         super().__init__(parent)
         self._library = library
         self._current_folder: str | None = None
+        self._in_series_hub: bool = False
+        self._current_series: str | None = None
+        self._folder_needs_series_hub: bool = False
         self._current_shelf_id: int | None = None
         self._current_shelf_name: str = ""
-        self._current_series_name: str | None = None
         self._show_hidden_mode: bool = False
         self._queue_mode: bool = False
         self._last_n_cols = 0
@@ -684,7 +705,10 @@ class BookshelfView(QWidget):
         self._repopulate()
 
     def _on_back_clicked(self):
-        if self._current_series_name is not None:
+        if self._current_series is not None:
+            self._show_series_hub()
+            return
+        if self._in_series_hub and self._current_folder is not None:
             self._show_comics(self._current_folder)
             return
         if self._current_shelf_id is not None and self._current_folder is not None:
@@ -739,7 +763,29 @@ class BookshelfView(QWidget):
     def _on_sort_changed(self, sort_by: str, order: str):
         self._sort_by = sort_by
         self._sort_order = order
+        if self._current_folder and not self._queue_mode and not self._show_hidden_mode:
+            self._save_folder_sort(self._current_folder)
         self._repopulate()
+
+    def _folder_sort_settings_key(self, folder_path: str) -> str:
+        return f"folder_sort/{folder_path}"
+
+    def _restore_folder_sort(self, folder_path: str) -> None:
+        val = QSettings("ComicReader", "ComicReader").value(
+            self._folder_sort_settings_key(folder_path)
+        )
+        if not val or not isinstance(val, str) or "/" not in val:
+            return
+        sort_by, order = val.split("/", 1)
+        valid = {(key, ord_) for _, key, ord_ in self._header._SORT_OPTIONS}
+        if (sort_by, order) in valid:
+            self._apply_sort(sort_by, order)
+
+    def _save_folder_sort(self, folder_path: str) -> None:
+        QSettings("ComicReader", "ComicReader").setValue(
+            self._folder_sort_settings_key(folder_path),
+            f"{self._sort_by}/{self._sort_order}",
+        )
 
     def _nav_transition(self, switch_fn):
         """Grab current grid, run switch_fn, fade the grab out."""
@@ -777,9 +823,11 @@ class BookshelfView(QWidget):
     def _show_folders(self):
         def do():
             self._current_folder = None
+            self._in_series_hub = False
+            self._current_series = None
+            self._folder_needs_series_hub = False
             self._current_shelf_id = None
             self._current_shelf_name = ""
-            self._current_series_name = None
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._show_hidden_mode = False
@@ -793,14 +841,44 @@ class BookshelfView(QWidget):
     def _show_comics(self, folder_path: str):
         def do():
             self._current_folder = folder_path
+            self._in_series_hub = False
+            self._current_series = None
             self._current_shelf_id = None
             self._current_shelf_name = ""
-            self._current_series_name = None
             self._show_hidden_mode = False
             self._queue_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
+            self._restore_folder_sort(folder_path)
+            self._last_n_cols = 0
+            self._repopulate()
+            self.folder_entered.emit(True)
+        self._nav_transition(do)
+
+    def _show_series_hub(self):
+        if not self._current_folder:
+            return
+
+        def do():
+            self._in_series_hub = True
+            self._current_series = None
+            self._selected_ids.clear()
+            self._comic_tiles.clear()
+            self._header.set_comic_mode("Series")
+            self._last_n_cols = 0
+            self._repopulate()
+            self.folder_entered.emit(True)
+        self._nav_transition(do)
+
+    def _show_series(self, folder_path: str, series_name: str):
+        def do():
+            self._current_folder = folder_path
+            self._in_series_hub = True
+            self._current_series = series_name
+            self._selected_ids.clear()
+            self._comic_tiles.clear()
+            self._header.set_comic_mode(series_name)
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(True)
@@ -811,7 +889,6 @@ class BookshelfView(QWidget):
             self._current_folder = None
             self._current_shelf_id = shelf_id
             self._current_shelf_name = shelf_name
-            self._current_series_name = None
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._show_hidden_mode = False
@@ -822,27 +899,10 @@ class BookshelfView(QWidget):
             self.folder_entered.emit(False)
         self._nav_transition(do)
 
-    def show_series(self, folder_path: str, series_name: str):
-        def do():
-            self._current_folder = folder_path
-            self._current_shelf_id = None
-            self._current_shelf_name = ""
-            self._current_series_name = series_name
-            self._selected_ids.clear()
-            self._comic_tiles.clear()
-            self._show_hidden_mode = False
-            self._queue_mode = False
-            self._header.set_series_mode(series_name)
-            self._last_n_cols = 0
-            self._repopulate()
-            self.folder_entered.emit(True)
-        self._nav_transition(do)
-
     def _show_shelf_folders(self):
         """Return to the shelf's folder-tile grid from a folder drill-down."""
         def do():
             self._current_folder = None
-            self._current_series_name = None
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._show_hidden_mode = False
@@ -857,12 +917,14 @@ class BookshelfView(QWidget):
         """Drill into a specific folder's comics within the current shelf."""
         def do():
             self._current_folder = folder_path
-            self._current_series_name = None
+            self._in_series_hub = False
+            self._current_series = None
             self._show_hidden_mode = False
             self._queue_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
+            self._restore_folder_sort(folder_path)
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(True)
@@ -874,7 +936,6 @@ class BookshelfView(QWidget):
             self._current_folder = None
             self._current_shelf_id = None
             self._current_shelf_name = ""
-            self._current_series_name = None
             self._show_hidden_mode = True
             self._queue_mode = False
             self._selected_ids.clear()
@@ -891,7 +952,6 @@ class BookshelfView(QWidget):
             self._current_folder = None
             self._current_shelf_id = None
             self._current_shelf_name = ""
-            self._current_series_name = None
             self._show_hidden_mode = False
             self._queue_mode = True
             self._selected_ids.clear()
@@ -917,6 +977,44 @@ class BookshelfView(QWidget):
     def _n_cols(self) -> int:
         w = self._scroll.viewport().width() - 2 * TILE_SPACING
         return max(1, (w + TILE_SPACING) // (TILE_W + TILE_SPACING))
+
+    def _folder_grid_items(self) -> tuple[list, str]:
+        """Build the tile list for the current folder view (series hub / flat / issues)."""
+        folder_path = self._current_folder
+        assert folder_path is not None
+
+        if self._current_shelf_id is not None:
+            comics = self._library.get_comics_in_shelf_for_folder(
+                self._current_shelf_id, folder_path,
+                sort_by=self._sort_by, order=self._sort_order,
+            )
+        else:
+            comics = self._library.get_comics_in_folder(
+                folder_path, sort_by=self._sort_by, order=self._sort_order
+            )
+
+        if self._current_series:
+            if self._sort_by == "chapter":
+                items = self._library.get_comics_in_series(folder_path, self._current_series)
+                if self._sort_order == "desc":
+                    items = list(reversed(items))
+            else:
+                items = [c for c in comics if c.series == self._current_series]
+            return items, "No issues in this series."
+
+        layout = self._library.analyze_folder_series_layout(comics)
+        self._folder_needs_series_hub = layout.needs_hub
+
+        if self._in_series_hub:
+            series_tiles, _ = self._library.group_series_from_comics(folder_path, comics)
+            return series_tiles, "No series in this folder."
+
+        if layout.needs_hub:
+            _, loose = self._library.group_series_from_comics(folder_path, comics)
+            hub = self._library.build_series_hub(folder_path, comics)
+            return [hub] + loose, "No comics found in this folder."
+
+        return comics, "No comics found in this folder."
 
     def _sync_header_folder_menu(self) -> None:
         """Allow header right-click folder actions when inside a folder view."""
@@ -974,26 +1072,11 @@ class BookshelfView(QWidget):
             items = self._library.get_shelf_folders(self._current_shelf_id)
             empty_msg = "This shelf is empty."
         elif self._current_shelf_id is not None:
-            # Shelf drill-down — same series grouping as a normal folder view
-            shelf_comics = self._library.get_comics_in_shelf_for_folder(
+            items = self._library.get_comics_in_shelf_for_folder(
                 self._current_shelf_id, self._current_folder,
                 sort_by=self._sort_by, order=self._sort_order,
             )
-            series_list, ungrouped = self._library.group_series_from_comics(
-                self._current_folder, shelf_comics
-            )
-            items = series_list + ungrouped
             empty_msg = "No comics from this folder on this shelf."
-        elif self._current_series_name is not None:
-            items = self._library.get_comics_in_series(
-                self._current_folder, self._current_series_name
-            )
-            if self._current_shelf_id is not None:
-                on_shelf = {
-                    c.id for c in self._library.get_comics_in_shelf(self._current_shelf_id)
-                }
-                items = [c for c in items if c.id in on_shelf]
-            empty_msg = "No comics found in this series."
         elif self._current_folder is None:
             items = self._library.get_folders()
             empty_msg = (
@@ -1001,15 +1084,7 @@ class BookshelfView(QWidget):
                 "Use Library → Add Folder or Add Files to Library to get started."
             )
         else:
-            # Folder view: series groups first, then ungrouped comics
-            all_comics = self._library.get_comics_in_folder(
-                self._current_folder, sort_by=self._sort_by, order=self._sort_order
-            )
-            series_list, ungrouped = self._library.group_series_from_comics(
-                self._current_folder, all_comics
-            )
-            items = series_list + ungrouped
-            empty_msg = "No comics found in this folder."
+            items, empty_msg = self._folder_grid_items()
 
         if not items:
             lbl = QLabel(empty_msg)
@@ -1032,7 +1107,13 @@ class BookshelfView(QWidget):
                 row_layout.setSpacing(TILE_SPACING)
                 layout.addWidget(row_widget)
 
-            if isinstance(item, Folder):
+            if isinstance(item, SeriesHub):
+                tile = SeriesHubTile(item)
+                tile.opened.connect(self._show_series_hub)
+            elif isinstance(item, Series):
+                tile = SeriesTile(item)
+                tile.opened.connect(self._show_series)
+            elif isinstance(item, Folder):
                 tile = FolderTile(item)
                 if self._search_query:
                     tile.opened.connect(self._open_folder_from_search)
@@ -1041,10 +1122,6 @@ class BookshelfView(QWidget):
                 else:
                     tile.opened.connect(self._show_comics)
                 tile.menu_requested.connect(self._on_folder_context_menu)
-            elif isinstance(item, Series):
-                tile = SeriesTile(item)
-                tile.series_opened.connect(self.show_series)
-                tile.ungroup_requested.connect(self._ungroup_series)
             else:
                 tile = ComicTile(item, selected=item.id in self._selected_ids)
                 tile.opened.connect(self.comic_opened)
@@ -1122,13 +1199,24 @@ class BookshelfView(QWidget):
             menu.addAction("Set chapter order").triggered.connect(
                 lambda: self._set_chapter_order(target_ids)
             )
-            menu.addAction("Group as series…").triggered.connect(
+            menu.addAction("Link as reading series…").triggered.connect(
                 lambda: self._group_as_series(target_ids)
             )
-        if self._current_series_name and self._current_folder:
-            menu.addAction("Ungroup this series").triggered.connect(
-                lambda: self._ungroup_series(self._current_folder, self._current_series_name)
-            )
+        if self._current_folder:
+            selected = [
+                c for cid in target_ids
+                if (c := self._library.get_comic_by_id(cid)) is not None and c.series
+            ]
+            series_names = {c.series for c in selected}
+            if len(series_names) == 1 and len(selected) == len(target_ids):
+                series_name = next(iter(series_names))
+                menu.addAction("Remove series link").triggered.connect(
+                    lambda: self._remove_series_link(self._current_folder, series_name)
+                )
+            elif len(series_names) > 1:
+                menu.addAction("Remove series link").triggered.connect(
+                    lambda: self._remove_comics_from_series(target_ids)
+                )
 
         menu.addSeparator()
         batch_menu = menu.addMenu("Batch")
@@ -1559,20 +1647,26 @@ class BookshelfView(QWidget):
         menu.addAction("Rescan folder").triggered.connect(
             lambda: self.folder_rescan_requested.emit(folder_path)
         )
+        menu.addAction("Scan for series").triggered.connect(
+            lambda: self._scan_series_in_folder(folder_path)
+        )
         if self._show_hidden_mode:
             menu.exec(QPoint(gx, gy))
             return
 
         folder_comics = self._comics_for_folder_grouping(folder_path)
         if len(folder_comics) >= 2:
-            series_list, _ = self._library.group_series_from_comics(
-                folder_path, folder_comics
-            )
             menu.addAction("Set chapter order").triggered.connect(
                 lambda: self._set_chapter_order([c.id for c in folder_comics])
             )
-            if not series_list:
-                menu.addAction("Group all comics as series…").triggered.connect(
+            series_names = {c.series for c in folder_comics if c.series}
+            if len(series_names) == 1 and all(c.series for c in folder_comics):
+                series_name = next(iter(series_names))
+                menu.addAction("Remove series link").triggered.connect(
+                    lambda: self._remove_series_link(folder_path, series_name)
+                )
+            else:
+                menu.addAction("Link all comics as reading series…").triggered.connect(
                     lambda: self._group_as_series([c.id for c in folder_comics])
                 )
 
@@ -1830,12 +1924,24 @@ class BookshelfView(QWidget):
 
     def _group_as_series(self, comic_ids: list[int]):
         from PyQt6.QtWidgets import QInputDialog
-        name, ok = QInputDialog.getText(self, "Group as Series", "Series name:")
+        name, ok = QInputDialog.getText(
+            self,
+            "Link as Reading Series",
+            "Series name (issues stay as separate tiles; you'll be offered the "
+            "next one when you finish each issue):",
+        )
         if ok and name.strip():
             self._library.group_comics_as_series(comic_ids, name.strip())
             self._clear_selection()
             self._apply_sort("chapter", "asc")
-            self._repopulate()
+            if self._current_folder:
+                self._save_folder_sort(self._current_folder)
+            self._nav_transition(self._repopulate)
+            n = len(comic_ids)
+            self.window().statusBar().showMessage(
+                f"Linked {n} comic{'s' if n != 1 else ''} as “{name.strip()}”",
+                4000,
+            )
 
     def _set_chapter_order(self, comic_ids: list[int]):
         if len(comic_ids) < 2:
@@ -1843,9 +1949,8 @@ class BookshelfView(QWidget):
         self._library.set_comics_chapter_order(comic_ids)
         self._clear_selection()
         self._apply_sort("chapter", "asc")
-        if self._current_series_name is not None and self._current_folder:
-            self._current_series_name = None
-            self._header.set_comic_mode(Path(self._current_folder).name)
+        if self._current_folder:
+            self._save_folder_sort(self._current_folder)
         self._repopulate()
         n = len(comic_ids)
         self.window().statusBar().showMessage(
@@ -1863,14 +1968,32 @@ class BookshelfView(QWidget):
                 self._header._sort_combo.blockSignals(False)
                 break
 
-    def _ungroup_series(self, folder_path: str, series_name: str):
+    def _scan_series_in_folder(self, folder_path: str) -> None:
+        linked = self._library.scan_series_in_folder(folder_path)
+        self._nav_transition(self._repopulate)
+        if linked:
+            self.window().statusBar().showMessage(
+                f"Linked {linked} comic{'s' if linked != 1 else ''} into series",
+                4000,
+            )
+        else:
+            self.window().statusBar().showMessage(
+                "No new series links found in this folder",
+                4000,
+            )
+
+    def _remove_series_link(self, folder_path: str, series_name: str) -> None:
+        """Clear series metadata — stops continue-to-next at end of issue."""
         comics = self._library.get_comics_in_series(folder_path, series_name)
         for c in comics:
             self._library.update_metadata(c.id, series=None)
-        if self._current_series_name == series_name:
-            self._show_comics(folder_path)
-        else:
-            self._nav_transition(self._repopulate)
+        self._nav_transition(self._repopulate)
+
+    def _remove_comics_from_series(self, comic_ids: list[int]) -> None:
+        for cid in comic_ids:
+            self._library.update_metadata(cid, series=None)
+        self._clear_selection()
+        self._nav_transition(self._repopulate)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

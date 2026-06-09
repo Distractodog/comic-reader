@@ -11,15 +11,16 @@ _RETAIN_RADIUS = 10  # keep full-res images within ±N pages of the current page
 
 
 class _PageLoader(QThread):
-    """Loads a list of pages in order, emitting each as a raw QImage (no scaling)."""
+    """Loads a list of pages in order, scaling off the UI thread."""
 
-    image_ready = pyqtSignal(int, int, QImage)  # gen, page_index, image
+    image_ready = pyqtSignal(int, int, QImage, QImage)  # gen, page_index, original, scaled
 
-    def __init__(self, reader, indices: list[int], gen: int, parent=None):
+    def __init__(self, reader, indices: list[int], gen: int, display_w: int, parent=None):
         super().__init__(parent)
         self._reader = reader
         self._indices = indices
         self._gen = gen
+        self._display_w = display_w
         self._abort = False
 
     def abort(self) -> None:
@@ -34,7 +35,10 @@ class _PageLoader(QThread):
                 img = QImage()
                 img.loadFromData(data)
                 if not img.isNull():
-                    self.image_ready.emit(self._gen, idx, img)
+                    scaled = img.scaledToWidth(
+                        self._display_w, Qt.TransformationMode.FastTransformation
+                    )
+                    self.image_ready.emit(self._gen, idx, img, scaled)
             except Exception:
                 pass
 
@@ -65,8 +69,10 @@ class WebtoonViewer(QScrollArea):
         self.setWidget(self._content)
 
         self._labels: list[QLabel] = []
+        self._tops: list[int] = []  # cached y of each label top — avoids O(n) layout queries
         self._originals: dict[int, QImage] = {}
         self._loaded: set[int] = set()
+        self._loading: set[int] = set()
         self._reader = None
         self._page_count = 0
         self._current_page = 0
@@ -88,6 +94,13 @@ class WebtoonViewer(QScrollArea):
         self._resize_timer.setInterval(150)
         self._resize_timer.timeout.connect(self._rerender_all)
 
+        # Batch pixmap/height updates to one layout pass per frame
+        self._render_queue: list[tuple[int, QImage]] = []
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.setInterval(16)
+        self._render_timer.timeout.connect(self._flush_renders)
+
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
     # ----- Event filter for mouse tracking -----
@@ -108,7 +121,9 @@ class WebtoonViewer(QScrollArea):
         self._reader = reader
         self._page_count = reader.page_count()
         self._loaded.clear()
+        self._loading.clear()
         self._originals.clear()
+        self._render_queue.clear()
         self._last_emitted = -1
 
         while self._layout.count():
@@ -116,6 +131,7 @@ class WebtoonViewer(QScrollArea):
             if item.widget():
                 item.widget().deleteLater()
         self._labels.clear()
+        self._tops.clear()
 
         for _ in range(self._page_count):
             lbl = QLabel()
@@ -124,6 +140,8 @@ class WebtoonViewer(QScrollArea):
             lbl.setMinimumHeight(300)
             self._layout.addWidget(lbl)
             self._labels.append(lbl)
+
+        self._rebuild_tops()
 
         if start_page > 0:
             QTimer.singleShot(120, lambda: self._scroll_to(start_page))
@@ -138,6 +156,22 @@ class WebtoonViewer(QScrollArea):
 
     # ----- Internal -----
 
+    def _rebuild_tops(self, from_index: int = 0) -> None:
+        """Recompute cached label tops from *from_index* onward."""
+        spacing = self._layout.spacing()
+        if from_index <= 0:
+            y = 0
+            self._tops = []
+            from_index = 0
+        else:
+            prev = from_index - 1
+            y = self._tops[prev] + self._labels[prev].height() + spacing
+            del self._tops[from_index:]
+
+        for i in range(from_index, len(self._labels)):
+            self._tops.append(y)
+            y += self._labels[i].height() + spacing
+
     def _scroll_to(self, page_index: int) -> None:
         if 0 <= page_index < len(self._labels):
             self.ensureWidgetVisible(self._labels[page_index])
@@ -148,14 +182,21 @@ class WebtoonViewer(QScrollArea):
         self._load_timer.start()
 
     def _update_current_page(self) -> None:
-        if not self._labels:
+        if not self._labels or not self._tops:
             return
         vp_center = self.verticalScrollBar().value() + self.viewport().height() // 2
+
+        lo, hi = 0, len(self._labels) - 1
         best = 0
-        for i, lbl in enumerate(self._labels):
-            lbl_center = lbl.y() + lbl.height() // 2
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            lbl_center = self._tops[mid] + self._labels[mid].height() // 2
             if lbl_center <= vp_center:
-                best = i
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
         if best != self._last_emitted:
             self._current_page = best
             self._last_emitted = best
@@ -190,9 +231,9 @@ class WebtoonViewer(QScrollArea):
         near: list[int] = []
         far: list[int] = []
         for i, lbl in enumerate(self._labels):
-            if i in self._loaded:
+            if i in self._loaded or i in self._loading:
                 continue
-            top = lbl.y()
+            top = self._tops[i]
             bot = top + lbl.height()
             if bot >= load_top and top <= load_bot:
                 if bot >= scroll_top and top <= scroll_bot:
@@ -204,41 +245,76 @@ class WebtoonViewer(QScrollArea):
         if not to_load:
             return
 
+        # Keep the current loader running if all viewport pages are already in flight.
+        urgent = set(near) - self._loaded - self._loading
+        if self._loader and self._loader.isRunning() and not urgent:
+            return
+
         self._abort_loader()
         self._loader_gen += 1
         gen = self._loader_gen
-        self._loader = _PageLoader(self._reader, to_load, gen)
+        self._loading = set(to_load)
+        self._loader = _PageLoader(self._reader, to_load, gen, self._current_display_w())
         self._loader.image_ready.connect(self._on_image_ready)
         self._loader.start()
 
-    def _on_image_ready(self, gen: int, index: int, image: QImage) -> None:
+    def _on_image_ready(
+        self, gen: int, index: int, original: QImage, scaled: QImage
+    ) -> None:
         if gen != self._loader_gen:
             return  # stale result — discard
         if index < 0 or index >= len(self._labels):
             return
-        self._originals[index] = image
+        self._loading.discard(index)
+        self._originals[index] = original
         self._loaded.add(index)
-        self._render(index)
+        self._render_queue.append((index, scaled))
+        self._render_timer.start()
+
+    def _flush_renders(self) -> None:
+        queue = self._render_queue
+        self._render_queue = []
+        if not queue:
+            return
+
+        first_changed = min(index for index, _ in queue)
+        self._content.setUpdatesEnabled(False)
+        try:
+            for index, scaled in queue:
+                lbl = self._labels[index]
+                lbl.setPixmap(QPixmap.fromImage(scaled))
+                lbl.setFixedHeight(scaled.height())
+            self._rebuild_tops(first_changed)
+        finally:
+            self._content.setUpdatesEnabled(True)
 
     def _render(self, index: int) -> None:
         img = self._originals.get(index)
         if img is None:
             return
         display_w = self._current_display_w()
-        # FastTransformation is ~50x quicker than Smooth and fine for comic viewing
         scaled = img.scaledToWidth(display_w, Qt.TransformationMode.FastTransformation)
         lbl = self._labels[index]
         lbl.setPixmap(QPixmap.fromImage(scaled))
         lbl.setFixedHeight(scaled.height())
 
     def _rerender_all(self) -> None:
-        for i in list(self._loaded):
-            self._render(i)
+        loaded = list(self._loaded)
+        if not loaded:
+            return
+        self._content.setUpdatesEnabled(False)
+        try:
+            for i in loaded:
+                self._render(i)
+            self._rebuild_tops()
+        finally:
+            self._content.setUpdatesEnabled(True)
 
     def _abort_loader(self) -> None:
         if self._loader and self._loader.isRunning():
             self._loader.abort()
         self._loader = None
+        self._loading.clear()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

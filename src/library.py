@@ -39,6 +39,24 @@ class Series:
 
 
 @dataclass
+class SeriesHub:
+    """Single folder-level tile grouping multiple series (and loose comics at top level)."""
+    folder_path: str
+    series_count: int
+    issue_count: int
+    cover_path: str | None
+
+
+@dataclass
+class FolderSeriesLayout:
+    """How a folder's comics should be shown in the bookshelf grid."""
+    needs_hub: bool
+    loose_comics: list[Comic]
+    series_tiles: list[Series]
+    flat_comics: list[Comic]
+
+
+@dataclass
 class Bookmark:
     id: int
     comic_id: int
@@ -134,21 +152,54 @@ def _natural_sort_key(name: str) -> list:
     return [int(p) if p.isdigit() else p for p in parts]
 
 
+_ISSUE_SUFFIX_PATTERNS = (
+    re.compile(r"[-_\s]#\s*(\d+(?:\.\d+)?)\s*$", re.IGNORECASE),
+    re.compile(r"[-_\s]\(\s*(\d+(?:\.\d+)?)\s*\)\s*$", re.IGNORECASE),
+    re.compile(r"[-_\s]v(?:ol)?\.?\s*(\d+(?:\.\d+)?)\s*$", re.IGNORECASE),
+    re.compile(r"[-_\s](\d+(?:\.\d+)?)\s*$", re.IGNORECASE),
+)
+
+
 def _infer_issue_number(stem: str) -> float | None:
     """Best-effort issue number from a filename stem (e.g. 'Saga 042' → 42)."""
-    for pat in (
-        r"#\s*(\d+(?:\.\d+)?)\s*$",
-        r"\(\s*(\d+(?:\.\d+)?)\s*\)\s*$",
-        r"[-_\s]v(?:ol)?\.?\s*(\d+(?:\.\d+)?)\s*$",
-        r"[-_\s](\d+(?:\.\d+)?)\s*$",
-    ):
-        m = re.search(pat, stem, re.IGNORECASE)
+    for pat in _ISSUE_SUFFIX_PATTERNS:
+        m = pat.search(stem)
         if m:
             try:
                 return float(m.group(1))
             except ValueError:
                 continue
     return None
+
+
+def _infer_series_name_from_stem(stem: str) -> tuple[str | None, float | None]:
+    """Split a filename stem like 'Saga 042' into ('Saga', 42)."""
+    for pat in _ISSUE_SUFFIX_PATTERNS:
+        m = pat.search(stem)
+        if m:
+            try:
+                number = float(m.group(1))
+            except ValueError:
+                continue
+            name = stem[: m.start()].strip(" -_")
+            if name and len(name) >= 2:
+                return name, number
+    return None, None
+
+
+def enrich_series_metadata(file_path: str, meta: dict) -> dict:
+    """Fill series / issue from the filename when ComicInfo did not provide them."""
+    if meta.get("series"):
+        return meta
+    stem = Path(file_path).stem
+    series, number = _infer_series_name_from_stem(stem)
+    if not series:
+        return meta
+    out = dict(meta)
+    out["series"] = series
+    if number is not None and out.get("series_number") is None:
+        out["series_number"] = number
+    return out
 
 
 def _comic_series_sort_key(c: Comic) -> tuple:
@@ -456,6 +507,7 @@ class Library:
             self._conn.executescript(_SCHEMA_V13_ANNOTATIONS)
             self._conn.execute("PRAGMA user_version = 13")
             self._conn.commit()
+            version = 13
 
     def _seed_smart_shelves(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -789,7 +841,7 @@ class Library:
             )
 
     def group_comics_as_series(self, comic_ids: list[int], series_name: str) -> None:
-        """Assign a shared series name; auto-number from filename order when needed."""
+        """Assign a shared series name for reading order; issues stay as separate tiles."""
         comics = [c for cid in comic_ids if (c := self.get_comic_by_id(cid)) is not None]
         comics = sorted(comics, key=_comic_series_sort_key)
         auto_number = not any(c.series_number is not None for c in comics)
@@ -803,12 +855,8 @@ class Library:
         """Put comics in chapter order as separate tiles — no series grouping."""
         comics = [c for cid in comic_ids if (c := self.get_comic_by_id(cid)) is not None]
         comics = sorted(comics, key=_comic_series_sort_key)
-        auto_number = not any(c.series_number is not None for c in comics)
         for i, comic in enumerate(comics, start=1):
-            fields: dict = {"series": None}
-            if auto_number:
-                fields["series_number"] = i
-            self.update_metadata(comic.id, **fields)
+            self.update_metadata(comic.id, series=None, series_number=i)
 
     def set_cover_path(self, comic_id: int, cover_path: str) -> None:
         with self.transaction() as cur:
@@ -966,32 +1014,142 @@ class Library:
         ).fetchall()
         return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
 
+    def scan_series_in_folder(self, folder_path: str) -> int:
+        """Detect shared series in a folder from metadata and filenames.
+
+        Comics with the same series name (2+ issues) are linked for reading order.
+        Returns how many comics were newly linked.
+        """
+        comics = self.get_comics_in_folder(folder_path)
+        if len(comics) < 2:
+            return 0
+
+        candidates: dict[str, list[Comic]] = {}
+        for comic in comics:
+            series = comic.series
+            number = comic.series_number
+            if not series:
+                series, number = _infer_series_name_from_stem(Path(comic.file_path).stem)
+            if not series:
+                continue
+            candidates.setdefault(series, []).append((comic, number))
+
+        def _scan_sort_key(item: tuple[Comic, float | None]) -> tuple:
+            comic, inferred = item
+            if comic.series_number is not None:
+                return _comic_series_sort_key(comic)
+            stem = Path(comic.file_path).stem
+            nat = _natural_sort_key(stem)
+            if inferred is not None:
+                return (0, inferred, nat)
+            return (1, nat)
+
+        linked = 0
+        for series_name, entries in candidates.items():
+            if len(entries) < 2:
+                continue
+            sorted_entries = sorted(entries, key=_scan_sort_key)
+            auto_number = not any(item[1] is not None for item in sorted_entries)
+            for i, (comic, number) in enumerate(sorted_entries, start=1):
+                fields: dict = {}
+                if comic.series != series_name:
+                    fields["series"] = series_name
+                if comic.series_number is None:
+                    fields["series_number"] = number if number is not None else (
+                        i if auto_number else None
+                    )
+                if fields:
+                    self.update_metadata(comic.id, **fields)
+                    linked += 1
+        return linked
+
+    @staticmethod
+    def _multi_issue_series_groups(comics: list[Comic]) -> dict[str, list[Comic]]:
+        groups: dict[str, list[Comic]] = {}
+        for comic in comics:
+            if comic.series:
+                groups.setdefault(comic.series, []).append(comic)
+        return {name: group for name, group in groups.items() if len(group) >= 2}
+
+    def analyze_folder_series_layout(
+        self, comics: list[Comic], folder_path: str = ""
+    ) -> FolderSeriesLayout:
+        """Decide hub vs flat display for a folder's comics."""
+        multi = self._multi_issue_series_groups(comics)
+        multi_ids = {c.id for group in multi.values() for c in group}
+        loose = [c for c in comics if c.id not in multi_ids]
+
+        if not multi:
+            return FolderSeriesLayout(
+                needs_hub=False,
+                loose_comics=[],
+                series_tiles=[],
+                flat_comics=comics,
+            )
+
+        series_tiles = self._series_tiles_from_groups(folder_path, multi)
+        needs_hub = len(multi) > 1 or bool(loose)
+
+        if needs_hub:
+            return FolderSeriesLayout(
+                needs_hub=True,
+                loose_comics=loose,
+                series_tiles=series_tiles,
+                flat_comics=[],
+            )
+
+        only_name = next(iter(multi))
+        return FolderSeriesLayout(
+            needs_hub=False,
+            loose_comics=[],
+            series_tiles=[],
+            flat_comics=sorted(multi[only_name], key=_comic_series_sort_key),
+        )
+
+    def build_series_hub(self, folder_path: str, comics: list[Comic]) -> SeriesHub:
+        multi = self._multi_issue_series_groups(comics)
+        cover = None
+        for group in sorted(multi.values(), key=lambda g: (g[0].series or "").lower()):
+            cover = next((c.cover_path for c in sorted(group, key=_comic_series_sort_key) if c.cover_path), None)
+            if cover:
+                break
+        return SeriesHub(
+            folder_path=folder_path,
+            series_count=len(multi),
+            issue_count=sum(len(g) for g in multi.values()),
+            cover_path=cover,
+        )
+
+    def _series_tiles_from_groups(
+        self, folder_path: str, groups: dict[str, list[Comic]]
+    ) -> list[Series]:
+        series_list: list[Series] = []
+        for name, group in groups.items():
+            sorted_group = sorted(group, key=_comic_series_sort_key)
+            cover = next((c.cover_path for c in sorted_group if c.cover_path), None)
+            series_list.append(
+                Series(
+                    name=name,
+                    comic_count=len(group),
+                    cover_path=cover,
+                    folder_path=folder_path,
+                )
+            )
+        series_list.sort(key=lambda s: s.name.lower())
+        return series_list
+
     def group_series_from_comics(
         self, folder_path: str, comics: list[Comic]
     ) -> tuple[list[Series], list[Comic]]:
-        """Split a comic list into series tiles (2+ sharing a series) and ungrouped comics."""
-        groups: dict[str, list[Comic]] = {}
-        for c in comics:
-            if c.series:
-                groups.setdefault(c.series, []).append(c)
-        series_list: list[Series] = []
-        grouped_names: set[str] = set()
-        for name, group in groups.items():
-            if len(group) >= 2:
-                grouped_names.add(name)
-                sorted_group = sorted(group, key=_comic_series_sort_key)
-                cover = next((c.cover_path for c in sorted_group if c.cover_path), None)
-                series_list.append(
-                    Series(
-                        name=name,
-                        comic_count=len(group),
-                        cover_path=cover,
-                        folder_path=folder_path,
-                    )
-                )
-        series_list.sort(key=lambda s: s.name.lower())
-        ungrouped = [c for c in comics if not c.series or c.series not in grouped_names]
-        return series_list, ungrouped
+        """Split comics into series tiles vs individual tiles (hub interior or loose)."""
+        layout = self.analyze_folder_series_layout(comics)
+        if layout.needs_hub:
+            tiles = self._series_tiles_from_groups(
+                folder_path, self._multi_issue_series_groups(comics)
+            )
+            return tiles, layout.loose_comics
+        shown = layout.flat_comics if layout.flat_comics else comics
+        return [], shown
 
     def get_series_in_folder(self, folder_path: str) -> list[Series]:
         """Return series that have 2+ comics in the folder, sorted by name."""
@@ -2244,6 +2402,26 @@ if __name__ == "__main__":
     saga_chapter_sort = [c.id for c in lib.get_comics_in_folder(folder, sort_by="chapter", order="asc")
                          if c.series == "Saga"]
     assert saga_chapter_sort == [u3, u2, u1]
+
+    folder_comics = lib.get_comics_in_folder(folder)
+    layout = lib.analyze_folder_series_layout(folder_comics)
+    assert layout.needs_hub
+    assert len(layout.series_tiles) >= 2
+    assert lib.get_next_in_series(u3).id == u2
+
+    solo = "/comics/solo"
+    s1 = lib.add_comic(
+        f"{solo}/Only 01.cbz", page_count=1, file_size=100,
+        title="Only One", series="Only",
+    )
+    s2 = lib.add_comic(
+        f"{solo}/Only 02.cbz", page_count=1, file_size=100,
+        title="Only Two", series="Only",
+    )
+    solo_layout = lib.analyze_folder_series_layout(lib.get_comics_in_folder(solo))
+    assert not solo_layout.needs_hub
+    assert len(solo_layout.flat_comics) == 2
+    assert lib.get_next_in_series(s1).id == s2
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
