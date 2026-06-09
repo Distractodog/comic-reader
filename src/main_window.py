@@ -1074,8 +1074,8 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(APP_DISPLAY_NAME)
 
     def _back_to_library(self):
-        if self.isFullScreen():
-            self._exit_window_fullscreen()
+        # Returning to the library is just an in-window view switch — stay in
+        # whatever fullscreen state the user chose (Esc still leaves fullscreen).
         if self._webtoon_save_timer.isActive():
             self._webtoon_save_timer.stop()
             self._save_progress()
