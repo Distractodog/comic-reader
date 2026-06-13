@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from PyQt6.QtCore import (
@@ -47,6 +48,7 @@ from PyQt6.QtWidgets import (
 )
 
 from batch_tools import BatchPlan, BatchWorker, plan_convert_to_cbz, plan_rename_from_metadata
+from app_info import app_settings
 from library import Comic, Folder, Library, Shelf
 
 TILE_W = 200
@@ -68,12 +70,26 @@ _PLACEHOLDER_FG = QColor("#b0a0a0")
 _QUEUE_DRAG_MIME = "application/x-comic-reader-queue-id"
 _QUEUE_DRAG_THRESHOLD = 12
 
+# Per-view bookshelf backgrounds — stored as one JSON map (paths must not be QSettings keys).
+_BG_MAP_KEY = "bookshelf/background_map"
+_BG_LEGACY_KEY = "bookshelf/background"
+_BG_OLD_GROUP = "bookshelf/backgrounds"  # prior broken per-key storage — removed on migrate
+_BG_DIM_ALPHA = 198  # theme tile-bg painted over the cover at this alpha to mute it
+_BG_MAX_ZOOM = 1.6  # cap how far a cover is enlarged to fill the view (higher = more edge-to-edge but softer)
+
 
 def _title_font() -> QFont:
     font = QFont()
     font.setPixelSize(_TITLE_FONT_SIZE)
     font.setWeight(QFont.Weight.Medium)
     return font
+
+
+def _transparent(widget: QWidget) -> None:
+    """Let a QWidget show whatever is painted behind it (e.g. the bookshelf bg)."""
+    widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    widget.setAutoFillBackground(False)
+    widget.setStyleSheet("background: transparent;")
 
 
 def _title_height_for(text: str) -> int:
@@ -597,6 +613,9 @@ class BookshelfView(QWidget):
         self._pre_search_shelf_id: int | None = None
         self._pre_search_shelf_name: str = ""
 
+        # Without WA_StyledBackground, a QWidget subclass ignores stylesheet
+        # backgrounds — needed now that the scroll area is transparent.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet("background-color: #f0e8e8;")
 
         root = QVBoxLayout(self)
@@ -617,9 +636,22 @@ class BookshelfView(QWidget):
 
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
+        self._scroll.setAutoFillBackground(False)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setStyleSheet("QScrollArea { border: none; background: #f0e8e8; }")
+        # Transparent so the global background (and the view's tile_bg) shows through.
+        self._scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self._scroll.viewport().setAutoFillBackground(False)
+        # Re-fit the background whenever the viewport resizes — this also catches
+        # the scrollbar appearing/disappearing, which doesn't resize the view itself.
+        self._scroll.viewport().installEventFilter(self)
         root.addWidget(self._scroll)
+
+        # Fixed (non-scrolling) background image, behind the grid inside the viewport.
+        self._bg_spec: dict | None = None  # v2 source spec — rendered at display resolution
+        self._bg_label = QLabel(self._scroll.viewport())
+        self._bg_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._bg_label.setScaledContents(False)
+        self._bg_label.hide()
 
         self._nav_overlay = QLabel(self._scroll)
         self._nav_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -634,10 +666,15 @@ class BookshelfView(QWidget):
         self._nav_anim.finished.connect(self._nav_overlay.hide)
 
         self._grid_widget = QWidget()
-        self._grid_widget.setStyleSheet(f"background: {_BG.name()};")
+        _transparent(self._grid_widget)
         self._scroll.setWidget(self._grid_widget)
+        self._bg_label.stackUnder(self._grid_widget)
 
-        self._show_folders()
+        self._maybe_migrate_background_storage()
+        self._migrate_all_background_entries()
+        # Defer first paint — grab() during __init__ (before the event loop runs) can
+        # stall the Dock bounce on macOS when launched as Cover 2.0.app.
+        QTimer.singleShot(0, self._show_folders)
         self.shelf_changed.connect(self._on_shelf_membership_changed)
 
     def _on_shelf_membership_changed(self) -> None:
@@ -714,7 +751,7 @@ class BookshelfView(QWidget):
         return f"folder_sort/{folder_path}"
 
     def _restore_folder_sort(self, folder_path: str) -> None:
-        val = QSettings("ComicReader", "ComicReader").value(
+        val = app_settings().value(
             self._folder_sort_settings_key(folder_path)
         )
         if not val or not isinstance(val, str) or "/" not in val:
@@ -725,16 +762,20 @@ class BookshelfView(QWidget):
             self._apply_sort(sort_by, order)
 
     def _save_folder_sort(self, folder_path: str) -> None:
-        QSettings("ComicReader", "ComicReader").setValue(
+        app_settings().setValue(
             self._folder_sort_settings_key(folder_path),
             f"{self._sort_by}/{self._sort_order}",
         )
 
     def _nav_transition(self, switch_fn):
         """Grab current grid, run switch_fn, fade the grab out."""
-        grab = self._scroll.grab()
-        switch_fn()
         vp = self._scroll.viewport()
+        can_animate = self.isVisible() and vp.width() > 0 and vp.height() > 0
+        grab = self._scroll.grab() if can_animate else None
+        switch_fn()
+        self._switch_background()
+        if grab is None or grab.isNull():
+            return
         self._nav_overlay.setPixmap(grab)
         self._nav_overlay.setGeometry(0, 0, vp.width(), vp.height())
         self._nav_overlay.show()
@@ -759,8 +800,9 @@ class BookshelfView(QWidget):
         _PROGRESS_FILL = QColor(c["progress_fill"])
         _PLACEHOLDER_FG = QColor(c["placeholder_fg"])
         self.setStyleSheet(f"background-color: {c['tile_bg']};")
-        self._scroll.setStyleSheet(f"QScrollArea {{ border: none; background: {c['tile_bg']}; }}")
+        self._scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         self._header.apply_theme(c)
+        self._apply_background()
         self.refresh()
 
     def _show_folders(self):
@@ -930,8 +972,10 @@ class BookshelfView(QWidget):
         old.deleteLater()
 
         self._grid_widget = QWidget()
-        self._grid_widget.setStyleSheet(f"background: {_BG.name()};")
+        _transparent(self._grid_widget)
         self._scroll.setWidget(self._grid_widget)
+        self._bg_label.stackUnder(self._grid_widget)
+        self._apply_background()
 
         layout = QVBoxLayout(self._grid_widget)
         layout.setContentsMargins(TILE_SPACING, TILE_SPACING, TILE_SPACING, TILE_SPACING)
@@ -993,6 +1037,7 @@ class BookshelfView(QWidget):
                 if row_layout is not None:
                     row_layout.addStretch()
                 row_widget = QWidget()
+                _transparent(row_widget)
                 row_layout = QHBoxLayout(row_widget)
                 row_layout.setContentsMargins(0, 0, 0, TILE_SPACING)
                 row_layout.setSpacing(TILE_SPACING)
@@ -1129,6 +1174,16 @@ class BookshelfView(QWidget):
             if comic and comic.cover_path:
                 menu.addAction("Set as folder cover").triggered.connect(
                     lambda: self._use_comic_as_folder_cover(comic_id)
+                )
+                cover = comic.cover_path
+                menu.addAction("Set as bookshelf background").triggered.connect(
+                    lambda checked=False, cid=comic_id, c=cover: self._set_background(
+                        c, comic_id=cid
+                    )
+                )
+            if self._scope_has_own_background():
+                menu.addAction("Clear bookshelf background").triggered.connect(
+                    lambda: self._clear_background()
                 )
 
         # Shelf actions
@@ -1306,6 +1361,7 @@ class BookshelfView(QWidget):
                 if row_layout is not None:
                     row_layout.addStretch()
                 row_widget = QWidget(self._grid_widget)
+                _transparent(row_widget)
                 row_layout = QHBoxLayout(row_widget)
                 row_layout.setContentsMargins(0, 0, 0, TILE_SPACING)
                 row_layout.setSpacing(TILE_SPACING)
@@ -1590,6 +1646,18 @@ class BookshelfView(QWidget):
             menu.addAction("Reset cover to default").triggered.connect(
                 lambda: self._reset_folder_cover(folder_path)
             )
+        folder_scope = self._folder_menu_background_scope(folder_path)
+        menu.addAction("Set as bookshelf background").triggered.connect(
+            lambda checked=False, fp=folder_path, scope=folder_scope: self._set_background(
+                self._effective_folder_cover(fp),
+                scope,
+                folder_path=fp,
+            )
+        )
+        if self._scope_has_own_background(folder_scope):
+            menu.addAction("Clear bookshelf background").triggered.connect(
+                lambda: self._clear_background(folder_scope)
+            )
         menu.addSeparator()
         menu.addAction("Hide this folder").triggered.connect(
             lambda: self._hide_folder(folder_path)
@@ -1649,6 +1717,7 @@ class BookshelfView(QWidget):
 
         if self._current_folder == folder_path:
             self._current_folder = new_path
+        self._migrate_folder_backgrounds(folder_path, new_path)
         self._nav_transition(self._repopulate)
         self.window().statusBar().showMessage(
             f"Folder renamed to “{Path(new_path).name}”",
@@ -1879,6 +1948,522 @@ class BookshelfView(QWidget):
             self._library.update_metadata(cid, series=None)
         self._clear_selection()
         self._nav_transition(self._repopulate)
+
+    # ----- Per-view bookshelf backgrounds -----
+
+    def _comic_id_from_thumb_path(self, cover_path: str) -> int | None:
+        """Parse a comic id from a cached cover thumbnail filename, if possible."""
+        name = Path(cover_path).name
+        if name.startswith("cover_override_") and name.endswith(".jpg"):
+            stem = name[len("cover_override_") : -4]
+        elif name.endswith(".jpg"):
+            stem = name[:-4]
+        else:
+            return None
+        try:
+            return int(stem)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _thumb_jpeg_bytes(image: QImage) -> bytes:
+        """Match the JPEG bytes ``generate_thumbnail_from_bytes`` would write."""
+        from PyQt6.QtCore import QBuffer, QIODevice
+
+        from thumbnails import THUMB_MAX_HEIGHT, THUMB_MAX_WIDTH, THUMB_QUALITY
+
+        thumb = image.scaled(
+            THUMB_MAX_WIDTH,
+            THUMB_MAX_HEIGHT,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        thumb.save(buf, "JPEG", THUMB_QUALITY)
+        return bytes(buf.data())
+
+    def _find_cover_override_page(self, comic_id: int, thumb_path: str) -> int:
+        """Find which comic page produced a manual cover override thumbnail."""
+        from archive_handler import open_comic
+
+        try:
+            ref = Path(thumb_path).read_bytes()
+        except OSError:
+            return 0
+
+        comic = self._library.get_comic_by_id(comic_id)
+        if comic is None or not Path(comic.file_path).exists():
+            return 0
+
+        try:
+            with open_comic(comic.file_path) as reader:
+                for i in range(reader.page_count()):
+                    page = QImage.fromData(reader.get_page_bytes(i))
+                    if page.isNull():
+                        continue
+                    if self._thumb_jpeg_bytes(page) == ref:
+                        return i
+        except Exception:
+            pass
+        return 0
+
+    def _comic_page_image(
+        self, comic_id: int, page: int = 0, min_long_side: int = 0
+    ) -> QImage | None:
+        from archive_handler import render_page_qimage
+
+        comic = self._library.get_comic_by_id(comic_id)
+        if comic is None or not Path(comic.file_path).exists():
+            return None
+        return render_page_qimage(comic.file_path, page, min_long_side)
+
+    def _parse_bg_entry(self, raw: str) -> dict | None:
+        """Parse a stored background entry — v2 JSON spec or legacy image path."""
+        if not raw:
+            return None
+        if raw.startswith("{"):
+            try:
+                spec = json.loads(raw)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+            if isinstance(spec, dict) and spec.get("v") == 2:
+                return spec
+            return None
+        if Path(raw).exists():
+            return {"v": 1, "path": raw}
+        return None
+
+    @staticmethod
+    def _encode_bg_entry(spec: dict) -> str:
+        if spec.get("v") == 2:
+            return json.dumps(spec, separators=(",", ":"))
+        return spec.get("path", "")
+
+    def _build_bg_spec(
+        self,
+        cover_path: str | None,
+        *,
+        comic_id: int | None = None,
+        folder_path: str | None = None,
+    ) -> dict | None:
+        """Build a v2 background spec that keeps a link back to full-resolution source."""
+        cid = comic_id
+        if cid is None and cover_path:
+            cid = self._comic_id_from_thumb_path(cover_path)
+        if cid is None and folder_path and cover_path:
+            for comic in self._library.get_comics_in_folder(folder_path):
+                if comic.cover_path == cover_path:
+                    cid = comic.id
+                    break
+
+        if cid is not None:
+            page = 0
+            if cover_path and Path(cover_path).name.startswith("cover_override_"):
+                page = self._find_cover_override_page(cid, cover_path)
+            elif cover_path:
+                comic = self._library.get_comic_by_id(cid)
+                if comic and comic.cover_override:
+                    page = self._find_cover_override_page(cid, cover_path)
+            return {"v": 2, "comic_id": cid, "page": page}
+
+        if folder_path and cover_path:
+            img = QImage(cover_path) if Path(cover_path).exists() else QImage()
+            if img.isNull() or max(img.width(), img.height()) < 800:
+                for comic in self._library.get_comics_in_folder(folder_path):
+                    if comic.cover_path:
+                        spec = self._build_bg_spec(
+                            comic.cover_path, comic_id=comic.id, folder_path=folder_path
+                        )
+                        if spec:
+                            return spec
+
+        if cover_path and Path(cover_path).exists():
+            img = QImage(cover_path)
+            if not img.isNull():
+                return {"v": 2, "path": cover_path}
+        return None
+
+    def _folder_path_from_scope_key(self, scope_key: str) -> str | None:
+        if scope_key.startswith("folder:"):
+            return scope_key[len("folder:"):]
+        if "+folder:" in scope_key:
+            return scope_key.split("+folder:", 1)[1]
+        return None
+
+    def _normalize_bg_entry(self, raw: str, scope_key: str = "") -> str | None:
+        """Upgrade legacy thumbnail paths to v2 specs that render from full comic pages."""
+        spec = self._parse_bg_entry(raw)
+        if spec is None:
+            return None
+        if spec.get("v") == 2:
+            if self._source_image_from_spec(spec) is not None:
+                return self._encode_bg_entry(spec)
+            return None
+
+        path = spec.get("path", "")
+        if not path:
+            return None
+
+        upgraded = self._build_bg_spec(
+            path, folder_path=self._folder_path_from_scope_key(scope_key)
+        )
+        if upgraded and self._source_image_from_spec(upgraded) is not None:
+            return self._encode_bg_entry(upgraded)
+        if Path(path).exists():
+            fallback = {"v": 2, "path": path}
+            if self._source_image_from_spec(fallback) is not None:
+                return self._encode_bg_entry(fallback)
+        return None
+
+    def _source_image_from_spec(
+        self, spec: dict | None, min_long_side: int = 0
+    ) -> QImage | None:
+        """Load the full-resolution source image for a background spec."""
+        if not spec:
+            return None
+        img: QImage | None = None
+        if spec.get("v") == 2:
+            if "comic_id" in spec:
+                img = self._comic_page_image(
+                    spec["comic_id"], spec.get("page", 0), min_long_side
+                )
+            else:
+                path = spec.get("path")
+                if path and Path(path).exists():
+                    loaded = QImage(path)
+                    img = loaded if not loaded.isNull() else None
+                    if img is not None and min_long_side > 0:
+                        from archive_handler import _scale_qimage_min_long_side
+                        img = _scale_qimage_min_long_side(img, min_long_side)
+        else:
+            path = spec.get("path")
+            if path and Path(path).exists():
+                loaded = QImage(path)
+                img = loaded if not loaded.isNull() else None
+        if img is None or max(img.width(), img.height()) < 200:
+            return None
+        return img
+
+    def _migrate_all_background_entries(self) -> None:
+        """Upgrade every saved background from low-res thumbnails to v2 comic-linked specs."""
+        data = self._load_background_map()
+        if not data:
+            return
+        changed = False
+        new_data: dict[str, str] = {}
+        for key, raw in data.items():
+            if isinstance(raw, str) and raw.startswith('{"v":2'):
+                spec = self._parse_bg_entry(raw)
+                if spec and self._source_image_from_spec(spec) is not None:
+                    new_data[key] = raw
+                else:
+                    changed = True
+                continue
+            normalized = self._normalize_bg_entry(raw, key)
+            if normalized:
+                new_data[key] = normalized
+                if normalized != raw:
+                    changed = True
+            else:
+                changed = True
+        if changed or len(new_data) != len(data):
+            self._save_background_map(new_data)
+
+    def _effective_folder_cover(self, folder_path: str) -> str | None:
+        """The cover image a folder shows — its override, else its first comic's cover."""
+        cover = self._library.get_folder_cover(folder_path)
+        if cover:
+            return cover
+        for c in self._library.get_comics_in_folder(folder_path):
+            if c.cover_path:
+                return c.cover_path
+        return None
+
+    def _current_scope_parts(self) -> list:
+        """Identify the bookshelf view the user is looking at right now."""
+        if self._queue_mode:
+            return ["queue"]
+        if self._show_hidden_mode:
+            return ["hidden"]
+        if self._current_shelf_id is not None:
+            if self._current_folder is not None:
+                return ["shelf", self._current_shelf_id, "folder", self._current_folder]
+            return ["shelf", self._current_shelf_id]
+        if self._current_folder is not None:
+            return ["folder", self._current_folder]
+        return ["library"]
+
+    def _folder_menu_background_scope(self, folder_path: str) -> list:
+        """Scope targeted by a folder tile's background menu."""
+        if self._current_shelf_id is not None and self._current_folder is None:
+            # Folder tile on a shelf grid → background for the whole shelf.
+            return ["shelf", self._current_shelf_id]
+        if self._current_shelf_id is not None:
+            return ["shelf", self._current_shelf_id, "folder", folder_path]
+        # Library folder tile → background shown when that folder is opened.
+        return ["folder", folder_path]
+
+    def _scope_map_key(self, parts: list) -> str:
+        """Flat map key — folder paths stay in the value, never in QSettings key names."""
+        if parts[0] == "library":
+            return "library"
+        if parts[0] == "queue":
+            return "queue"
+        if parts[0] == "hidden":
+            return "hidden"
+        if parts[0] == "folder":
+            return f"folder:{parts[1]}"
+        if parts[0] == "shelf" and len(parts) == 2:
+            return f"shelf:{parts[1]}"
+        if parts[0] == "shelf" and len(parts) == 4 and parts[2] == "folder":
+            return f"shelf:{parts[1]}+folder:{parts[3]}"
+        return json.dumps(parts, separators=(",", ":"))
+
+    def _scope_label(self, parts: list) -> str:
+        if parts[0] == "library":
+            return "Library"
+        if parts[0] == "queue":
+            return "Reading Queue"
+        if parts[0] == "hidden":
+            return "Hidden"
+        if parts[0] == "folder":
+            return Path(parts[1]).name
+        if parts[0] == "shelf" and len(parts) == 2:
+            for shelf in self._library.get_shelves():
+                if shelf.id == parts[1]:
+                    return shelf.name
+            return "Shelf"
+        if parts[0] == "shelf" and len(parts) == 4 and parts[2] == "folder":
+            return Path(parts[3]).name
+        return "view"
+
+    def _load_background_map(self) -> dict[str, str]:
+        try:
+            settings = app_settings()
+            raw = settings.value(_BG_MAP_KEY) or settings.value("bookshelf.background_map")
+            if isinstance(raw, str) and raw:
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    return {
+                        k: v for k, v in data.items()
+                        if isinstance(k, str) and isinstance(v, str)
+                    }
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return {}
+
+    def _save_background_map(self, data: dict[str, str]) -> None:
+        settings = app_settings()
+        settings.setValue(_BG_MAP_KEY, json.dumps(data, separators=(",", ":")))
+        settings.sync()
+
+    def _background_scope_fallbacks(self, parts: list) -> list[list]:
+        """Try the current view first, then parent views (shelf → library)."""
+        chain: list[list] = [parts]
+        if parts[0] == "shelf" and len(parts) == 4 and parts[2] == "folder":
+            chain.append(["shelf", parts[1]])
+        if parts[0] in ("shelf", "folder"):
+            chain.append(["library"])
+        seen: set[str] = set()
+        result: list[list] = []
+        for candidate in chain:
+            key = self._scope_map_key(candidate)
+            if key not in seen:
+                seen.add(key)
+                result.append(candidate)
+        return result
+
+    def _read_background_spec_for_parts(self, parts: list) -> dict | None:
+        try:
+            stored = self._load_background_map().get(self._scope_map_key(parts))
+        except Exception:
+            return None
+        if not isinstance(stored, str) or not stored:
+            return None
+        spec = self._parse_bg_entry(stored)
+        if spec is None or self._source_image_from_spec(spec) is None:
+            return None
+        return spec
+
+    def _read_background_for_scope(self, parts: list) -> dict | None:
+        for candidate in self._background_scope_fallbacks(parts):
+            spec = self._read_background_spec_for_parts(candidate)
+            if spec is not None:
+                return spec
+        return None
+
+    def _scope_has_own_background(self, parts: list | None = None) -> bool:
+        parts = parts if parts is not None else self._current_scope_parts()
+        return self._read_background_spec_for_parts(parts) is not None
+
+    def _scope_has_background(self, parts: list | None = None) -> bool:
+        parts = parts if parts is not None else self._current_scope_parts()
+        return self._read_background_for_scope(parts) is not None
+
+    def _maybe_migrate_background_storage(self) -> None:
+        """Move old background settings into the map and delete broken per-key entries."""
+        settings = app_settings()
+        data = self._load_background_map()
+        changed = False
+
+        legacy = settings.value(_BG_LEGACY_KEY)
+        if isinstance(legacy, str) and legacy and "library" not in data:
+            data["library"] = legacy
+            settings.remove(_BG_LEGACY_KEY)
+            changed = True
+
+        # Prior per-scope format that was safe for library but broke once folder paths
+        # were embedded in QSettings key names (slashes confuse macOS plist nesting).
+        old_library = settings.value(f'{_BG_OLD_GROUP}/["library"]')
+        if isinstance(old_library, str) and old_library and "library" not in data:
+            data["library"] = old_library
+            changed = True
+
+        # Always delete the old storage shapes — folder paths in key names broke macOS plists.
+        settings.remove(_BG_LEGACY_KEY)
+        settings.remove(_BG_OLD_GROUP)
+
+        if changed:
+            self._save_background_map(data)
+
+    def _migrate_folder_backgrounds(self, old_path: str, new_path: str) -> None:
+        data = self._load_background_map()
+        changed = False
+        pairs = [(f"folder:{old_path}", f"folder:{new_path}")]
+        for shelf in self._library.get_shelves():
+            pairs.append((
+                f"shelf:{shelf.id}+folder:{old_path}",
+                f"shelf:{shelf.id}+folder:{new_path}",
+            ))
+        for old_key, new_key in pairs:
+            if old_key in data:
+                data[new_key] = data.pop(old_key)
+                changed = True
+        if changed:
+            self._save_background_map(data)
+
+    def _switch_background(self) -> None:
+        """Load the background saved for the current shelf/folder/library view."""
+        try:
+            self._bg_spec = self._read_background_for_scope(self._current_scope_parts())
+        except Exception:
+            self._bg_spec = None
+        self._apply_background()
+
+    def _set_background(
+        self,
+        cover_path: str | None,
+        parts: list | None = None,
+        *,
+        comic_id: int | None = None,
+        folder_path: str | None = None,
+    ) -> None:
+        parts = parts if parts is not None else self._current_scope_parts()
+        scope_key = self._scope_map_key(parts)
+        spec = self._build_bg_spec(
+            cover_path,
+            comic_id=comic_id,
+            folder_path=folder_path,
+        )
+        if spec is None or self._source_image_from_spec(spec) is None:
+            QMessageBox.information(
+                self, "Set Bookshelf Background",
+                "There's no cover image available to use as a background yet.",
+            )
+            return
+
+        data = self._load_background_map()
+        data[scope_key] = self._encode_bg_entry(spec)
+        self._save_background_map(data)
+        label = self._scope_label(parts)
+        if parts == self._current_scope_parts():
+            self._bg_spec = spec
+            self._apply_background()
+        self.window().statusBar().showMessage(f"Background set for {label}", 4000)
+
+    def _clear_background(self, parts: list | None = None) -> None:
+        parts = parts if parts is not None else self._current_scope_parts()
+        data = self._load_background_map()
+        data.pop(self._scope_map_key(parts), None)
+        self._save_background_map(data)
+        label = self._scope_label(parts)
+        if parts == self._current_scope_parts():
+            self._bg_spec = None
+            self._bg_label.hide()
+        self.window().statusBar().showMessage(f"Background cleared for {label}", 4000)
+
+    def _build_background_pixmap(self, w: int, h: int) -> QPixmap | None:
+        """Cover w×h with the source at a capped zoom (sharp), then mute it with a tint."""
+        # Load the source at native resolution so we control the zoom ourselves.
+        src = self._source_image_from_spec(self._bg_spec, 0)
+        if src is None:
+            return None
+        sw, sh = src.width(), src.height()
+        if sw <= 0 or sh <= 0:
+            return None
+        # Zoom needed to fully cover the view is max(w/sw, h/sh); cap it so a small
+        # cover is never blown up into a blur. When the cap stops it short of the
+        # edges, the muted backdrop tone fills the margin (set below).
+        scale = min(max(w / sw, h / sh), _BG_MAX_ZOOM)
+        new_w = max(1, int(round(sw * scale)))
+        new_h = max(1, int(round(sh * scale)))
+        scaled = src.scaled(
+            new_w, new_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        # Compose onto a full-view canvas: center the cover (cropping overflow, or
+        # leaving a margin when the cap holds it back), fill the rest with the theme
+        # tone, then dim everything so it sits quietly behind the tiles.
+        pix = QPixmap(w, h)
+        pix.fill(_BG)
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawImage((w - scaled.width()) // 2, (h - scaled.height()) // 2, scaled)
+        overlay = QColor(_BG)
+        overlay.setAlpha(_BG_DIM_ALPHA)
+        painter.fillRect(pix.rect(), overlay)
+        painter.end()
+        return pix
+
+    def _background_device_pixel_ratio(self, vp) -> float:
+        dpr = max(vp.devicePixelRatioF(), self.devicePixelRatioF())
+        window = self.window()
+        if window is not None:
+            dpr = max(dpr, window.devicePixelRatioF())
+            handle = window.windowHandle()
+            if handle is not None:
+                dpr = max(dpr, handle.devicePixelRatio())
+        return dpr if dpr > 0 else 1.0
+
+    def _apply_background(self) -> None:
+        vp = self._scroll.viewport()
+        dpr = self._background_device_pixel_ratio(vp)
+        w = max(1, int(vp.width() * dpr))
+        h = max(1, int(vp.height() * dpr))
+        if not self._bg_spec or vp.width() <= 0 or vp.height() <= 0:
+            self._bg_label.hide()
+            return
+        pix = self._build_background_pixmap(w, h)
+        if pix is None:
+            self._bg_label.hide()
+            return
+        pix.setDevicePixelRatio(dpr)
+        self._bg_label.setGeometry(0, 0, vp.width(), vp.height())
+        self._bg_label.setPixmap(pix)
+        self._bg_label.stackUnder(self._grid_widget)
+        self._bg_label.show()
+        self._bg_label.lower()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_background()
+
+    def eventFilter(self, obj, event):
+        if obj is self._scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._apply_background()
+        return super().eventFilter(obj, event)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

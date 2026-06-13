@@ -25,6 +25,17 @@ def app_icon() -> QIcon | None:
     return None
 
 
+def _activate_macos_app() -> None:
+    if sys.platform != "darwin":
+        return
+    try:
+        from AppKit import NSApplication  # type: ignore[import-untyped]
+
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+    except Exception:
+        pass
+
+
 def main():
     apply_macos_app_name(APP_DISPLAY_NAME)
     app = QApplication(sys.argv)
@@ -50,6 +61,9 @@ def main():
     if icon is not None:
         window.setWindowIcon(icon)
     window.show()
+    window.raise_()
+    window.activateWindow()
+    _activate_macos_app()
 
     # If a file path was passed on the command line, open it
     if len(sys.argv) > 1:

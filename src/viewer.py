@@ -29,7 +29,19 @@ def make_spread_pixmap(page1_bytes: bytes, page2_bytes: bytes, rtl: bool = False
     pix1.loadFromData(page1_bytes)
     pix2 = QPixmap()
     pix2.loadFromData(page2_bytes)
+    return _compose_spread(pix1, pix2, rtl)
 
+
+def make_spread_pixmap_from_images(
+    img1: QImage | None, img2: QImage | None, rtl: bool = False
+) -> QPixmap:
+    """Compose two pre-decoded pages — the slow decode already happened off-thread."""
+    pix1 = QPixmap.fromImage(img1) if img1 is not None and not img1.isNull() else QPixmap()
+    pix2 = QPixmap.fromImage(img2) if img2 is not None and not img2.isNull() else QPixmap()
+    return _compose_spread(pix1, pix2, rtl)
+
+
+def _compose_spread(pix1: QPixmap, pix2: QPixmap, rtl: bool) -> QPixmap:
     if pix1.isNull():
         return pix2
     if pix2.isNull():

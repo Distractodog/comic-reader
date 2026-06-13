@@ -20,6 +20,8 @@ import xml.etree.ElementTree as ET
 import py7zr
 import rarfile
 import fitz  # PyMuPDF
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QImage
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff", ".tif"}
 
@@ -250,11 +252,84 @@ def _pdf_render_matrix(page: fitz.Page, doc: fitz.Document) -> fitz.Matrix:
     return fitz.Matrix(scale, scale)
 
 
+def _pdf_matrix_for_min_long_side(
+    page: fitz.Page, matrix: fitz.Matrix, min_long_side: int
+) -> fitz.Matrix:
+    """Ensure a PDF page renders at least ``min_long_side`` pixels on its long edge."""
+    _MAX_LONG_SIDE = 8192
+    if min_long_side <= 0:
+        return matrix
+    rect = page.rect
+    longest_pt = max(rect.width, rect.height)
+    if longest_pt <= 0:
+        return matrix
+    current_long = longest_pt * matrix.a
+    if current_long >= min_long_side:
+        return matrix
+    scale = min(min_long_side / longest_pt, _MAX_LONG_SIDE / longest_pt)
+    return fitz.Matrix(scale, scale)
+
+
+def _scale_qimage_min_long_side(image: QImage, min_long_side: int) -> QImage:
+    """Upscale an image so its long edge reaches ``min_long_side`` (smooth, last resort)."""
+    w, h = image.width(), image.height()
+    if w <= 0 or h <= 0 or min_long_side <= 0:
+        return image
+    if max(w, h) >= min_long_side:
+        return image
+    if w >= h:
+        new_w = min_long_side
+        new_h = max(1, int(h * min_long_side / w))
+    else:
+        new_h = min_long_side
+        new_w = max(1, int(w * min_long_side / h))
+    return image.scaled(
+        new_w,
+        new_h,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
+def render_page_qimage(
+    file_path: str, page_index: int, min_long_side: int = 0
+) -> QImage | None:
+    """Load one comic page as a QImage, optionally scaling up for large displays."""
+    try:
+        with open_comic(file_path) as reader:
+            total = reader.page_count()
+            if total <= 0:
+                return None
+            page_index = max(0, min(page_index, total - 1))
+            if isinstance(reader, PDFReader):
+                img = reader.render_page_qimage(page_index, min_long_side)
+            else:
+                img = QImage.fromData(reader.get_page_bytes(page_index))
+                if img.isNull():
+                    return None
+                if min_long_side > 0:
+                    img = _scale_qimage_min_long_side(img, min_long_side)
+            return img if img is not None and not img.isNull() else None
+    except Exception:
+        return None
+
+
 class PDFReader(ComicReader):
     def __init__(self, file_path: str):
         super().__init__(file_path)
         self._doc = fitz.open(file_path)
         self.pages = list(range(self._doc.page_count))
+
+    def render_page_qimage(self, index: int, min_long_side: int = 0) -> QImage | None:
+        """Render a PDF page to QImage, optionally targeting a minimum long-edge size."""
+        with self._lock:
+            page = self._doc.load_page(index)
+            matrix = _pdf_render_matrix(page, self._doc)
+            matrix = _pdf_matrix_for_min_long_side(page, matrix, min_long_side)
+            pix = page.get_pixmap(matrix=matrix)
+            data = pix.tobytes("ppm")
+        img = QImage.fromData(data)
+        return img if not img.isNull() else None
 
     def _read_page(self, index: int) -> bytes:
         page = self._doc.load_page(index)

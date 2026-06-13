@@ -6,7 +6,7 @@ import sys
 import time
 from pathlib import Path
 
-from app_info import APP_DISPLAY_NAME
+from app_info import APP_DISPLAY_NAME, app_settings
 
 from PyQt6.QtCore import (
     QEasingCurve,
@@ -20,7 +20,16 @@ from PyQt6.QtCore import (
     Qt,
     pyqtSignal,
 )
-from PyQt6.QtGui import QAction, QFont, QKeySequence
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -43,6 +52,160 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# Minimum time the loading screen stays up. Fast opens are held to this so the
+# screen reads as a deliberate transition (and the reader finishes preparing
+# underneath) instead of an unrecognizable flicker.
+_MIN_LOADING_SCREEN_S = 0.7
+
+
+class _LoadingOverlay(QWidget):
+    """Instant 'opening…' screen: the comic's faded cover plus a spinner.
+
+    Shown over the view stack the moment a comic is clicked, so the app feels
+    responsive while the archive is opened on a background thread.
+    """
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.hide()
+        self._source: QPixmap | None = None
+        self._scaled: QPixmap | None = None
+        self._angle = 0.0  # spinner arc rotation
+        self._spin = QTimer(self)
+        self._spin.setInterval(16)
+        self._spin.timeout.connect(self._tick)
+        # Fade-out used when the real page is ready underneath.
+        self._fx = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._fx)
+        self._fade = QPropertyAnimation(self._fx, b"opacity", self)
+        self._fade.setDuration(220)
+        self._fade.setStartValue(1.0)
+        self._fade.setEndValue(0.0)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade.finished.connect(self._after_fade)
+        # Track the stack's size so the overlay always fills it.
+        parent.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if obj is self.parentWidget() and event.type() == QEvent.Type.Resize and self.isVisible():
+            self.setGeometry(self.parentWidget().rect())
+            self._rescale()
+        return super().eventFilter(obj, event)
+
+    def _tick(self):
+        self._angle = (self._angle + 6.5) % 360  # one full turn ≈ 0.9s
+        self.update()
+
+    def _rescale(self):
+        if self._source is None or self.width() <= 0 or self.height() <= 0:
+            self._scaled = None
+            return
+        self._scaled = self._source.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    def start(self, cover_path: str | None):
+        self._fade.stop()
+        self._fx.setOpacity(1.0)
+        self._source = None
+        if cover_path and Path(cover_path).exists():
+            img = QImage(cover_path)
+            if not img.isNull():
+                # Greyscale so the placeholder reads as "not loaded yet".
+                img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+                self._source = QPixmap.fromImage(img)
+        self.setGeometry(self.parentWidget().rect())
+        self._rescale()
+        self.raise_()
+        self.show()
+        # Paint NOW — queued events (e.g. a fast open finishing) would otherwise
+        # be processed before the paint event and the user would never see this.
+        self.repaint()
+        self._spin.start()
+
+    def finish(self):
+        """Fade out to reveal the loaded page underneath."""
+        if self.isVisible():
+            self._fade.start()
+
+    def stop(self):
+        """Hide immediately (open failed or was superseded)."""
+        self._fade.stop()
+        self._spin.stop()
+        self.hide()
+
+    def _after_fade(self):
+        self._spin.stop()
+        self.hide()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#000000"))  # match the reader background
+        if self._scaled is not None:
+            p.setOpacity(0.14)  # heavily greyed out
+            x = (self.width() - self._scaled.width()) // 2
+            y = (self.height() - self._scaled.height()) // 2
+            p.drawPixmap(x, y, self._scaled)
+            p.setOpacity(1.0)
+        # Single-line spinner: one open arc, smoothly rotating.
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(235, 230, 230, 235), 3.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        r = 24
+        cx, cy = self.width() // 2, self.height() // 2
+        # 100°-long arc; start angle advances each tick (Qt angles are 1/16°).
+        p.drawArc(cx - r, cy - r, 2 * r, 2 * r, int(-self._angle * 16), 100 * 16)
+
+
+class _ComicOpenWorker(QThread):
+    """Opens a comic archive AND decodes the starting page(s) off the GUI thread.
+
+    Decoding is the slow part for big pages, so doing it here keeps the loading
+    screen responsive. Decoded QImages go into the page cache on arrival.
+    """
+
+    # generation, reader (or None), {page_index: QImage}, error text
+    done = pyqtSignal(int, object, object, str)
+
+    def __init__(self, gen: int, path: str, start_page: int, spread: bool,
+                 webtoon: bool, parent=None):
+        super().__init__(parent)
+        self._gen = gen
+        self._path = path
+        self._start_page = start_page
+        self._spread = spread
+        self._webtoon = webtoon
+
+    def run(self):
+        try:
+            reader = open_comic(self._path)
+        except Exception as e:
+            self.done.emit(self._gen, None, {}, str(e))
+            return
+        images: dict[int, QImage] = {}
+        # The webtoon viewer decodes its own pages on a background thread already.
+        if not self._webtoon:
+            try:
+                count = reader.page_count()
+                # Mirror _finish_open_comic's resume logic so the indices match.
+                start = self._start_page if 0 < self._start_page < count else 0
+                if self._spread:
+                    start = (start // 2) * 2
+                pages = (start, start + 1) if self._spread else (start,)
+                for i in pages:
+                    if 0 <= i < count:
+                        img = QImage()
+                        img.loadFromData(reader.get_page_bytes(i))
+                        if not img.isNull():
+                            images[i] = img
+            except Exception:
+                pass  # cache misses fall back to the normal decode path
+        self.done.emit(self._gen, reader, images, "")
+
 
 class _ReaderBar(QWidget):
     """Top bar shown while reading — back, title, fullscreen, and ⋮ menu."""
@@ -282,7 +445,15 @@ from library import Library, ReadingSettings, Shelf
 from library_scanner import SCANNABLE_EXTENSIONS, LibraryScanner
 from preloader import PageCache, PagePreloader
 from stats_dialog import StatsDialog
-from viewer import ComicViewer, FitMode, ReadingMode, SeekBar, ThumbnailStrip, make_spread_pixmap
+from viewer import (
+    ComicViewer,
+    FitMode,
+    ReadingMode,
+    SeekBar,
+    ThumbnailStrip,
+    make_spread_pixmap,
+    make_spread_pixmap_from_images,
+)
 from webtoon_viewer import WebtoonViewer
 import themes
 
@@ -673,7 +844,7 @@ class MainWindow(QMainWindow):
         self._reader: ComicReader | None = None
         self._current_page: int = 0
         self._current_comic_id: int | None = None
-        self._settings = QSettings("ComicReader", "ComicReader")
+        self._settings = app_settings()
         self._library = Library()
         self._sidebar_hidden_nav_ids = self._load_sidebar_hidden_nav_ids()
         valid_nav_ids = {nav_id for nav_id, _ in _SIDEBAR_LIBRARY_NAV} | {
@@ -731,6 +902,15 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self.viewer)           # index 1
         self._stack.addWidget(self._webtoon_viewer)  # index 2
         self._stack.addWidget(self._ebook_viewer)    # index 3 — text ebooks
+
+        # Instant loading screen + background archive opening.
+        self._loading_overlay = _LoadingOverlay(self._stack)
+        self._open_gen = 0
+        self._open_worker: _ComicOpenWorker | None = None
+        self._opening_path: str | None = None
+        self._open_started: float = 0.0
+        self._open_min_elapsed = False
+        self._open_page_ready = False
 
         self._seek_bar = SeekBar()
         self._seek_bar.setVisible(False)
@@ -821,6 +1001,7 @@ class MainWindow(QMainWindow):
         self._reader_bar.menu_requested.connect(self._show_reader_menu)
         self._thumb_strip.page_selected.connect(self.seek_to_page)
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
+        self._webtoon_viewer.start_page_rendered.connect(self._on_webtoon_start_page_rendered)
         self._ebook_viewer.chapter_changed.connect(self._on_ebook_chapter_changed)
         self._ebook_viewer.exit_requested.connect(self._back_to_library)
         self._ebook_viewer.end_reached.connect(self._prompt_continue_after_book)
@@ -1049,6 +1230,9 @@ class MainWindow(QMainWindow):
 
     def _prepare_comics_for_deletion(self, comic_ids: list[int]) -> None:
         """Release open file handles before the bookshelf deletes comics from disk."""
+        # Cancel any comic still opening in the background.
+        self._open_gen += 1
+        self._loading_overlay.stop()
         if self._current_comic_id is None or self._current_comic_id not in comic_ids:
             return
         self._record_reading_session()
@@ -1074,6 +1258,9 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(APP_DISPLAY_NAME)
 
     def _back_to_library(self):
+        # Cancel any comic still opening in the background.
+        self._open_gen += 1
+        self._loading_overlay.stop()
         # Returning to the library is just an in-window view switch — stay in
         # whatever fullscreen state the user chose (Esc still leaves fullscreen).
         if self._webtoon_save_timer.isActive():
@@ -1464,20 +1651,61 @@ class MainWindow(QMainWindow):
             self._thumb_strip.stop()
             if self._reader:
                 self._reader.close()
+                self._reader = None
             if self._ebook is not None:
                 self._settings.setValue("ebook_font_pt", self._ebook_viewer.font_pt())
                 self._ebook.close()
                 self._ebook = None
             self._ebook_mode = False
-            self._reader = open_comic(path)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not open file:\n{e}")
             return
 
-        if self._reader.page_count() == 0:
+        # Show the loading screen immediately — faded cover + spinner — and
+        # open + decode on a background thread so the UI never freezes.
+        comic = self._library.get_comic(path)
+        cover = comic.cover_path if comic is not None else None
+        start_page = 0
+        spread = True  # default for comics not in the library (mirrors below)
+        webtoon = False
+        if comic is not None:
+            start_page = max(0, comic.current_page)
+            rs = self._library.resolve_reading_settings(comic)
+            webtoon = rs.reading_mode == "webtoon"
+            spread = bool(rs.spread) and not webtoon
+        self._open_gen += 1
+        self._opening_path = path
+        self._open_started = time.monotonic()
+        self._loading_overlay.start(cover)
+        worker = _ComicOpenWorker(self._open_gen, path, start_page, spread, webtoon, self)
+        worker.done.connect(self._on_comic_opened)
+        worker.finished.connect(worker.deleteLater)
+        self._open_worker = worker
+        worker.start()
+
+    def _on_comic_opened(self, gen: int, reader, images: dict, error: str) -> None:
+        if gen != self._open_gen:
+            # A newer open (or a cancel) superseded this one — discard it.
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+            return
+        self._open_worker = None
+        if error:
+            self._loading_overlay.stop()
+            QMessageBox.critical(self, "Error", f"Could not open file:\n{error}")
+            return
+        if reader.page_count() == 0:
+            reader.close()
+            self._loading_overlay.stop()
             QMessageBox.warning(self, "Empty", "No pages found in this file.")
             return
+        self._reader = reader
+        self._finish_open_comic(self._opening_path, images)
 
+    def _finish_open_comic(self, path: str, images: dict | None = None) -> None:
         self._settings.setValue("last_dir", str(Path(path).parent))
         title = Path(path).stem
         self.setWindowTitle(f"{APP_DISPLAY_NAME} — {title}")
@@ -1525,6 +1753,10 @@ class MainWindow(QMainWindow):
         self._stop_preloader()
         if not self._webtoon_mode:
             self._cache.clear()
+            # Seed with the page(s) the open worker already decoded off-thread,
+            # so showing the first page below is instant.
+            for idx, img in (images or {}).items():
+                self._cache.put(idx, img)
             self._preloader = PagePreloader(self._reader, self._cache)
             self._preloader.set_center(self._current_page)
             self._preloader.start()
@@ -1547,14 +1779,48 @@ class MainWindow(QMainWindow):
             self._show_current_page()
             target_index = 1
 
-        def do_switch():
-            self._seek_bar.setVisible(True)
-            self._stack.setCurrentIndex(target_index)
-            self._sidebar.hide()
-            self._chrome_hidden = False
-            self._apply_reading_chrome()
+        # The loading overlay already covers the stack — switch underneath it
+        # right away so the reader keeps preparing (webtoon pages decode, the
+        # preloader warms neighbors) while the loading screen is still up.
+        self._seek_bar.setVisible(True)
+        self._stack.setCurrentIndex(target_index)
+        self._sidebar.hide()
+        self._chrome_hidden = False
+        self._apply_reading_chrome()
 
-        QTimer.singleShot(180, lambda: self._fade_switch(do_switch))
+        # Reveal only when BOTH are true: the minimum hold time has passed AND
+        # the starting page is actually rendered. In single/spread mode the page
+        # was just shown synchronously above; in webtoon mode we wait for the
+        # viewer's start_page_rendered signal.
+        gen = self._open_gen
+        self._open_min_elapsed = False
+        self._open_page_ready = not self._webtoon_mode
+
+        elapsed = time.monotonic() - self._open_started
+        delay_ms = max(0, int((_MIN_LOADING_SCREEN_S - elapsed) * 1000))
+
+        def min_hold_done():
+            if gen == self._open_gen:
+                self._open_min_elapsed = True
+                self._maybe_reveal()
+
+        QTimer.singleShot(delay_ms, min_hold_done)
+
+        # Failsafe: never leave the loading screen stuck (e.g. a webtoon page
+        # that fails to decode) — force the reveal after 10s.
+        def failsafe():
+            if gen == self._open_gen:
+                self._loading_overlay.finish()
+
+        QTimer.singleShot(10000, failsafe)
+
+    def _on_webtoon_start_page_rendered(self) -> None:
+        self._open_page_ready = True
+        self._maybe_reveal()
+
+    def _maybe_reveal(self) -> None:
+        if self._open_min_elapsed and self._open_page_ready:
+            self._loading_overlay.finish()
 
     def _load_ebook(self, path: str):
         """Open a text/novel EPUB in the dedicated ebook reader."""
@@ -1659,14 +1925,20 @@ class MainWindow(QMainWindow):
         page_count = self._reader.page_count()
         p1 = self._current_page
         p2 = p1 + 1
-        data1 = self._reader.get_page_bytes(p1)
-        data2 = self._reader.get_page_bytes(p2) if p2 < page_count else None
-        if data2 is not None:
-            pixmap = make_spread_pixmap(data1, data2, self._is_manga)
+        has_p2 = p2 < page_count
+        img1 = self._cache.get(p1)
+        img2 = self._cache.get(p2) if has_p2 else None
+        if img1 is not None and (not has_p2 or img2 is not None):
+            # Both pages already decoded (open worker or preloader) — cheap path.
+            pixmap = make_spread_pixmap_from_images(img1, img2, self._is_manga)
         else:
-            from PyQt6.QtGui import QPixmap
-            pixmap = QPixmap()
-            pixmap.loadFromData(data1)
+            data1 = self._reader.get_page_bytes(p1)
+            data2 = self._reader.get_page_bytes(p2) if has_p2 else None
+            if data2 is not None:
+                pixmap = make_spread_pixmap(data1, data2, self._is_manga)
+            else:
+                pixmap = QPixmap()
+                pixmap.loadFromData(data1)
         self.viewer.set_image_pixmap(pixmap, direction)
         pair_count = (page_count + 1) // 2
         pair_index = p1 // 2
@@ -2056,6 +2328,23 @@ class MainWindow(QMainWindow):
         geom = self._settings.value("geometry")
         if geom:
             self.restoreGeometry(geom)
+        # Saved geometry can land the window off-screen after a display change,
+        # which looks like the app never opened (Dock keeps bouncing).
+        screens = QApplication.screens()
+        if screens:
+            frame = self.frameGeometry()
+            on_screen = any(
+                s.availableGeometry().intersects(frame) for s in screens
+            )
+            if not on_screen:
+                sg = QApplication.primaryScreen().availableGeometry()
+                w = max(self.width(), 800)
+                h = max(self.height(), 600)
+                self.resize(w, h)
+                self.move(
+                    sg.x() + max(0, (sg.width() - w) // 2),
+                    sg.y() + max(0, (sg.height() - h) // 2),
+                )
 
     def changeEvent(self, event):
         super().changeEvent(event)

@@ -48,6 +48,7 @@ class WebtoonViewer(QScrollArea):
 
     page_changed = pyqtSignal(int)  # current page at viewport center
     mouse_moved = pyqtSignal(int)   # viewport y — for fullscreen bar reveal
+    start_page_rendered = pyqtSignal()  # the page load_comic targeted is on screen
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -77,6 +78,7 @@ class WebtoonViewer(QScrollArea):
         self._page_count = 0
         self._current_page = 0
         self._last_emitted = -1
+        self._pending_start: int | None = None
 
         # Generation counter: stale loader signals are dropped without blocking
         self._loader: _PageLoader | None = None
@@ -120,6 +122,11 @@ class WebtoonViewer(QScrollArea):
         self._abort_loader()
         self._reader = reader
         self._page_count = reader.page_count()
+        # Watched by the main window's loading screen: reveal once this page
+        # is actually rendered, not merely once the archive is open.
+        self._pending_start: int | None = (
+            min(max(start_page, 0), self._page_count - 1) if self._page_count > 0 else None
+        )
         self._loaded.clear()
         self._loading.clear()
         self._originals.clear()
@@ -287,6 +294,12 @@ class WebtoonViewer(QScrollArea):
             self._rebuild_tops(first_changed)
         finally:
             self._content.setUpdatesEnabled(True)
+
+        if self._pending_start is not None and any(
+            index == self._pending_start for index, _ in queue
+        ):
+            self._pending_start = None
+            self.start_page_rendered.emit()
 
     def _render(self, index: int) -> None:
         img = self._originals.get(index)
