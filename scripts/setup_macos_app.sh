@@ -94,6 +94,9 @@ codesign --force --deep --sign - --entitlements "$ENTITLEMENTS" "$APP" 2>/dev/nu
 
 echo "Built ${APP}"
 echo ""
-echo "Code changes: edit files in src/, then run: bash scripts/setup_macos_app.sh"
+echo "When launched from this repo folder, Cover 2.0.app runs your LIVE src/ and"
+echo "venv directly — edit files in src/ and just relaunch; no re-sync needed."
+echo "Re-run this script only after: changing the launcher/icon/Info.plist, or to"
+echo "refresh the bundled fallback copy used if the .app is moved out standalone."
 echo "First launch: right-click Cover 2.0.app → Open → Open."
 echo "Backup launcher: double-click Launch Cover 2.0.command"

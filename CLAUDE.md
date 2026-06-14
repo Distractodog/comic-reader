@@ -4,6 +4,13 @@
 
 A standalone Windows desktop comic book reader app. Single-window app that opens comic archive files and displays the pages with navigation/zoom, backed by a local SQLite library with a folder-based bookshelf UI.
 
+## At the start of every session (read first)
+
+Before doing any work on this project:
+
+1. **Read the Documents CLAUDE.md** at `/Users/ethanbristol/Documents/CLAUDE.md` — it holds the session-time-tracking and "compile to Obsidian" rules that apply to all work in Documents.
+2. **Read all related Obsidian notes.** The vault is at `/Users/ethanbristol/Documents/Obsidian Vault`. Search it for comic-reader / Cover 2.0 notes (e.g. glob `*omic*` and `*Cover 2*`) and read the relevant ones — at minimum the roadmap note and the most recent sessions — so you pick up the current state, recent decisions, and gotchas before touching code. Note that this app is also referred to as **"Cover 2.0"** in newer notes.
+
 ## User context (important)
 
 - **User does not write code.** Surface-level Python familiarity only. Claude does ALL the building. Explain what's happening in plain language; do not ask the user to write or edit code themselves.

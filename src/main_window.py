@@ -13,6 +13,7 @@ from PyQt6.QtCore import (
     QEvent,
     QParallelAnimationGroup,
     QPoint,
+    QPointF,
     QPropertyAnimation,
     QSettings,
     QThread,
@@ -24,9 +25,11 @@ from PyQt6.QtGui import (
     QAction,
     QColor,
     QFont,
+    QFontMetrics,
     QImage,
     QKeySequence,
     QPainter,
+    QPainterPath,
     QPen,
     QPixmap,
 )
@@ -41,6 +44,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -458,359 +462,277 @@ from webtoon_viewer import WebtoonViewer
 import themes
 
 
-class _Sidebar(QWidget):
-    """Left sidebar — action buttons + library/shelf navigation list."""
+class _RailButton(QPushButton):
+    """Sidebar button that paints its icon centered by ink, not glyph advance.
 
-    show_folders_clicked = pyqtSignal()
-    show_queue_clicked = pyqtSignal()
-    show_hidden_clicked = pyqtSignal()
-    show_shelf_clicked = pyqtSignal(int, str)   # shelf_id, shelf_name
-    add_folder_clicked = pyqtSignal()
-    rescan_clicked = pyqtSignal()
-    new_shelf_clicked = pyqtSignal()
-    rename_shelf_requested = pyqtSignal(int, str)  # shelf_id, current_name
-    delete_shelf_requested = pyqtSignal(int)        # shelf_id
-    export_shelf_requested = pyqtSignal(int, str)   # shelf_id, shelf_name
-    back_to_root_clicked = pyqtSignal()
-    hidden_nav_changed = pyqtSignal(object)  # set[int]
+    Centering with text-align/padding depends on each glyph's side-bearing, which
+    differs per glyph and per platform (the 📖 emoji especially). Painting the
+    icon ourselves at its tight-bounding-box center makes every icon line up
+    exactly, on macOS and Windows alike. The rounded background/hover/active still
+    come from the stylesheet (drawn by super().paintEvent).
+    """
+
+    def __init__(self, icon_char: str, label_text: str, kind: str = "glyph", parent=None):
+        super().__init__(parent)
+        self._icon = icon_char
+        self._label = label_text
+        self._kind = kind  # "glyph" (font char) or "book" (vector outline)
+        self._expanded = False
+        self._fg = QColor("#2a1818")
+        self.setFlat(True)
+        self.setText("")  # we draw the glyph ourselves
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._expanded = expanded
+        self.update()
+
+    def set_fg(self, color: str) -> None:
+        self._fg = QColor(color)
+        self.update()
+
+    def _icon_px(self) -> int:
+        return self.font().pixelSize() if self.font().pixelSize() > 0 else 18
+
+    def paintEvent(self, event):
+        super().paintEvent(event)  # stylesheet background / hover / active
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(self._fg)
+        painter.setFont(self.font())
+        fm = QFontMetrics(self.font())
+        h = self.height()
+
+        if self._expanded and self._label:
+            baseline = h / 2 + (fm.ascent() - fm.descent()) / 2
+            if self._kind == "book":
+                self._draw_book(painter, 24, h / 2)
+                painter.setPen(self._fg)
+                painter.drawText(44, int(round(baseline)), self._label)
+            else:
+                painter.drawText(16, int(round(baseline)), f"{self._icon}   {self._label}")
+        else:
+            if self._kind == "book":
+                self._draw_book(painter, self.width() / 2, h / 2)
+            else:
+                tight = fm.tightBoundingRect(self._icon)
+                x = self.width() / 2 - tight.left() - tight.width() / 2
+                baseline = h / 2 - (tight.top() + tight.height() / 2)
+                painter.drawText(int(round(x)), int(round(baseline)), self._icon)
+        painter.end()
+
+    def _draw_book(self, painter: QPainter, cx: float, cy: float) -> None:
+        """Stroke an open-book outline centered at (cx, cy), sized to the icon font."""
+        s = self._icon_px()
+        hw = s * 0.60          # half width
+        hh = s * 0.42          # half height
+        spine_top = QPointF(cx, cy - hh * 0.72)
+        spine_bot = QPointF(cx, cy + hh)
+
+        path = QPainterPath()
+        # left page
+        path.moveTo(spine_top)
+        path.quadTo(cx - hw * 0.5, cy - hh, cx - hw, cy - hh * 0.5)
+        path.lineTo(cx - hw, cy + hh * 0.62)
+        path.quadTo(cx - hw * 0.5, cy + hh * 0.42, spine_bot.x(), spine_bot.y())
+        # right page (mirror)
+        path.moveTo(spine_top)
+        path.quadTo(cx + hw * 0.5, cy - hh, cx + hw, cy - hh * 0.5)
+        path.lineTo(cx + hw, cy + hh * 0.62)
+        path.quadTo(cx + hw * 0.5, cy + hh * 0.42, spine_bot.x(), spine_bot.y())
+        # spine
+        path.moveTo(spine_top)
+        path.lineTo(spine_bot)
+
+        pen = QPen(self._fg)
+        pen.setWidthF(max(1.3, s * 0.085))
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+
+class _Sidebar(QWidget):
+    """Slim icon rail: Library / Currently Reading / Search, expandable with labels.
+
+    The hamburger that toggles the labels lives in the top bar; this rail just
+    shows icons (collapsed) or icons + labels (expanded). Clicking Search reveals
+    a search field right here in the sidebar.
+    """
+
+    home_clicked = pyqtSignal()
+    currently_reading_clicked = pyqtSignal()
+    search_changed = pyqtSignal(str)
+    search_closed = pyqtSignal()
     app_menu_requested = pyqtSignal()
 
-    WIDTH = 180
+    COLLAPSED_W = 60
+    EXPANDED_W = 200
 
-    def __init__(
-        self,
-        library: Library,
-        hidden_nav_ids: set[int] | None = None,
-        *,
-        show_app_menu: bool = False,
-        parent=None,
-    ):
+    def __init__(self, *, show_app_menu: bool = False, parent=None):
         super().__init__(parent)
-        self._library = library
-        self._active_id: int = -1   # -1 = Folders, -2 = Hidden, -3 = Queue, int = shelf id
-        self._shelf_btns: list[tuple[int, QPushButton]] = []
-        self._folders_btn: QPushButton | None = None
-        self._hidden_btn: QPushButton | None = None
-        self._queue_btn: QPushButton | None = None
-        self._hidden_nav_ids: set[int] = set(hidden_nav_ids or ())
         self._theme: dict = themes.DARK
+        self._expanded = False
+        self._active = "library"
+        self._search_active = False
 
-        self.setFixedWidth(self.WIDTH)
+        self.setFixedWidth(self.COLLAPSED_W)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        outer.setContentsMargins(0, 8, 0, 8)
+        outer.setSpacing(2)
 
-        # Top action row
-        top_row = QWidget()
-        top_row.setFixedHeight(56)
-        top_layout = QHBoxLayout(top_row)
-        top_layout.setContentsMargins(4, 0, 4, 0)
-        top_layout.setSpacing(0)
+        # Hamburger lives at the top of the rail and toggles the labels.
+        self._btn_hamburger = self._make_item("☰", "")
+        self._btn_hamburger.setToolTip("Show/hide labels")
+        self._btn_hamburger.clicked.connect(self.toggle_expanded)
+        outer.addWidget(self._btn_hamburger)
 
+        self._btn_home = self._make_item("⌂", "Library")
+        self._btn_home.clicked.connect(self._on_home)
+        outer.addWidget(self._btn_home)
+
+        self._btn_reading = self._make_item("📖", "Currently Reading", kind="book")
+        self._btn_reading.clicked.connect(self._on_reading)
+        outer.addWidget(self._btn_reading)
+
+        self._btn_search = self._make_item("⌕", "Search")
+        self._btn_search.clicked.connect(self._on_search)
+        outer.addWidget(self._btn_search)
+
+        # Search field — hidden until Search is clicked.
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText("Search…")
+        self._search_input.setClearButtonEnabled(True)
+        self._search_input.textChanged.connect(self.search_changed)
+        self._search_input.installEventFilter(self)
+        self._search_input.hide()
+        outer.addWidget(self._search_input)
+
+        outer.addStretch(1)
+
+        # Optional app menu (non-macOS only) at the bottom of the rail.
         self._btn_menu: QPushButton | None = None
         if show_app_menu:
-            self._btn_menu = QPushButton("☰")
-            self._btn_menu.setFixedSize(44, 56)
-            self._btn_menu.setFlat(True)
-            self._btn_menu.setToolTip("App menu")
+            self._btn_menu = self._make_item("≡", "Menu")
             self._btn_menu.clicked.connect(self.app_menu_requested.emit)
-            top_layout.addWidget(self._btn_menu)
+            outer.addWidget(self._btn_menu)
 
-        self._btn_back = QPushButton("←")
-        self._btn_back.setFixedSize(44, 56)
-        self._btn_back.setFlat(True)
-        self._btn_back.setToolTip("Back to folder list")
-        self._btn_back.clicked.connect(self.back_to_root_clicked)
-        self._btn_back.hide()
-        top_layout.addWidget(self._btn_back)
-        top_layout.addStretch()
+        self._nav_items = [self._btn_home, self._btn_reading, self._btn_search]
+        self._all_buttons = [self._btn_hamburger, *self._nav_items]
+        if self._btn_menu is not None:
+            self._all_buttons.append(self._btn_menu)
+        self._refresh_text()
+        self._apply_styles()
 
-        self._btn_rescan = QPushButton("↻")
-        self._btn_rescan.setFixedSize(44, 56)
-        self._btn_rescan.setFlat(True)
-        self._btn_rescan.setToolTip("Refresh library — rescan all folders for new comics")
-        self._btn_rescan.clicked.connect(self.rescan_clicked.emit)
-        top_layout.addWidget(self._btn_rescan)
+    # ----- item construction -----
 
-        self._btn_add = QPushButton("+")
-        self._btn_add.setFixedSize(44, 56)
-        self._btn_add.setFlat(True)
-        self._btn_add.setToolTip("Add Folder to Library (Ctrl+L)")
-        self._btn_add.clicked.connect(self.add_folder_clicked)
-        top_layout.addWidget(self._btn_add)
-
-        outer.addWidget(top_row)
-
-        # Scrollable shelf list
-        self._scroll = QScrollArea()
-        self._scroll.setWidgetResizable(True)
-        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
-        outer.addWidget(self._scroll, stretch=1)
-
-        self._list_widget = QWidget()
-        self._list_layout = QVBoxLayout(self._list_widget)
-        self._list_layout.setContentsMargins(0, 4, 0, 4)
-        self._list_layout.setSpacing(0)
-        self._scroll.setWidget(self._list_widget)
-
-        self._new_shelf_btn = QPushButton("  + New Shelf")
-        self._new_shelf_btn.setFlat(True)
-        self._new_shelf_btn.clicked.connect(self.new_shelf_clicked)
-
-        footer = QWidget()
-        footer_layout = QVBoxLayout(footer)
-        footer_layout.setContentsMargins(6, 4, 6, 8)
-        footer_layout.setSpacing(0)
-        self._hide_nav_btn = QPushButton("Hide items…")
-        self._hide_nav_btn.setFlat(True)
-        self._hide_nav_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._hide_nav_btn.clicked.connect(self._open_hide_nav_dialog)
-        footer_layout.addWidget(self._hide_nav_btn)
-        outer.addWidget(footer)
-
-        self._build_list()
-        self._apply_btn_styles()
-
-    # ----- Internal builders -----
-
-    def _section_label(self, text: str) -> QLabel:
-        lbl = QLabel(text)
-        lbl.setStyleSheet(
-            "QLabel { color: rgba(255,255,255,0.30); font-size: 10px;"
-            " letter-spacing: 1px; padding: 10px 12px 2px; background: transparent; }"
-        )
-        return lbl
-
-    def _nav_btn(self, text: str) -> QPushButton:
-        btn = QPushButton(text)
-        btn.setFlat(True)
-        btn.setCheckable(True)
-        btn.setStyleSheet(self._nav_btn_css())
+    def _make_item(self, icon: str, label: str, kind: str = "glyph") -> _RailButton:
+        btn = _RailButton(icon, label, kind=kind)
+        if label:
+            btn.setToolTip(label)
+        btn.setFixedHeight(48)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
         return btn
 
-    def _nav_btn_css(self) -> str:
-        c = self._theme
-        return (
-            f"QPushButton {{ text-align: left; padding: 5px 14px; border: none;"
-            f" background: transparent; color: {c['text']}; font-size: 13px;"
-            f" font-family: 'Libre Baskerville'; border-radius: 4px; margin: 1px 6px; }}"
-            f"QPushButton:hover {{ background: rgba(255,255,255,0.07); }}"
-            f"QPushButton:checked {{ background: rgba(255,255,255,0.13); }}"
-        )
+    def _refresh_text(self) -> None:
+        expanded = self._expanded or self._search_active
+        for btn in self._all_buttons:
+            btn.set_expanded(expanded)
 
-    def _build_list(self):
-        while self._list_layout.count():
-            item = self._list_layout.takeAt(0)
-            widget = item.widget()
-            if widget and widget is not self._new_shelf_btn:
-                widget.deleteLater()
-        self._shelf_btns.clear()
-        self._folders_btn = None
-        self._hidden_btn = None
-        self._queue_btn = None
+    # ----- expand / collapse -----
 
-        library_items = [
-            (nav_id, label) for nav_id, label in _SIDEBAR_LIBRARY_NAV
-            if nav_id not in self._hidden_nav_ids
-        ]
-        if library_items:
-            self._list_layout.addWidget(self._section_label("LIBRARY"))
-            for nav_id, label in library_items:
-                btn = self._nav_btn(f"  {label}")
-                btn.setChecked(self._active_id == nav_id)
-                if nav_id == -1:
-                    btn.clicked.connect(self._on_folders_clicked)
-                    self._folders_btn = btn
-                elif nav_id == -3:
-                    btn.clicked.connect(self._on_queue_clicked)
-                    self._queue_btn = btn
-                else:
-                    btn.clicked.connect(self._on_hidden_clicked)
-                    self._hidden_btn = btn
-                self._list_layout.addWidget(btn)
+    def toggle_expanded(self) -> None:
+        self.set_expanded(not self._expanded)
 
-        shelves = self._library.get_shelves()
-        visible = [s for s in shelves if s.id not in self._hidden_nav_ids]
-        smart = [s for s in visible if s.kind == "smart"]
-        manual = [s for s in visible if s.kind == "manual"]
+    def set_expanded(self, expanded: bool) -> None:
+        self._expanded = expanded
+        want = expanded or self._search_active
+        self.setFixedWidth(self.EXPANDED_W if want else self.COLLAPSED_W)
+        self._refresh_text()
+        self._apply_styles()
+        self._search_input.setVisible(self._search_active and want)
 
-        if visible:
-            self._list_layout.addWidget(self._section_label("SHELVES"))
+    # ----- slots -----
 
-        for shelf in smart:
-            btn = self._nav_btn(f"  {shelf.name}")
-            btn.setChecked(self._active_id == shelf.id)
-            sid, sname = shelf.id, shelf.name
-            btn.clicked.connect(lambda checked, s=sid, n=sname: self._on_shelf_clicked(s, n))
-            self._shelf_btns.append((shelf.id, btn))
-            self._list_layout.addWidget(btn)
+    def _on_home(self):
+        self._close_search_input()
+        self.set_active("library")
+        self.home_clicked.emit()
 
-        if manual:
-            div = QFrame()
-            div.setFrameShape(QFrame.Shape.HLine)
-            div.setStyleSheet("QFrame { color: rgba(255,255,255,0.10); margin: 4px 12px; }")
-            self._list_layout.addWidget(div)
+    def _on_reading(self):
+        self._close_search_input()
+        self.set_active("currently_reading")
+        self.currently_reading_clicked.emit()
 
-            for shelf in manual:
-                btn = self._nav_btn(f"  {shelf.name}")
-                btn.setChecked(self._active_id == shelf.id)
-                sid, sname = shelf.id, shelf.name
-                btn.clicked.connect(lambda checked, s=sid, n=sname: self._on_shelf_clicked(s, n))
-                btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-                btn.customContextMenuRequested.connect(
-                    lambda pos, s=sid, n=sname, b=btn: self._on_shelf_right_click(s, n, b.mapToGlobal(pos))
-                )
-                self._shelf_btns.append((shelf.id, btn))
-                self._list_layout.addWidget(btn)
+    def _on_search(self):
+        self._search_active = True
+        self.set_expanded(True)
+        self._search_input.show()
+        self._search_input.setFocus()
 
-        self._list_layout.addStretch(1)
-        self._list_layout.addWidget(self._new_shelf_btn)
-
-    def _apply_btn_styles(self):
-        c = self._theme
-        btn_css = (
-            f"QPushButton {{ background: transparent; color: {c['btn_color']}; border: none;"
-            f" border-radius: 4px; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }}"
-            f"QPushButton:hover {{ color: {c['btn_hover_color']}; background: {c['btn_hover_bg']}; }}"
-            f"QPushButton:pressed {{ color: {c['btn_pressed']}; }}"
-            f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
-        )
-        add_css = (
-            f"QPushButton {{ background: transparent; color: {c['btn_color']}; border: none;"
-            f" border-radius: 4px; font-size: 20px; font-family: 'Libre Baskerville'; padding: 0; }}"
-            f"QPushButton:hover {{ color: {c['btn_hover_color']}; background: {c['btn_hover_bg']};"
-            f" border: 1px solid white; }}"
-            f"QPushButton:pressed {{ color: {c['btn_pressed']}; }}"
-            f"QPushButton:disabled {{ color: {c['btn_disabled']}; }}"
-        )
-        self._btn_back.setStyleSheet(btn_css)
-        if self._btn_menu is not None:
-            self._btn_menu.setStyleSheet(btn_css)
-        self._btn_rescan.setStyleSheet(btn_css)
-        self._btn_add.setStyleSheet(add_css)
-        new_shelf_css = (
-            "QPushButton { text-align: left; padding: 8px 14px; border: none;"
-            " background: transparent; color: rgba(255,255,255,0.40); font-size: 12px;"
-            " font-family: 'Libre Baskerville'; border-radius: 4px; margin: 1px 6px; }"
-            "QPushButton:hover { color: rgba(255,255,255,0.80); background: rgba(255,255,255,0.07); }"
-        )
-        self._new_shelf_btn.setStyleSheet(new_shelf_css)
-        self._hide_nav_btn.setStyleSheet(
-            f"QPushButton {{ text-align: left; padding: 6px 10px; border: 1px solid {c['border']};"
-            f" border-radius: 4px; background: {c['app_bg']}; color: {c['text_secondary']};"
-            f" font-size: 11px; font-family: 'Libre Baskerville'; }}"
-            f"QPushButton:hover {{ background: {c['hover_bg']}; color: {c['text']}; }}"
-            f"QPushButton:pressed {{ background: {c['border']}; }}"
-        )
-
-    # ----- Slots -----
-
-    def _on_folders_clicked(self):
-        self.set_active(-1)
-        self.show_folders_clicked.emit()
-
-    def _on_queue_clicked(self):
-        self.set_active(-3)
-        self.show_queue_clicked.emit()
-
-    def _on_hidden_clicked(self):
-        self.set_active(-2)
-        self.show_hidden_clicked.emit()
-
-    def _on_shelf_clicked(self, shelf_id: int, shelf_name: str):
-        self.set_active(shelf_id)
-        self.show_shelf_clicked.emit(shelf_id, shelf_name)
-
-    def _on_shelf_right_click(self, shelf_id: int, shelf_name: str, pos):
-        menu = QMenu(self)
-        rename_action = menu.addAction("Rename…")
-        export_action = menu.addAction("Export shelf…")
-        menu.addSeparator()
-        delete_action = menu.addAction("Delete shelf")
-        action = menu.exec(pos)
-        if action == rename_action:
-            self.rename_shelf_requested.emit(shelf_id, shelf_name)
-        elif action == export_action:
-            self.export_shelf_requested.emit(shelf_id, shelf_name)
-        elif action == delete_action:
-            self.delete_shelf_requested.emit(shelf_id)
-
-    def _open_hide_nav_dialog(self):
-        dlg = _HideSidebarDialog(
-            list(_SIDEBAR_LIBRARY_NAV),
-            self._library.get_shelves(),
-            self._hidden_nav_ids,
-            self,
-        )
-        dlg.apply_theme(self._theme)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+    def _close_search_input(self):
+        if not self._search_active:
             return
-        self.set_hidden_nav_ids(dlg.hidden_ids())
+        self._search_active = False
+        self._search_input.blockSignals(True)
+        self._search_input.clear()
+        self._search_input.blockSignals(False)
+        self._search_input.hide()
+        self.search_closed.emit()
+        self.set_expanded(self._expanded)
 
-    def _valid_nav_ids(self) -> set[int]:
-        return {nav_id for nav_id, _ in _SIDEBAR_LIBRARY_NAV} | {
-            s.id for s in self._library.get_shelves()
-        }
+    def eventFilter(self, obj, event):
+        if obj is self._search_input and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                self._close_search_input()
+                return True
+        return super().eventFilter(obj, event)
 
-    def _go_to_first_visible(self):
-        for nav_id, _ in _SIDEBAR_LIBRARY_NAV:
-            if nav_id not in self._hidden_nav_ids:
-                if nav_id == -1:
-                    self._on_folders_clicked()
-                elif nav_id == -3:
-                    self._on_queue_clicked()
-                else:
-                    self._on_hidden_clicked()
-                return
-        for shelf in self._library.get_shelves():
-            if shelf.id not in self._hidden_nav_ids:
-                self._on_shelf_clicked(shelf.id, shelf.name)
-                return
+    # ----- public API -----
 
-    def set_hidden_nav_ids(self, ids: set[int]):
-        self._hidden_nav_ids = set(ids) & self._valid_nav_ids()
-        if self._active_id in self._hidden_nav_ids:
-            self._go_to_first_visible()
-        self._build_list()
-        self.hidden_nav_changed.emit(self._hidden_nav_ids)
+    def set_active(self, key: str) -> None:
+        """key is 'library' or 'currently_reading' (or '' for none)."""
+        self._active = key
+        self._apply_styles()
 
-    def hidden_nav_ids(self) -> set[int]:
-        return set(self._hidden_nav_ids)
-
-    # ----- Public API -----
-
-    def set_active(self, active_id: int):
-        self._active_id = active_id
-        if self._folders_btn:
-            self._folders_btn.setChecked(active_id == -1)
-        if self._queue_btn:
-            self._queue_btn.setChecked(active_id == -3)
-        if self._hidden_btn:
-            self._hidden_btn.setChecked(active_id == -2)
-        for sid, btn in self._shelf_btns:
-            btn.setChecked(sid == active_id)
-
-    def refresh_shelves(self):
-        self._build_list()
-
-    def set_back_visible(self, visible: bool):
-        self._btn_back.setVisible(visible)
-
-    def set_add_enabled(self, enabled: bool):
-        self._btn_add.setEnabled(enabled)
-
-    def set_rescan_enabled(self, enabled: bool):
-        self._btn_rescan.setEnabled(enabled)
-
-    def apply_theme(self, c: dict):
+    def apply_theme(self, c: dict) -> None:
         self._theme = c
+        self._apply_styles()
+
+    def _apply_styles(self) -> None:
+        c = self._theme
         self.setStyleSheet(f"QWidget {{ background: {c['sidebar_bg']}; }}")
-        self._apply_btn_styles()
-        self._build_list()
+        expanded = self._expanded or self._search_active
+        # Labels at 18px overflow the rail; shrink the text when expanded so
+        # "Currently Reading" fits. Icons stay large in the collapsed rail.
+        font_px = 13 if expanded else 18
+        icon_font = QFont("Libre Baskerville")
+        icon_font.setPixelSize(font_px)
+        active_map = {
+            id(self._btn_home): "library",
+            id(self._btn_reading): "currently_reading",
+        }
+        for btn in self._all_buttons:
+            key = active_map.get(id(btn))
+            active = key is not None and key == self._active
+            bg = "rgba(255,255,255,0.13)" if active else "transparent"
+            btn.setFont(icon_font)
+            btn.set_fg(c["text"])
+            # Background/hover/active only — the glyph is painted by _RailButton.
+            btn.setStyleSheet(
+                f"QPushButton {{ border: none; background: {bg};"
+                f" border-radius: 6px; margin: 1px 6px; }}"
+                f"QPushButton:hover {{ background: rgba(255,255,255,0.08); }}"
+            )
+        self._search_input.setStyleSheet(
+            f"QLineEdit {{ margin: 4px 8px; padding: 6px; border: 1px solid {c['border']};"
+            f" border-radius: 6px; background: {c['input_bg']}; color: {c['text']}; }}"
+            f"QLineEdit:focus {{ border-color: {c['accent']}; }}"
+        )
+
 
 SUPPORTED_FILTERS = [
     "Comic files (*.cbz *.cbr *.cb7 *.cbt *.pdf *.epub *.zip *.rar *.7z *.tar)",
@@ -846,11 +768,6 @@ class MainWindow(QMainWindow):
         self._current_comic_id: int | None = None
         self._settings = app_settings()
         self._library = Library()
-        self._sidebar_hidden_nav_ids = self._load_sidebar_hidden_nav_ids()
-        valid_nav_ids = {nav_id for nav_id, _ in _SIDEBAR_LIBRARY_NAV} | {
-            s.id for s in self._library.get_shelves()
-        }
-        self._sidebar_hidden_nav_ids &= valid_nav_ids
         self._scan_thread: QThread | None = None
         self._scanner: LibraryScanner | None = None
         self._scan_progress: QProgressDialog | None = None
@@ -951,24 +868,14 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._thumb_strip)
         content_layout.addWidget(self._seek_bar)
 
-        self._sidebar = _Sidebar(
-            self._library,
-            hidden_nav_ids=self._sidebar_hidden_nav_ids,
-            show_app_menu=sys.platform != "darwin",
-        )
+        self._sidebar = _Sidebar(show_app_menu=sys.platform != "darwin")
         self._sidebar.app_menu_requested.connect(self._show_app_menu)
-        self._sidebar.show_folders_clicked.connect(self._bookshelf.go_to_root)
-        self._sidebar.show_queue_clicked.connect(self._bookshelf.show_queue)
-        self._sidebar.show_hidden_clicked.connect(self._bookshelf.show_hidden)
-        self._sidebar.show_shelf_clicked.connect(self._bookshelf.show_shelf)
-        self._sidebar.add_folder_clicked.connect(self.add_folder_to_library)
-        self._sidebar.rescan_clicked.connect(self.rescan_all_folders)
-        self._sidebar.new_shelf_clicked.connect(self._create_new_shelf)
-        self._sidebar.rename_shelf_requested.connect(self._rename_shelf)
-        self._sidebar.delete_shelf_requested.connect(self._delete_shelf)
-        self._sidebar.export_shelf_requested.connect(self.export_shelf)
-        self._sidebar.back_to_root_clicked.connect(self._bookshelf.go_to_root)
-        self._sidebar.hidden_nav_changed.connect(self._set_sidebar_hidden_nav)
+        self._sidebar.home_clicked.connect(self._bookshelf.go_to_root)
+        self._sidebar.currently_reading_clicked.connect(
+            self._bookshelf.show_currently_reading
+        )
+        self._sidebar.search_changed.connect(self._bookshelf.search)
+        self._sidebar.search_closed.connect(self._bookshelf.clear_search)
 
         container = QWidget()
         h_layout = QHBoxLayout(container)
@@ -992,7 +899,8 @@ class MainWindow(QMainWindow):
 
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
         self._bookshelf.folder_entered.connect(self._on_folder_level_changed)
-        self._bookshelf.shelf_changed.connect(self._sidebar.refresh_shelves)
+        self._bookshelf.rescan_all_requested.connect(self.rescan_all_folders)
+        self._bookshelf.export_shelf_requested.connect(self.export_shelf)
         self._bookshelf.folder_rescan_requested.connect(self.rescan_folder)
         self._bookshelf.comics_delete_requested.connect(self._prepare_comics_for_deletion)
         self.viewer.page_forward.connect(self.next_page)
@@ -1574,32 +1482,18 @@ class MainWindow(QMainWindow):
             self._back_to_library()
 
     def _on_folder_level_changed(self, in_folder: bool):
-        self._sidebar.set_back_visible(in_folder)
-        if not in_folder:
-            if self._bookshelf._show_hidden_mode:
-                self._sidebar.set_active(-2)
-            elif self._bookshelf.is_showing_queue():
-                self._sidebar.set_active(-3)
-            else:
-                shelf_id = self._bookshelf._current_shelf_id
-                self._sidebar.set_active(shelf_id if shelf_id is not None else -1)
-
-    def _load_sidebar_hidden_nav_ids(self) -> set[int]:
-        if self._settings.value("sidebar_nav_hidden", False, type=bool):
-            self._settings.remove("sidebar_nav_hidden")
-        raw = self._settings.value("sidebar_hidden_nav_ids", "")
-        if not raw:
-            raw = self._settings.value("sidebar_hidden_shelf_ids", "")
-        if not raw:
-            return set()
-        return {int(part) for part in str(raw).split(",") if part.strip().lstrip("-").isdigit()}
-
-    def _set_sidebar_hidden_nav(self, hidden_ids: set[int]) -> None:
-        self._sidebar_hidden_nav_ids = set(hidden_ids)
-        self._settings.setValue(
-            "sidebar_hidden_nav_ids",
-            ",".join(str(nid) for nid in sorted(self._sidebar_hidden_nav_ids)),
-        )
+        # Keep the sidebar highlight in sync with the active view.
+        if self._bookshelf._currently_reading_mode:
+            self._sidebar.set_active("currently_reading")
+        elif (
+            not in_folder
+            and self._bookshelf._current_shelf_id is None
+            and not self._bookshelf._show_hidden_mode
+            and not self._bookshelf.is_showing_queue()
+        ):
+            self._sidebar.set_active("library")
+        else:
+            self._sidebar.set_active("")
 
     def apply_theme(self, c: dict):
         from PyQt6.QtWidgets import QApplication
@@ -2389,36 +2283,6 @@ class MainWindow(QMainWindow):
 
     # ----- Shelf management -----
 
-    def _create_new_shelf(self):
-        name, ok = QInputDialog.getText(self, "New Shelf", "Shelf name:")
-        if ok and name.strip():
-            shelf_id = self._library.create_shelf(name.strip())
-            self._sidebar.refresh_shelves()
-            self._sidebar.set_active(shelf_id)
-            self._bookshelf.show_shelf(shelf_id, name.strip())
-
-    def _rename_shelf(self, shelf_id: int, current_name: str):
-        name, ok = QInputDialog.getText(self, "Rename Shelf", "New name:", text=current_name)
-        if ok and name.strip() and name.strip() != current_name:
-            self._library.rename_shelf(shelf_id, name.strip())
-            self._sidebar.refresh_shelves()
-            if self._bookshelf._current_shelf_id == shelf_id:
-                self._bookshelf._current_shelf_name = name.strip()
-                self._bookshelf._header.set_shelf_mode(name.strip())
-
-    def _delete_shelf(self, shelf_id: int):
-        reply = QMessageBox.question(
-            self, "Delete Shelf",
-            "Delete this shelf? Comics will not be removed from your library.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self._library.delete_shelf(shelf_id)
-            if self._bookshelf._current_shelf_id == shelf_id:
-                self._bookshelf.go_to_root()
-                self._sidebar.set_active(-1)
-            self._sidebar.refresh_shelves()
-
     # ----- Library scanning -----
 
     def add_folder_to_library(self):
@@ -2517,7 +2381,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Import Failed", f"Could not import library:\n{e}")
             return
-        self._sidebar.refresh_shelves()
         self._bookshelf.refresh()
         QMessageBox.information(
             self,
@@ -2571,7 +2434,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Import Failed", f"Could not import shelf:\n{e}")
             return
-        self._sidebar.refresh_shelves()
         self._bookshelf.refresh()
         QMessageBox.information(
             self,
@@ -2591,8 +2453,6 @@ class MainWindow(QMainWindow):
         self._add_folder_action.setEnabled(False)
         self._add_files_action.setEnabled(False)
         self._rescan_all_action.setEnabled(False)
-        self._sidebar.set_add_enabled(False)
-        self._sidebar.set_rescan_enabled(False)
 
         self._scan_thread = QThread(self)
         if paths:
@@ -2696,8 +2556,6 @@ class MainWindow(QMainWindow):
         self._add_folder_action.setEnabled(True)
         self._add_files_action.setEnabled(True)
         self._rescan_all_action.setEnabled(True)
-        self._sidebar.set_add_enabled(True)
-        self._sidebar.set_rescan_enabled(True)
 
     # ----- Duplicate detection -----
 

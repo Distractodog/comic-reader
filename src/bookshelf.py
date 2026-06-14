@@ -64,11 +64,13 @@ _COVER_BG = QColor("#d8cccc")
 _TITLE_FG = QColor("#2a1818")
 _STATUS_FG = QColor("#7a5858")
 _HOVER_OVERLAY = QColor(100, 30, 30, 22)
+_HOVER_OUTLINE = QColor("#8b2a2a")
 _PROGRESS_TRACK = QColor("#c4aeae")
 _PROGRESS_FILL = QColor("#8b2a2a")
 _PLACEHOLDER_FG = QColor("#b0a0a0")
 _QUEUE_DRAG_MIME = "application/x-comic-reader-queue-id"
 _QUEUE_DRAG_THRESHOLD = 12
+_COMIC_FILE_MIME = "application/x-comic-reader-file-id"  # dragging a loose comic onto a shelf
 
 # Per-view bookshelf backgrounds — stored as one JSON map (paths must not be QSettings keys).
 _BG_MAP_KEY = "bookshelf/background_map"
@@ -92,16 +94,35 @@ def _transparent(widget: QWidget) -> None:
     widget.setStyleSheet("background: transparent;")
 
 
+_TITLE_MAX_LINES = 2
+
+
 def _title_height_for(text: str) -> int:
-    """Height needed to show the full title with word wrap (no elision)."""
+    """Fixed two-line title block so every tile is the same height and tops align."""
     fm = QFontMetrics(_title_font())
-    rect = fm.boundingRect(
-        0, 0, TILE_W - 8, 10000,
-        int(Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap),
-        text or " ",
-    )
-    min_h = fm.lineSpacing() + _TITLE_PAD
-    return max(min_h, rect.height() + _TITLE_PAD)
+    return fm.lineSpacing() * _TITLE_MAX_LINES + _TITLE_PAD
+
+
+def _fit_two_lines(text: str) -> str:
+    """Truncate with an ellipsis so the word-wrapped title fills at most two lines."""
+    fm = QFontMetrics(_title_font())
+    width = TILE_W - 8
+    flags = int(Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap)
+    two_line_h = fm.lineSpacing() * _TITLE_MAX_LINES + 1
+    if fm.boundingRect(0, 0, width, 10000, flags, text).height() <= two_line_h:
+        return text
+    # Binary-search the longest prefix that still fits two lines with an ellipsis.
+    best = "…"
+    lo, hi = 0, len(text)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = text[:mid].rstrip() + "…"
+        if fm.boundingRect(0, 0, width, 10000, flags, candidate).height() <= two_line_h:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
 
 
 class _CoverLoader(QThread):
@@ -176,21 +197,26 @@ class _Tile(QWidget):
                 Qt.AlignmentFlag.AlignCenter,
                 "?",
             )
-        if self._hovered:
-            painter.fillRect(0, 0, TILE_W, COVER_H, _HOVER_OVERLAY)
+
+    def _draw_hover_outline(self, painter: QPainter) -> None:
+        """Outline the whole tile on hover (replaces the old cover-only tint)."""
+        if not self._hovered:
+            return
+        pen = QPen(_HOVER_OUTLINE, 2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(1, 1, TILE_W - 2, self._tile_h - 2, 8, 8)
 
     def _draw_title(self, painter: QPainter, text: str) -> None:
-        painter.fillRect(0, COVER_H, TILE_W, self._title_h, _BG)
         painter.setPen(_TITLE_FG)
         painter.setFont(_title_font())
         painter.drawText(
             QRect(4, COVER_H + 2, TILE_W - 8, self._title_h - 4),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
-            text,
+            _fit_two_lines(text),
         )
 
     def _draw_status(self, painter: QPainter, text: str) -> None:
-        painter.fillRect(0, COVER_H + self._title_h, TILE_W, STATUS_H, _BG)
         painter.setPen(_STATUS_FG)
         font = painter.font()
         font.setPixelSize(12)
@@ -233,6 +259,7 @@ class FolderTile(_Tile):
         self._draw_title(painter, self._folder.name)
         n = self._folder.comic_count
         self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}")
+        self._draw_hover_outline(painter)
 
     def contextMenuEvent(self, event):
         self.menu_requested.emit(
@@ -255,6 +282,7 @@ class ComicTile(_Tile):
         self._selected = selected
         self.cover_path = comic.cover_path
         self._queue_reorder_enabled = False
+        self._file_drag_enabled = False
         self._press_pos: QPoint | None = None
         self._drag_started = False
         self._drop_highlight = False
@@ -269,6 +297,10 @@ class ComicTile(_Tile):
             Qt.CursorShape.OpenHandCursor if enabled else Qt.CursorShape.PointingHandCursor
         )
 
+    def set_file_drag_enabled(self, enabled: bool) -> None:
+        """Let a loose comic be dragged onto a shelf tile to file it (home grid)."""
+        self._file_drag_enabled = enabled
+
     def contextMenuEvent(self, event):
         self.shelf_action_requested.emit(
             self._comic.id, event.globalPos().x(), event.globalPos().y()
@@ -280,7 +312,7 @@ class ComicTile(_Tile):
             if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
                 self.select_toggled.emit(self._comic.id)
                 return
-            if self._queue_reorder_enabled:
+            if self._queue_reorder_enabled or self._file_drag_enabled:
                 self._press_pos = event.position().toPoint()
                 self._drag_started = False
                 return
@@ -288,26 +320,48 @@ class ComicTile(_Tile):
 
     def mouseMoveEvent(self, event):
         if (
-            self._queue_reorder_enabled
+            (self._queue_reorder_enabled or self._file_drag_enabled)
             and self._press_pos is not None
             and not self._drag_started
             and event.buttons() & Qt.MouseButton.LeftButton
         ):
             delta = event.position().toPoint() - self._press_pos
             if delta.manhattanLength() >= _QUEUE_DRAG_THRESHOLD:
-                self._start_queue_drag()
+                if self._queue_reorder_enabled:
+                    self._start_queue_drag()
+                else:
+                    self._start_file_drag()
                 return
-        if not self._queue_reorder_enabled:
+        if not (self._queue_reorder_enabled or self._file_drag_enabled):
             super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if self._queue_reorder_enabled and event.button() == Qt.MouseButton.LeftButton:
+        if (
+            (self._queue_reorder_enabled or self._file_drag_enabled)
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
             if not self._drag_started and not ComicTile._is_deleted(self):
                 self._on_click()
             self._press_pos = None
             self._drag_started = False
             return
         super().mouseReleaseEvent(event)
+
+    def _start_file_drag(self) -> None:
+        self._drag_started = True
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(_COMIC_FILE_MIME, str(self._comic.id).encode())
+        drag.setMimeData(mime)
+        if self._pixmap and not self._pixmap.isNull():
+            thumb = self._pixmap.scaled(
+                100, 150,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            drag.setPixmap(thumb)
+            drag.setHotSpot(QPoint(thumb.width() // 2, thumb.height() // 2))
+        drag.exec(Qt.DropAction.MoveAction)
 
     def _start_queue_drag(self) -> None:
         self._drag_started = True
@@ -398,6 +452,7 @@ class ComicTile(_Tile):
         title = self._comic.title or Path(self._comic.file_path).stem
         self._draw_title(painter, title)
         self._draw_status(painter, self._status_text())
+        self._draw_hover_outline(painter)
 
     def _status_text(self) -> str:
         if self._comic.read_status == "read":
@@ -426,10 +481,86 @@ class ComicTile(_Tile):
         self.opened.emit(self._comic.file_path)
 
 
+class ShelfTile(_Tile):
+    """A bookshelf shown as a tile on the home grid.
+
+    The cover is the shelf's saved background image (falling back to the cover of
+    the first comic on the shelf). Clicking it opens the shelf.
+    """
+
+    shelf_opened = pyqtSignal(int, str)             # shelf_id, shelf_name
+    menu_requested = pyqtSignal(int, int, int)      # shelf_id, global_x, global_y
+
+    def __init__(self, shelf: Shelf, cover_path: str | None, comic_count: int, parent=None):
+        super().__init__(shelf.name, parent)
+        self._shelf = shelf
+        self.cover_path = cover_path
+        self._comic_count = comic_count
+        self.setAcceptDrops(True)
+        self._drop_highlight = False
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self._draw_cover(painter)
+        if self._drop_highlight:
+            pen = QPen(_PROGRESS_FILL, 3)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(1, 1, TILE_W - 2, self._tile_h - 2, 8, 8)
+        self._draw_title(painter, self._shelf.name)
+        n = self._comic_count
+        self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}")
+        self._draw_hover_outline(painter)
+
+    def contextMenuEvent(self, event):
+        self.menu_requested.emit(
+            self._shelf.id, event.globalPos().x(), event.globalPos().y()
+        )
+
+    # --- accept a loose comic dropped onto the shelf to file it there ---
+    def _dropped_comic_id(self, event) -> int | None:
+        if not event.mimeData().hasFormat(_COMIC_FILE_MIME):
+            return None
+        try:
+            return int(bytes(event.mimeData().data(_COMIC_FILE_MIME)).decode())
+        except (TypeError, ValueError):
+            return None
+
+    def dragEnterEvent(self, event):
+        if self._dropped_comic_id(event) is not None:
+            event.acceptProposedAction()
+            self._drop_highlight = True
+            self.update()
+
+    def dragMoveEvent(self, event):
+        if self._dropped_comic_id(event) is not None:
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        if self._drop_highlight:
+            self._drop_highlight = False
+            self.update()
+
+    def dropEvent(self, event):
+        cid = self._dropped_comic_id(event)
+        self._drop_highlight = False
+        self.update()
+        if cid is not None:
+            self.file_comic_requested.emit(cid, self._shelf.id)
+            event.acceptProposedAction()
+
+    file_comic_requested = pyqtSignal(int, int)  # comic_id, shelf_id
+
+    def _on_click(self):
+        self.shelf_opened.emit(self._shelf.id, self._shelf.name)
+
+
 class _HeaderBar(QWidget):
-    back_clicked = pyqtSignal()
-    search_changed = pyqtSignal(str)
-    sort_changed = pyqtSignal(str, str)  # sort_by, order
+    back_clicked = pyqtSignal()                        # ← back button (only shown off-root)
+    sort_changed = pyqtSignal(str, str)                # sort_by, order
+    filter_changed = pyqtSignal(str)                   # '' | recently_read | unread | finished
+    options_menu_requested = pyqtSignal(int, int)      # global_x, global_y (3-dot menu)
 
     _SORT_OPTIONS = [
         ("Title A–Z",      "title",      "asc"),
@@ -437,6 +568,13 @@ class _HeaderBar(QWidget):
         ("Chapter order",  "chapter",    "asc"),
         ("Recently Added", "date_added", "desc"),
         ("Last Read",      "last_read",  "desc"),
+    ]
+
+    _FILTER_OPTIONS = [
+        ("All Comics",   ""),
+        ("Recently Read", "recently_read"),
+        ("Unread",        "unread"),
+        ("Finished",      "finished"),
     ]
 
     def __init__(self, parent=None):
@@ -447,11 +585,20 @@ class _HeaderBar(QWidget):
         self.setStyleSheet(
             "#HeaderBar { background: #ecdede; border: none; }"
         )
-        self._in_comic_view = False
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setContentsMargins(16, 0, 12, 0)
         layout.setSpacing(8)
+
+        # Back button — hidden on the root folder view, shown once you drill in.
+        # Wider than tall so the arrow glyph never clips against the button edge.
+        self._back_btn = QPushButton("‹")
+        self._back_btn.setFlat(True)
+        self._back_btn.setToolTip("Back")
+        self._back_btn.setFixedSize(44, 38)
+        self._back_btn.clicked.connect(self.back_clicked)
+        self._back_btn.hide()
+        layout.addWidget(self._back_btn)
 
         self._title = QLabel("Library")
         title_font = QFont("Libre Baskerville")
@@ -465,116 +612,97 @@ class _HeaderBar(QWidget):
         self._sort_combo = QComboBox()
         for label, _, _ in self._SORT_OPTIONS:
             self._sort_combo.addItem(label)
-        self._sort_combo.setFixedWidth(165)
-        self._sort_combo.setStyleSheet(
-            "QComboBox::drop-down { border: none; width: 20px; }"
-        )
+        self._sort_combo.setFixedWidth(150)
+        self._sort_combo.setToolTip("Sort")
         self._sort_combo.currentIndexChanged.connect(self._emit_sort)
-        self._sort_combo.hide()
         layout.addWidget(self._sort_combo)
 
-        self._search_input = QLineEdit()
-        self._search_input.setPlaceholderText("Search title, series, author, folder…")
-        self._search_input.setClearButtonEnabled(True)
-        self._search_input.setFixedWidth(250)
-        self._search_input.setStyleSheet("QLineEdit:focus { border-color: #8b2a2a; }")
-        self._search_input.textChanged.connect(self.search_changed)
-        self._search_input.hide()
-        self._search_input.installEventFilter(self)
-        layout.addWidget(self._search_input)
+        self._filter_combo = QComboBox()
+        for label, _ in self._FILTER_OPTIONS:
+            self._filter_combo.addItem(label)
+        self._filter_combo.setFixedWidth(140)
+        self._filter_combo.setToolTip("Filter by read status")
+        self._filter_combo.currentIndexChanged.connect(self._emit_filter)
+        layout.addWidget(self._filter_combo)
 
-        self._search_btn = QPushButton("⌕")
-        self._search_btn.setFlat(True)
-        self._search_btn.setToolTip("Search")
-        self._search_btn.setFixedSize(34, 34)
-        self._search_btn.setStyleSheet(
-            "QPushButton { color: #7a5858; border: none; font-size: 18px;"
-            " font-family: 'Libre Baskerville'; background: transparent; }"
-            "QPushButton:hover { color: #2a1818; }"
-        )
-        self._search_btn.clicked.connect(self._toggle_search)
-        layout.addWidget(self._search_btn)
+        self._options_btn = QPushButton("⋮")
+        self._options_btn.setFlat(True)
+        self._options_btn.setToolTip("More options")
+        self._options_btn.setFixedSize(38, 38)
+        self._options_btn.clicked.connect(self._emit_options)
+        layout.addWidget(self._options_btn)
+
+        self._apply_btn_styles({})
 
     def _emit_sort(self, idx: int):
         _, sort_by, order = self._SORT_OPTIONS[idx]
         self.sort_changed.emit(sort_by, order)
 
-    def eventFilter(self, obj, event):
-        if obj is self._search_input and event.type() == QEvent.Type.KeyPress:
-            if event.key() == Qt.Key.Key_Escape:
-                self._close_search()
-                return True
-        return super().eventFilter(obj, event)
+    def _emit_filter(self, idx: int):
+        _, key = self._FILTER_OPTIONS[idx]
+        self.filter_changed.emit(key)
 
-    def _toggle_search(self):
-        if self._search_input.isVisible():
-            self._close_search()
-        else:
-            self._open_search()
+    def _emit_options(self):
+        pos = self._options_btn.mapToGlobal(QPoint(0, self._options_btn.height()))
+        self.options_menu_requested.emit(pos.x(), pos.y())
 
-    def _open_search(self):
-        self._sort_combo.hide()
-        self._search_input.show()
-        self._search_input.setFocus()
-        self._search_btn.setText("✕")
-        self._search_btn.setToolTip("Close search")
+    def current_filter_key(self) -> str:
+        return self._FILTER_OPTIONS[self._filter_combo.currentIndex()][1]
 
-    def _close_search(self):
-        self._search_input.hide()
-        self._search_input.clear()
-        self._search_btn.setText("⌕")
-        self._search_btn.setToolTip("Search")
-        if self._in_comic_view:
-            self._sort_combo.show()
+    def set_filter_key(self, key: str) -> None:
+        for idx, (_, k) in enumerate(self._FILTER_OPTIONS):
+            if k == key:
+                self._filter_combo.blockSignals(True)
+                self._filter_combo.setCurrentIndex(idx)
+                self._filter_combo.blockSignals(False)
+                break
 
+    # The title just reflects the current view; sort + filter are always available.
     def set_folder_mode(self):
-        self._in_comic_view = False
         self._title.setText("Library")
-        self._sort_combo.hide()
-        if self._search_input.isVisible():
-            self._search_input.hide()
-            self._search_btn.setText("⌕")
+        self._back_btn.hide()
 
     def set_comic_mode(self, folder_name: str):
-        self._in_comic_view = True
         self._title.setText(folder_name)
-        if not self._search_input.isVisible():
-            self._sort_combo.show()
+        self._back_btn.show()
 
     def set_shelf_mode(self, shelf_name: str):
-        self._in_comic_view = True
         self._title.setText(shelf_name)
-        if not self._search_input.isVisible():
-            if shelf_name == "Reading Queue":
-                self._sort_combo.hide()
-            else:
-                self._sort_combo.show()
+        self._back_btn.show()
 
     def set_search_mode(self):
         self._title.setText("Search Results")
-        if not self._search_input.isVisible():
-            self._sort_combo.show()
+        self._back_btn.show()
 
-    def clear_search(self) -> None:
-        self._search_input.blockSignals(True)
-        self._search_input.clear()
-        self._search_input.blockSignals(False)
-        if self._search_input.isVisible():
-            self._search_input.hide()
-            self._search_btn.setText("⌕")
-            self._search_btn.setToolTip("Search")
+    def _apply_btn_styles(self, c: dict) -> None:
+        accent = c.get("accent", "#8b2a2a")
+        text = c.get("text", "#2a1818")
+        text_sec = c.get("text_secondary", "#7a5858")
+        btn_css = (
+            f"QPushButton {{ color: {text_sec}; border: none; font-size: 20px;"
+            f" font-family: 'Libre Baskerville'; background: transparent; }}"
+            f"QPushButton:hover {{ color: {text}; }}"
+        )
+        self._options_btn.setStyleSheet(btn_css)
+        # Back chevron uses the default UI font (not the serif) and centers via
+        # text-align so the glyph never clips against the button edge.
+        back_css = (
+            f"QPushButton {{ color: {text_sec}; border: none; font-size: 28px;"
+            f" font-weight: bold; text-align: center; padding: 0px;"
+            f" background: transparent; }}"
+            f"QPushButton:hover {{ color: {text}; }}"
+        )
+        self._back_btn.setStyleSheet(back_css)
+        combo_css = "QComboBox::drop-down { border: none; width: 20px; }"
+        self._sort_combo.setStyleSheet(combo_css)
+        self._filter_combo.setStyleSheet(combo_css)
 
     def apply_theme(self, c: dict):
         self.setStyleSheet(
             f"#HeaderBar {{ background: {c['header_bg']}; border: none; }}"
         )
         self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
-        self._search_input.setStyleSheet(f"QLineEdit:focus {{ border-color: {c['accent']}; }}")
-        self._search_btn.setStyleSheet(
-            f"QPushButton {{ color: {c['text_secondary']}; border: none; font-size: 18px;"
-            f" font-family: 'Libre Baskerville'; background: transparent; }}"
-            f"QPushButton:hover {{ color: {c['text']}; }}"
-        )
+        self._apply_btn_styles(c)
 
 
 class BookshelfView(QWidget):
@@ -583,6 +711,9 @@ class BookshelfView(QWidget):
     shelf_changed = pyqtSignal()            # emitted when shelf membership changes
     folder_rescan_requested = pyqtSignal(str)  # folder_path
     comics_delete_requested = pyqtSignal(list)  # comic ids — close reader before delete
+    sidebar_toggle_requested = pyqtSignal()    # hamburger — expand/collapse sidebar
+    rescan_all_requested = pyqtSignal()        # 3-dot menu — refresh whole library
+    export_shelf_requested = pyqtSignal(int, str)  # shelf_id, shelf_name
 
     def __init__(self, library: Library, parent=None):
         super().__init__(parent)
@@ -592,6 +723,8 @@ class BookshelfView(QWidget):
         self._current_shelf_name: str = ""
         self._show_hidden_mode: bool = False
         self._queue_mode: bool = False
+        self._currently_reading_mode: bool = False
+        self._status_filter: str = ""   # '' | recently_read | unread | finished
         self._last_n_cols = 0
 
         self._selected_ids: set[int] = set()
@@ -624,8 +757,9 @@ class BookshelfView(QWidget):
 
         self._header = _HeaderBar()
         self._header.back_clicked.connect(self._on_back_clicked)
-        self._header.search_changed.connect(self._on_search_changed)
         self._header.sort_changed.connect(self._on_sort_changed)
+        self._header.filter_changed.connect(self._on_filter_changed)
+        self._header.options_menu_requested.connect(self._on_options_menu)
         self._header.customContextMenuRequested.connect(self._on_header_folder_menu)
         root.addWidget(self._header)
 
@@ -670,6 +804,7 @@ class BookshelfView(QWidget):
         self._scroll.setWidget(self._grid_widget)
         self._bg_label.stackUnder(self._grid_widget)
 
+        self._migrate_background_cover_paths()
         self._maybe_migrate_background_storage()
         self._migrate_all_background_entries()
         # Defer first paint — grab() during __init__ (before the event loop runs) can
@@ -680,10 +815,6 @@ class BookshelfView(QWidget):
     def _on_shelf_membership_changed(self) -> None:
         if self._current_shelf_id is not None:
             self._nav_transition(self._repopulate)
-
-    def focus_search(self) -> None:
-        self._header._search_input.setFocus()
-        self._header._search_input.selectAll()
 
     def refresh(self):
         """Reload from library — call after scanning or returning from reader."""
@@ -700,10 +831,12 @@ class BookshelfView(QWidget):
         self._pre_search_folder = None
         self._pre_search_shelf_id = None
         self._pre_search_shelf_name = ""
-        self._header.clear_search()
         self._show_folders()
 
-    def _on_search_changed(self, text: str):
+    # ----- Search (driven from the sidebar) -----
+
+    def search(self, text: str) -> None:
+        """Run a library search — called by the sidebar search field."""
         query = text.strip()
         if query and not self._in_search:
             self._in_search = True
@@ -712,6 +845,15 @@ class BookshelfView(QWidget):
             self._pre_search_shelf_name = self._current_shelf_name
         self._search_query = query
         self._search_timer.start()
+
+    def clear_search(self) -> None:
+        """Close search and return to the view that was active before searching."""
+        self._search_timer.stop()
+        if not self._in_search:
+            self._search_query = ""
+            return
+        self._search_query = ""
+        self._apply_search()
 
     def _apply_search(self):
         if self._search_query:
@@ -737,7 +879,6 @@ class BookshelfView(QWidget):
         self._search_query = ""
         self._in_search = False
         self._pre_search_folder = None
-        self._header.clear_search()
         self._show_comics(folder_path)
 
     def _on_sort_changed(self, sort_by: str, order: str):
@@ -746,6 +887,154 @@ class BookshelfView(QWidget):
         if self._current_folder and not self._queue_mode and not self._show_hidden_mode:
             self._save_folder_sort(self._current_folder)
         self._repopulate()
+
+    def _on_filter_changed(self, key: str):
+        self._status_filter = key
+        self._nav_transition(self._repopulate)
+
+    def _on_options_menu(self, gx: int, gy: int):
+        """The top-bar ⋮ menu: refresh actions + bookshelf management for the view."""
+        menu = QMenu(self)
+        is_home = (
+            not self._queue_mode and not self._show_hidden_mode
+            and not self._currently_reading_mode and not self._search_query
+            and self._current_shelf_id is None and self._current_folder is None
+        )
+        if is_home:
+            menu.addAction("New bookshelf…").triggered.connect(self._create_shelf)
+            menu.addSeparator()
+        menu.addAction("Refresh library").triggered.connect(
+            self.rescan_all_requested.emit
+        )
+        if self._current_folder is not None:
+            folder = self._current_folder
+            menu.addAction("Refresh this folder").triggered.connect(
+                lambda: self.folder_rescan_requested.emit(folder)
+            )
+        menu.addSeparator()
+        menu.addAction("Reading Queue").triggered.connect(self.show_queue)
+        menu.addAction("Hidden comics").triggered.connect(self.show_hidden)
+        menu.addSeparator()
+        menu.addAction("Reload view").triggered.connect(
+            lambda: self._nav_transition(self._repopulate)
+        )
+        menu.exec(QPoint(gx, gy))
+
+    # ----- Bookshelf tile helpers -----
+
+    def _shelf_tile_cover(self, shelf: Shelf, comics: list[Comic]) -> str | None:
+        """The image a shelf tile shows: its background source, else first comic cover."""
+        spec = self._read_background_spec_for_parts(["shelf", shelf.id])
+        if spec:
+            cid = spec.get("comic_id")
+            if cid is not None:
+                c = self._library.get_comic_by_id(cid)
+                if c and c.cover_path and Path(c.cover_path).exists():
+                    return c.cover_path
+            path = spec.get("path")
+            if path and Path(path).exists():
+                return path
+        for c in comics:
+            if c.cover_path and Path(c.cover_path).exists():
+                return c.cover_path
+        return None
+
+    def _file_comic_into_shelf(self, comic_id: int, shelf_id: int) -> None:
+        self._library.add_comic_to_shelf(comic_id, shelf_id)
+        comic = self._library.get_comic_by_id(comic_id)
+        shelf = next((s for s in self._library.get_shelves() if s.id == shelf_id), None)
+        if comic and shelf:
+            self.window().statusBar().showMessage(
+                f"Filed “{comic.title or Path(comic.file_path).stem}” into “{shelf.name}”",
+                3500,
+            )
+        self._nav_transition(self._repopulate)
+        self.shelf_changed.emit()
+
+    def _on_shelf_context_menu(self, shelf_id: int, gx: int, gy: int) -> None:
+        shelf = next((s for s in self._library.get_shelves() if s.id == shelf_id), None)
+        if shelf is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("Open").triggered.connect(
+            lambda: self.show_shelf(shelf_id, shelf.name)
+        )
+        menu.addSeparator()
+        menu.addAction("Rename bookshelf…").triggered.connect(
+            lambda: self._rename_shelf(shelf_id, shelf.name)
+        )
+        menu.addAction("Export bookshelf…").triggered.connect(
+            lambda: self.export_shelf_requested.emit(shelf_id, shelf.name)
+        )
+        if self._read_background_spec_for_parts(["shelf", shelf_id]) is not None:
+            menu.addAction("Clear cover image").triggered.connect(
+                lambda: self._clear_background(["shelf", shelf_id])
+            )
+        menu.addSeparator()
+        menu.addAction("Delete bookshelf").triggered.connect(
+            lambda: self._delete_shelf(shelf_id, shelf.name)
+        )
+        menu.exec(QPoint(gx, gy))
+
+    def _create_shelf(self) -> None:
+        name, ok = QInputDialog.getText(self, "New Bookshelf", "Bookshelf name:")
+        if ok and name.strip():
+            self._library.create_shelf(name.strip())
+            self._nav_transition(self._repopulate)
+            self.shelf_changed.emit()
+
+    def _rename_shelf(self, shelf_id: int, current_name: str) -> None:
+        name, ok = QInputDialog.getText(
+            self, "Rename Bookshelf", "New name:", text=current_name
+        )
+        if ok and name.strip():
+            self._library.rename_shelf(shelf_id, name.strip())
+            self._nav_transition(self._repopulate)
+            self.shelf_changed.emit()
+
+    def _delete_shelf(self, shelf_id: int, name: str) -> None:
+        reply = QMessageBox.question(
+            self, "Delete Bookshelf",
+            f"Delete the bookshelf “{name}”?\n\n"
+            "The comics on it are NOT deleted — they return to the home grid as "
+            "unsorted comics.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._library.delete_shelf(shelf_id)
+            if self._current_shelf_id == shelf_id:
+                self._show_folders()
+            else:
+                self._nav_transition(self._repopulate)
+            self.shelf_changed.emit()
+
+    # ----- Read-status filter (applies on the home grid and inside shelves) -----
+
+    def _passes_filter(self, comic: Comic) -> bool:
+        f = self._status_filter
+        if not f:
+            return True
+        if f == "unread":
+            return comic.read_status == "unread"
+        if f == "finished":
+            return comic.read_status == "read"
+        if f == "recently_read":
+            return comic.read_status in ("in_progress", "read") and bool(comic.last_read)
+        return True
+
+    def _filter_comics(self, comics: list[Comic]) -> list[Comic]:
+        if not self._status_filter:
+            return comics
+        return [c for c in comics if self._passes_filter(c)]
+
+    def _shelf_matches_filter(self, shelf_id: int) -> bool:
+        """True when a shelf has at least one comic passing the current filter."""
+        if not self._status_filter:
+            return True
+        for c in self._library.get_comics_in_shelf(shelf_id):
+            if self._passes_filter(c):
+                return True
+        return False
 
     def _folder_sort_settings_key(self, folder_path: str) -> str:
         return f"folder_sort/{folder_path}"
@@ -788,7 +1077,7 @@ class BookshelfView(QWidget):
         self._on_back_clicked()
 
     def apply_theme(self, c: dict):
-        global _BG, _COVER_BG, _TITLE_FG, _STATUS_FG, _HOVER_OVERLAY
+        global _BG, _COVER_BG, _TITLE_FG, _STATUS_FG, _HOVER_OVERLAY, _HOVER_OUTLINE
         global _PROGRESS_TRACK, _PROGRESS_FILL, _PLACEHOLDER_FG
         _BG = QColor(c["tile_bg"])
         _COVER_BG = QColor(c["cover_bg"])
@@ -796,6 +1085,7 @@ class BookshelfView(QWidget):
         _STATUS_FG = QColor(c["text_secondary"])
         r, g, b, a = c["hover_overlay"]
         _HOVER_OVERLAY = QColor(r, g, b, a)
+        _HOVER_OUTLINE = QColor(c["accent"])
         _PROGRESS_TRACK = QColor(c["progress_track"])
         _PROGRESS_FILL = QColor(c["progress_fill"])
         _PLACEHOLDER_FG = QColor(c["placeholder_fg"])
@@ -814,6 +1104,7 @@ class BookshelfView(QWidget):
             self._comic_tiles.clear()
             self._show_hidden_mode = False
             self._queue_mode = False
+            self._currently_reading_mode = False
             self._header.set_folder_mode()
             self._last_n_cols = 0
             self._repopulate()
@@ -827,6 +1118,7 @@ class BookshelfView(QWidget):
             self._current_shelf_name = ""
             self._show_hidden_mode = False
             self._queue_mode = False
+            self._currently_reading_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
@@ -845,6 +1137,7 @@ class BookshelfView(QWidget):
             self._comic_tiles.clear()
             self._show_hidden_mode = False
             self._queue_mode = False
+            self._currently_reading_mode = False
             self._header.set_shelf_mode(shelf_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -859,6 +1152,7 @@ class BookshelfView(QWidget):
             self._comic_tiles.clear()
             self._show_hidden_mode = False
             self._queue_mode = False
+            self._currently_reading_mode = False
             self._header.set_shelf_mode(self._current_shelf_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -871,6 +1165,7 @@ class BookshelfView(QWidget):
             self._current_folder = folder_path
             self._show_hidden_mode = False
             self._queue_mode = False
+            self._currently_reading_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
@@ -888,6 +1183,7 @@ class BookshelfView(QWidget):
             self._current_shelf_name = ""
             self._show_hidden_mode = True
             self._queue_mode = False
+            self._currently_reading_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_shelf_mode("Hidden")
@@ -904,9 +1200,27 @@ class BookshelfView(QWidget):
             self._current_shelf_name = ""
             self._show_hidden_mode = False
             self._queue_mode = True
+            self._currently_reading_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_shelf_mode("Reading Queue")
+            self._last_n_cols = 0
+            self._repopulate()
+            self.folder_entered.emit(False)
+        self._nav_transition(do)
+
+    def show_currently_reading(self):
+        """Show in-progress comics — backs the sidebar 'Currently Reading' icon."""
+        def do():
+            self._current_folder = None
+            self._current_shelf_id = None
+            self._current_shelf_name = ""
+            self._show_hidden_mode = False
+            self._queue_mode = False
+            self._currently_reading_mode = True
+            self._selected_ids.clear()
+            self._comic_tiles.clear()
+            self._header.set_shelf_mode("Currently Reading")
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(False)
@@ -987,39 +1301,50 @@ class BookshelfView(QWidget):
 
         if self._queue_mode:
             # Manual order — do NOT re-sort; get_queue() is already in position order.
-            items = self._library.get_queue()
+            items = self._filter_comics(self._library.get_queue())
             empty_msg = ("Your reading queue is empty.\n"
                          "Right-click any comic → Add to reading queue.")
         elif self._show_hidden_mode:
-            items = self._library.get_hidden_comics(
+            items = self._filter_comics(self._library.get_hidden_comics(
                 sort_by=self._sort_by, order=self._sort_order
-            )
+            ))
             empty_msg = ("Nothing hidden.\n"
                          "Comics you remove from the library appear here.")
+        elif self._currently_reading_mode:
+            items = self._filter_comics(self._library.get_currently_reading(
+                sort_by=self._sort_by, order=self._sort_order
+            ))
+            empty_msg = ("Nothing in progress.\n"
+                         "Comics you're partway through show up here.")
         elif self._search_query:
             folders, comics = self._library.search_library(
                 self._search_query, self._sort_by, self._sort_order
             )
-            items = folders + comics
+            items = folders + self._filter_comics(comics)
             empty_msg = f'No results for "{self._search_query}"'
-        elif self._current_shelf_id is not None and self._current_folder is None:
-            # Shelf top level — show folders that have comics on this shelf
-            items = self._library.get_shelf_folders(self._current_shelf_id)
-            empty_msg = "This shelf is empty."
         elif self._current_shelf_id is not None:
-            items = self._library.get_comics_in_shelf_for_folder(
-                self._current_shelf_id, self._current_folder,
+            # Inside a bookshelf: show its comics directly (flat — no folder level).
+            items = self._filter_comics(self._library.get_comics_in_shelf(
+                self._current_shelf_id,
                 sort_by=self._sort_by, order=self._sort_order,
-            )
-            empty_msg = "No comics from this folder on this shelf."
-        elif self._current_folder is None:
-            items = self._library.get_folders()
-            empty_msg = (
-                "No comics yet.\n"
-                "Use Library → Add Folder or Add Files to Library to get started."
-            )
-        else:
+            ))
+            empty_msg = "This shelf is empty."
+        elif self._current_folder is not None:
             items, empty_msg = self._folder_grid_items()
+            items = self._filter_comics(items)
+        else:
+            # Home grid: bookshelf tiles + loose unsorted comics.
+            shelves = [s for s in self._library.get_shelves() if s.kind == "manual"]
+            if self._status_filter:
+                shelves = [s for s in shelves if self._shelf_matches_filter(s.id)]
+            unsorted = self._filter_comics(self._library.get_unsorted_comics(
+                sort_by=self._sort_by, order=self._sort_order
+            ))
+            items = list(shelves) + list(unsorted)
+            empty_msg = (
+                "No bookshelves or comics yet.\n"
+                "Use the ⋮ menu → New bookshelf, or Refresh library to add comics."
+            )
 
         if not items:
             lbl = QLabel(empty_msg)
@@ -1043,12 +1368,24 @@ class BookshelfView(QWidget):
                 row_layout.setSpacing(TILE_SPACING)
                 layout.addWidget(row_widget)
 
-            if isinstance(item, Folder):
+            is_home = (
+                not self._queue_mode and not self._show_hidden_mode
+                and not self._currently_reading_mode and not self._search_query
+                and self._current_shelf_id is None and self._current_folder is None
+            )
+            if isinstance(item, Shelf):
+                shelf_comics = self._library.get_comics_in_shelf(item.id)
+                if self._status_filter:
+                    shelf_comics = [c for c in shelf_comics if self._passes_filter(c)]
+                cover = self._shelf_tile_cover(item, shelf_comics)
+                tile = ShelfTile(item, cover, len(shelf_comics))
+                tile.shelf_opened.connect(self.show_shelf)
+                tile.menu_requested.connect(self._on_shelf_context_menu)
+                tile.file_comic_requested.connect(self._file_comic_into_shelf)
+            elif isinstance(item, Folder):
                 tile = FolderTile(item)
                 if self._search_query:
                     tile.opened.connect(self._open_folder_from_search)
-                elif self._current_shelf_id is not None:
-                    tile.opened.connect(self._show_shelf_folder)
                 else:
                     tile.opened.connect(self._show_comics)
                 tile.menu_requested.connect(self._on_folder_context_menu)
@@ -1060,6 +1397,9 @@ class BookshelfView(QWidget):
                 if self._queue_mode:
                     tile.set_queue_reorder_enabled(True)
                     tile.queue_reorder_drop.connect(self._on_queue_drag_reorder)
+                elif is_home:
+                    # Loose comic on the home grid — drag it onto a shelf to file it.
+                    tile.set_file_drag_enabled(True)
                 self._comic_tiles[item.id] = tile
 
             self._ordered_tiles.append(tile)
@@ -1160,6 +1500,7 @@ class BookshelfView(QWidget):
         # Cover override (single comic only)
         if not is_multi:
             comic = self._library.get_comic_by_id(comic_id)
+            bg_noun = self._background_noun(self._current_scope_parts())
             menu.addSeparator()
             menu.addAction("Set cover from page…").triggered.connect(
                 lambda: self._set_comic_cover_from_page(comic_id)
@@ -1176,13 +1517,13 @@ class BookshelfView(QWidget):
                     lambda: self._use_comic_as_folder_cover(comic_id)
                 )
                 cover = comic.cover_path
-                menu.addAction("Set as bookshelf background").triggered.connect(
+                menu.addAction(f"Set as {bg_noun} background").triggered.connect(
                     lambda checked=False, cid=comic_id, c=cover: self._set_background(
                         c, comic_id=cid
                     )
                 )
             if self._scope_has_own_background():
-                menu.addAction("Clear bookshelf background").triggered.connect(
+                menu.addAction(f"Clear {bg_noun} background").triggered.connect(
                     lambda: self._clear_background()
                 )
 
@@ -1647,7 +1988,8 @@ class BookshelfView(QWidget):
                 lambda: self._reset_folder_cover(folder_path)
             )
         folder_scope = self._folder_menu_background_scope(folder_path)
-        menu.addAction("Set as bookshelf background").triggered.connect(
+        bg_noun = self._background_noun(folder_scope)
+        menu.addAction(f"Set as {bg_noun} background").triggered.connect(
             lambda checked=False, fp=folder_path, scope=folder_scope: self._set_background(
                 self._effective_folder_cover(fp),
                 scope,
@@ -1655,7 +1997,7 @@ class BookshelfView(QWidget):
             )
         )
         if self._scope_has_own_background(folder_scope):
-            menu.addAction("Clear bookshelf background").triggered.connect(
+            menu.addAction(f"Clear {bg_noun} background").triggered.connect(
                 lambda: self._clear_background(folder_scope)
             )
         menu.addSeparator()
@@ -2155,7 +2497,12 @@ class BookshelfView(QWidget):
         for key, raw in data.items():
             if isinstance(raw, str) and raw.startswith('{"v":2'):
                 spec = self._parse_bg_entry(raw)
-                if spec and self._source_image_from_spec(spec) is not None:
+                if spec and "comic_id" in spec:
+                    # Re-renders from the comic file, so it survives a cache purge.
+                    # Keep it even if the page can't be decoded right now (the file
+                    # may be temporarily unavailable) — never silently drop it.
+                    new_data[key] = raw
+                elif spec and self._source_image_from_spec(spec) is not None:
                     new_data[key] = raw
                 else:
                     changed = True
@@ -2184,6 +2531,8 @@ class BookshelfView(QWidget):
         """Identify the bookshelf view the user is looking at right now."""
         if self._queue_mode:
             return ["queue"]
+        if self._currently_reading_mode:
+            return ["currently_reading"]
         if self._show_hidden_mode:
             return ["hidden"]
         if self._current_shelf_id is not None:
@@ -2195,14 +2544,13 @@ class BookshelfView(QWidget):
         return ["library"]
 
     def _folder_menu_background_scope(self, folder_path: str) -> list:
-        """Scope targeted by a folder tile's background menu."""
-        if self._current_shelf_id is not None and self._current_folder is None:
-            # Folder tile on a shelf grid → background for the whole shelf.
-            return ["shelf", self._current_shelf_id]
-        if self._current_shelf_id is not None:
-            return ["shelf", self._current_shelf_id, "folder", folder_path]
-        # Library folder tile → background shown when that folder is opened.
-        return ["folder", folder_path]
+        """Background target for a folder/header menu — always the view on screen.
+
+        From the library grid this is the library itself; from a shelf grid it's the
+        shelf; from inside a folder it's that folder. The folder's cover art is used
+        as the source image, but it sets the background of whatever you're looking at.
+        """
+        return self._current_scope_parts()
 
     def _scope_map_key(self, parts: list) -> str:
         """Flat map key — folder paths stay in the value, never in QSettings key names."""
@@ -2210,6 +2558,8 @@ class BookshelfView(QWidget):
             return "library"
         if parts[0] == "queue":
             return "queue"
+        if parts[0] == "currently_reading":
+            return "currently_reading"
         if parts[0] == "hidden":
             return "hidden"
         if parts[0] == "folder":
@@ -2220,11 +2570,25 @@ class BookshelfView(QWidget):
             return f"shelf:{parts[1]}+folder:{parts[3]}"
         return json.dumps(parts, separators=(",", ":"))
 
+    def _background_noun(self, parts: list) -> str:
+        """The word used in menu labels, e.g. 'Set as <noun> background'."""
+        if "folder" in parts:
+            return "folder"
+        return {
+            "library": "library",
+            "shelf": "shelf",
+            "queue": "queue",
+            "currently_reading": "currently reading",
+            "hidden": "hidden",
+        }.get(parts[0], "view")
+
     def _scope_label(self, parts: list) -> str:
         if parts[0] == "library":
             return "Library"
         if parts[0] == "queue":
             return "Reading Queue"
+        if parts[0] == "currently_reading":
+            return "Currently Reading"
         if parts[0] == "hidden":
             return "Hidden"
         if parts[0] == "folder":
@@ -2300,6 +2664,31 @@ class BookshelfView(QWidget):
     def _scope_has_background(self, parts: list | None = None) -> bool:
         parts = parts if parts is not None else self._current_scope_parts()
         return self._read_background_for_scope(parts) is not None
+
+    def _migrate_background_cover_paths(self) -> None:
+        """Repoint any background image paths from the old cache dir to persistent storage.
+
+        Mirrors the DB cover-path migration so a saved background whose source was a
+        cached image keeps resolving after covers move out of the purgeable cache.
+        """
+        try:
+            from thumbnails import legacy_cover_base, cover_store_base
+        except Exception:
+            return
+        old = legacy_cover_base().rstrip("/") + "/"
+        new = cover_store_base().rstrip("/") + "/"
+        if old == new:
+            return
+        data = self._load_background_map()
+        if not data:
+            return
+        changed = False
+        for key, value in list(data.items()):
+            if old in value:
+                data[key] = value.replace(old, new)
+                changed = True
+        if changed:
+            self._save_background_map(data)
 
     def _maybe_migrate_background_storage(self) -> None:
         """Move old background settings into the map and delete broken per-key entries."""

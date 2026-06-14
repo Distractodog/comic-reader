@@ -1,0 +1,4 @@
+# Dependencies for developer/control tools only (NOT the shipped app).
+# Install into the project venv:
+#   DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib venv/bin/pip install -r tools/requirements-tools.txt
+mcp

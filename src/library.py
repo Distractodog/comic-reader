@@ -413,6 +413,38 @@ class Library:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA temp_store = MEMORY")
         self._migrate()
+        self._migrate_cover_store()
+
+    def _migrate_cover_store(self) -> None:
+        """Move covers into persistent storage and repoint stored paths at it.
+
+        Covers used to live in the OS cache, which gets purged — taking folder
+        covers and background source images with it. This moves the files into
+        AppData and rewrites every absolute cache path saved in the DB. Idempotent.
+        """
+        try:
+            from thumbnails import (
+                migrate_cover_store,
+                legacy_cover_base,
+                cover_store_base,
+            )
+        except Exception:
+            return
+        migrate_cover_store()
+        old_base = legacy_cover_base()
+        new_base = cover_store_base()
+        if not old_base or old_base == new_base:
+            return
+        old_prefix = old_base.rstrip("/") + "/"
+        new_prefix = new_base.rstrip("/") + "/"
+        tail_start = len(old_prefix) + 1  # SQLite substr() is 1-indexed
+        with self.transaction() as cur:
+            for table in ("comics", "folder_covers"):
+                cur.execute(
+                    f"UPDATE {table} SET cover_path = ? || substr(cover_path, ?)"
+                    f" WHERE cover_path LIKE ? || '%'",
+                    (new_prefix, tail_start, old_prefix),
+                )
 
     def _migrate(self):
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
@@ -1292,6 +1324,37 @@ class Library:
                   smart_key=r["smart_key"], sort_order=r["sort_order"])
             for r in rows
         ]
+
+    def get_unsorted_comics(
+        self, *, sort_by: str = "title", order: str = "asc"
+    ) -> list[Comic]:
+        """Return comics that are not filed in any manual shelf (and not hidden).
+
+        These are the 'loose' comics shown on the home grid alongside the
+        bookshelf tiles, waiting to be sorted into a shelf.
+        """
+        if sort_by not in _CLIENT_SORT_MODES:
+            sort_by = "title"
+        rows = self._conn.execute(
+            "SELECT c.* FROM comics c"
+            " WHERE c.hidden = 0 AND c.id NOT IN ("
+            "   SELECT cs.comic_id FROM comic_shelves cs"
+            "   JOIN shelves s ON cs.shelf_id = s.id"
+            "   WHERE s.kind = 'manual'"
+            " )"
+        ).fetchall()
+        return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
+
+    def get_currently_reading(
+        self, *, sort_by: str = "last_read", order: str = "desc"
+    ) -> list[Comic]:
+        """Comics currently in progress — backs the sidebar 'Currently Reading' view."""
+        if sort_by not in _CLIENT_SORT_MODES:
+            sort_by = "last_read"
+        rows = self._conn.execute(
+            "SELECT * FROM comics WHERE hidden = 0 AND read_status = 'in_progress'"
+        ).fetchall()
+        return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
 
     def export_shelf(self, shelf_id: int, output_path: str | Path) -> dict:
         """Export one manual shelf as a shareable list, not the comic files."""

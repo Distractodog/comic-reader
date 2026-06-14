@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QStandardPaths
@@ -15,12 +16,62 @@ THUMB_QUALITY = 85
 
 
 def _thumbnail_cache_base() -> Path:
+    """Persistent store for cover thumbnails, folder covers, and override covers.
+
+    Lives in AppDataLocation (alongside the library DB) — NOT CacheLocation, which
+    macOS can purge on low disk or across reboots. Keeping covers here is what lets
+    folder covers and bookshelf backgrounds survive restarts.
+    """
+    base = Path(
+        QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppDataLocation
+        )
+    )
+    return base / "covers"
+
+
+def _legacy_thumbnail_cache_base() -> Path:
+    """The old (purgeable) cache location covers used to live in."""
     base = Path(
         QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.CacheLocation
         )
     )
     return base / "thumbnails"
+
+
+def cover_store_base() -> str:
+    return str(_thumbnail_cache_base())
+
+
+def legacy_cover_base() -> str:
+    return str(_legacy_thumbnail_cache_base())
+
+
+def migrate_cover_store() -> None:
+    """Move cover files out of the old purgeable cache into persistent storage.
+
+    Idempotent: only moves files that don't already exist at the destination, and
+    does nothing once the old directory is gone.
+    """
+    old = _legacy_thumbnail_cache_base()
+    new = _thumbnail_cache_base()
+    new.mkdir(parents=True, exist_ok=True)
+    if not old.exists() or old == new:
+        return
+    try:
+        for f in old.iterdir():
+            if not f.is_file():
+                continue
+            target = new / f.name
+            if target.exists():
+                continue
+            try:
+                shutil.move(str(f), str(target))
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def thumbnail_cache_dir() -> Path:
