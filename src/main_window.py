@@ -1011,6 +1011,7 @@ class MainWindow(QMainWindow):
         # shifts. The sidebar itself floats on top (see below) and, when expanded,
         # spills over the content instead of pushing it.
         h_layout.addSpacing(_Sidebar.COLLAPSED_W)
+        self._gutter_spacer = h_layout.itemAt(0)  # collapses when the sidebar hides
         h_layout.addWidget(content)
         self.setCentralWidget(container)
 
@@ -1076,6 +1077,30 @@ class MainWindow(QMainWindow):
             return
         self._sidebar.setGeometry(0, 0, self._sidebar.width(), host.height())
         self._sidebar.raise_()
+
+    def _set_gutter(self, on: bool) -> None:
+        """Reserve (or release) the left gutter the floating sidebar sits in.
+
+        The sidebar overlay reserves a fixed COLLAPSED_W column so content never
+        shifts. In the reader the sidebar is hidden, so that column must collapse
+        to zero — otherwise an empty gutter lingers and pushes the page right.
+        """
+        spacer = getattr(self, "_gutter_spacer", None)
+        if spacer is None:
+            return
+        spacer.changeSize(int(_Sidebar.COLLAPSED_W) if on else 0, 0)
+        host = getattr(self, "_sidebar_host", None)
+        if host is not None and host.layout() is not None:
+            host.layout().invalidate()
+            host.layout().activate()
+
+    def _show_sidebar(self) -> None:
+        self._set_gutter(True)
+        self._sidebar.show()
+
+    def _hide_sidebar(self) -> None:
+        self._sidebar.hide()
+        self._set_gutter(False)
 
     def eventFilter(self, obj, event) -> bool:
         if obj is getattr(self, "_sidebar_host", None) and event.type() == QEvent.Type.Resize:
@@ -1317,7 +1342,7 @@ class MainWindow(QMainWindow):
             self._seek_bar.setVisible(False)
             self._thumb_strip.setVisible(False)
             self._stack.setCurrentIndex(0)
-            self._sidebar.show()
+            self._show_sidebar()
             self.setWindowTitle(APP_DISPLAY_NAME)
 
     def _back_to_library(self):
@@ -1345,7 +1370,7 @@ class MainWindow(QMainWindow):
             self._thumb_strip.setVisible(False)
             self._bookshelf.refresh()
             self._stack.setCurrentIndex(0)
-            self._sidebar.show()
+            self._show_sidebar()
         self._fade_switch(do_switch)
         self.setWindowTitle(APP_DISPLAY_NAME)
         self._current_comic_id = None
@@ -1867,7 +1892,7 @@ class MainWindow(QMainWindow):
         # preloader warms neighbors) while the loading screen is still up.
         self._seek_bar.setVisible(True)
         self._stack.setCurrentIndex(target_index)
-        self._sidebar.hide()
+        self._hide_sidebar()
         self._chrome_hidden = False
         self._apply_reading_chrome()
 
@@ -1966,7 +1991,7 @@ class MainWindow(QMainWindow):
 
         def do_switch():
             self._stack.setCurrentIndex(3)
-            self._sidebar.hide()
+            self._hide_sidebar()
             self._chrome_hidden = False
             self._apply_reading_chrome()
 
@@ -2353,7 +2378,7 @@ class MainWindow(QMainWindow):
         self._settings_view.reset()
         self._sidebar.set_active("")
         self._stack.setCurrentIndex(4)
-        self._sidebar.show()
+        self._show_sidebar()
 
     def _close_settings(self) -> None:
         """Leave the settings page and return to the bookshelf."""
@@ -2361,7 +2386,7 @@ class MainWindow(QMainWindow):
             return
         self._bookshelf.refresh()
         self._stack.setCurrentIndex(0)
-        self._sidebar.show()
+        self._show_sidebar()
         self._on_folder_level_changed(self._bookshelf._current_folder is not None)
 
     # ----- settings handlers -----
