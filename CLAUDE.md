@@ -8,8 +8,8 @@ A standalone Windows desktop comic book reader app. Single-window app that opens
 
 Before doing any work on this project:
 
-1. **Read the Documents CLAUDE.md** at `/Users/ethanbristol/Documents/CLAUDE.md` — it holds the session-time-tracking and "compile to Obsidian" rules that apply to all work in Documents.
-2. **Read all related Obsidian notes.** The vault is at `/Users/ethanbristol/Documents/Obsidian Vault`. Search it for comic-reader / Cover 2.0 notes (e.g. glob `*omic*` and `*Cover 2*`) and read the relevant ones — at minimum the roadmap note and the most recent sessions — so you pick up the current state, recent decisions, and gotchas before touching code. Note that this app is also referred to as **"Cover 2.0"** in newer notes.
+1. **⛔ READ THE RELATED OBSIDIAN NOTES FIRST — THIS IS MANDATORY, DO IT EVERY TIME WITHOUT BEING ASKED.** This is the step agents keep skipping and the user is tired of having to remind every single one. It is not optional — not for quick questions, not for "I just need to check one thing," not for read-only tasks. The Obsidian notes are the real source of truth for the current state, recent decisions, and gotchas; **this CLAUDE.md lags behind them.** Skipping the notes means you act on stale context and repeat mistakes the user already paid to solve. So: **read the relevant Obsidian notes BEFORE you answer anything or touch any code.** The vault is at `/Users/ethanbristol/Documents/Obsidian Vault`. Search it for comic-reader / Cover 2.0 notes (e.g. glob `*omic*` and `*Cover 2*`) and read the relevant ones — at minimum the roadmap note and the most recent sessions — so you pick up the current state, recent decisions, and gotchas before touching code. Note that this app is also referred to as **"Cover 2.0"** in newer notes.
+2. **Read the Documents CLAUDE.md** at `/Users/ethanbristol/Documents/CLAUDE.md` — it holds the session-time-tracking and "compile to Obsidian" rules that apply to all work in Documents.
 
 ## User context (important)
 

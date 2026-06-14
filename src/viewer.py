@@ -443,6 +443,20 @@ class SeekBar(QWidget):
     def _near_handle(self, x: float) -> bool:
         return abs(x - self._handle_x()) <= self._HANDLE_D / 2 + 2
 
+    def _tick_x(self, page_idx: int) -> int:
+        """X position of a bookmark/note tick.
+
+        Bookmarks and notes store real page indices, but in spread mode the
+        bar's own length (`_page_count`) counts two-page spreads — using it as
+        the denominator would push ticks to roughly double their position. Map
+        against the real page total instead (it equals `_page_count` in single
+        mode, so this is correct in both modes).
+        """
+        total = self._total_pages if self._total_pages > 0 else self._page_count
+        if total <= 0:
+            return 0
+        return int(self.width() * page_idx / total)
+
     def _format_page_tooltip(self, seek_index: int) -> str:
         if self._spread_mode and self._total_pages > 0:
             p1 = seek_index * 2
@@ -475,7 +489,7 @@ class SeekBar(QWidget):
             mx = event.position().x()
             w = self.width()
             for page_idx, body in self._notes:
-                tick_x = int(w * page_idx / self._page_count)
+                tick_x = self._tick_x(page_idx)
                 if abs(mx - tick_x) <= _BOOKMARK_SNAP_PX:
                     preview = body.replace("\n", " ").strip()
                     if len(preview) > 80:
@@ -487,7 +501,7 @@ class SeekBar(QWidget):
                     )
                     return
             for page_idx, label in self._bookmarks:
-                tick_x = int(w * page_idx / self._page_count)
+                tick_x = self._tick_x(page_idx)
                 if abs(mx - tick_x) <= _BOOKMARK_SNAP_PX:
                     text = label if label else f"Page {page_idx + 1}"
                     QToolTip.showText(event.globalPosition().toPoint(), text, self)
@@ -541,7 +555,7 @@ class SeekBar(QWidget):
         if self._page_count > 0 and self._bookmarks:
             painter.setPen(_BAR_BOOKMARK)
             for page_idx, _ in self._bookmarks:
-                x = int(w * page_idx / self._page_count)
+                x = self._tick_x(page_idx)
                 painter.drawLine(x, 0, x, self._WIDGET_H)
             painter.setPen(Qt.PenStyle.NoPen)
 
@@ -549,7 +563,7 @@ class SeekBar(QWidget):
         if self._page_count > 0 and self._notes:
             painter.setPen(_BAR_NOTE)
             for page_idx, _ in self._notes:
-                x = int(w * page_idx / self._page_count)
+                x = self._tick_x(page_idx)
                 painter.drawLine(x, 2, x, self._WIDGET_H - 2)
             painter.setPen(Qt.PenStyle.NoPen)
 
