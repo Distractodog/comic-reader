@@ -90,7 +90,6 @@ _BG_MAP_KEY = "bookshelf/background_map"
 _BG_LEGACY_KEY = "bookshelf/background"
 _BG_OLD_GROUP = "bookshelf/backgrounds"  # prior broken per-key storage — removed on migrate
 _BG_DIM_ALPHA = 198  # theme tile-bg painted over the cover at this alpha to mute it
-_BG_MAX_ZOOM = 1.6  # cap how far a cover is enlarged to fill the view (higher = more edge-to-edge but softer)
 
 
 def _title_font() -> QFont:
@@ -826,8 +825,9 @@ class BookshelfView(QWidget):
         self.shelf_changed.connect(self._on_shelf_membership_changed)
 
     def _on_shelf_membership_changed(self) -> None:
-        if self._current_shelf_id is not None:
-            self._nav_transition(self._repopulate)
+        # Refresh on any filing change: a comic added to a shelf must vanish
+        # from the home grid / its home folder, and a removal must reappear.
+        self._nav_transition(self._repopulate)
 
     def refresh(self):
         """Reload from library — call after scanning or returning from reader."""
@@ -992,6 +992,12 @@ class BookshelfView(QWidget):
             menu.addAction("Clear cover image").triggered.connect(
                 lambda: self._clear_shelf_cover(shelf_id)
             )
+        shelf_comics = self._library.get_comics_in_shelf(shelf_id)
+        cover_path = self._shelf_tile_cover(shelf, shelf_comics)
+        if cover_path:
+            menu.addAction("Set as Library background").triggered.connect(
+                lambda checked=False, c=cover_path: self._set_background(c, ["library"])
+            )
         menu.addSeparator()
         menu.addAction("Delete bookshelf").triggered.connect(
             lambda: self._delete_shelf(shelf_id, shelf.name)
@@ -1057,6 +1063,23 @@ class BookshelfView(QWidget):
             if self._passes_filter(c):
                 return True
         return False
+
+    def _home_folder_items(self) -> list[Folder]:
+        """Folder tiles for the home grid: folders holding comics not yet filed
+        onto any manual shelf, so unsorted comics appear grouped by folder
+        (rather than as loose individual tiles) next to the bookshelves.
+
+        Counts reflect unsorted comics only; once a folder's comics are all
+        filed onto shelves it disappears from the home grid entirely."""
+        folders = self._library.get_unsorted_folders()
+        if not self._status_filter:
+            return folders
+        keep = []
+        for f in folders:
+            comics = self._library.get_unsorted_comics_in_folder(f.path)
+            if any(self._passes_filter(c) for c in comics):
+                keep.append(f)
+        return keep
 
     def _folder_sort_settings_key(self, folder_path: str) -> str:
         return f"folder_sort/{folder_path}"
@@ -1279,7 +1302,9 @@ class BookshelfView(QWidget):
                 sort_by=self._sort_by, order=self._sort_order,
             )
         else:
-            comics = self._library.get_comics_in_folder(
+            # Home folder view shows only unsorted comics — filed comics live
+            # solely in their shelf and are gone from the main library.
+            comics = self._library.get_unsorted_comics_in_folder(
                 folder_path, sort_by=self._sort_by, order=self._sort_order
             )
 
@@ -1352,14 +1377,12 @@ class BookshelfView(QWidget):
             items, empty_msg = self._folder_grid_items()
             items = self._filter_comics(items)
         else:
-            # Home grid: bookshelf tiles + loose unsorted comics.
+            # Home grid: bookshelf tiles + folder tiles for unsorted comics.
             shelves = [s for s in self._library.get_shelves() if s.kind == "manual"]
             if self._status_filter:
                 shelves = [s for s in shelves if self._shelf_matches_filter(s.id)]
-            unsorted = self._filter_comics(self._library.get_unsorted_comics(
-                sort_by=self._sort_by, order=self._sort_order
-            ))
-            items = list(shelves) + list(unsorted)
+            folders = self._home_folder_items()
+            items = list(shelves) + list(folders)
             empty_msg = (
                 "No bookshelves or comics yet.\n"
                 "Use the ⋮ menu → New bookshelf, or Refresh library to add comics."
@@ -2832,7 +2855,7 @@ class BookshelfView(QWidget):
         self.window().statusBar().showMessage(f"Background cleared for {label}", 4000)
 
     def _build_background_pixmap(self, w: int, h: int) -> QPixmap | None:
-        """Cover w×h with the source at a capped zoom (sharp), then mute it with a tint."""
+        """Cover w x h with the source at the exact minimum zoom, then tint it."""
         # Load the source at native resolution so we control the zoom ourselves.
         src = self._source_image_from_spec(self._bg_spec, 0)
         if src is None:
@@ -2840,10 +2863,9 @@ class BookshelfView(QWidget):
         sw, sh = src.width(), src.height()
         if sw <= 0 or sh <= 0:
             return None
-        # Zoom needed to fully cover the view is max(w/sw, h/sh); cap it so a small
-        # cover is never blown up into a blur. When the cap stops it short of the
-        # edges, the muted backdrop tone fills the margin (set below).
-        scale = min(max(w / sw, h / sh), _BG_MAX_ZOOM)
+        # Exact "cover" scale: fill both dimensions with no margins and no extra
+        # zoom beyond what is needed. Overflow is cropped equally from the center.
+        scale = max(w / sw, h / sh)
         new_w = max(1, int(round(sw * scale)))
         new_h = max(1, int(round(sh * scale)))
         scaled = src.scaled(
@@ -2851,9 +2873,8 @@ class BookshelfView(QWidget):
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        # Compose onto a full-view canvas: center the cover (cropping overflow, or
-        # leaving a margin when the cap holds it back), fill the rest with the theme
-        # tone, then dim everything so it sits quietly behind the tiles.
+        # Compose onto a full-view canvas: center the cover, crop overflow, then
+        # dim everything so it sits quietly behind the tiles.
         pix = QPixmap(w, h)
         pix.fill(_BG)
         painter = QPainter(pix)

@@ -1363,6 +1363,46 @@ class Library:
         ).fetchall()
         return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
 
+    def get_unsorted_folders(self) -> list[Folder]:
+        """Folders that still hold unsorted comics, counted by unsorted comics only.
+
+        Once every comic in a folder is filed onto a manual shelf, the folder
+        drops off the home grid — filed comics live only in their shelf.
+        """
+        comics = self.get_unsorted_comics()
+        overrides = self._folder_cover_overrides()
+        seen: dict[str, Folder] = {}
+        for c in comics:
+            parent = _parent_dir(c.file_path)
+            if parent not in seen:
+                seen[parent] = Folder(
+                    path=parent,
+                    name=Path(parent).name,
+                    comic_count=0,
+                    cover_path=overrides.get(parent) or c.cover_path or None,
+                )
+            seen[parent].comic_count += 1
+            if seen[parent].cover_path is None and c.cover_path:
+                seen[parent].cover_path = c.cover_path
+        return sorted(seen.values(), key=lambda f: f.name.lower())
+
+    def get_unsorted_comics_in_folder(
+        self, folder_path: str, *, sort_by: str = "title", order: str = "asc"
+    ) -> list[Comic]:
+        """Unsorted comics (not on any manual shelf) directly inside folder_path."""
+        if sort_by not in _CLIENT_SORT_MODES:
+            sort_by = "title"
+        rows = self._conn.execute(
+            "SELECT c.* FROM comics c"
+            " WHERE c.hidden = 0 AND c.parent_dir = ? AND c.id NOT IN ("
+            "   SELECT cs.comic_id FROM comic_shelves cs"
+            "   JOIN shelves s ON cs.shelf_id = s.id"
+            "   WHERE s.kind = 'manual'"
+            " )",
+            (folder_path,),
+        ).fetchall()
+        return _sort_comics([_row_to_comic(r) for r in rows], sort_by, order)
+
     def get_currently_reading(
         self, *, sort_by: str = "last_read", order: str = "desc"
     ) -> list[Comic]:
