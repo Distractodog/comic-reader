@@ -9,7 +9,7 @@ win over these. The view emits signals so the main window can apply changes live
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -473,6 +473,17 @@ class SettingsView(QWidget):
         super().__init__(parent)
         self._theme: dict = themes.DARK
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName("SettingsRoot")
+
+        # A random bookshelf background, dimmed, sits behind the content (the
+        # settings page has no comic tiles of its own). Source image is supplied
+        # by the main window each time the page is opened; rendered here at the
+        # current size. Stays behind everything and ignores mouse events.
+        self._bg_source: QImage | None = None
+        self._bg_label = QLabel(self)
+        self._bg_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._bg_label.setScaledContents(False)
+        self._bg_label.hide()
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -488,11 +499,13 @@ class SettingsView(QWidget):
 
         # ----- right side: header + panel stack -----
         right = QWidget()
+        right.setObjectName("SettingsRight")
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
 
         header = QWidget()
+        header.setObjectName("SettingsHeader")
         header.setFixedHeight(52)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(16, 0, 16, 0)
@@ -516,6 +529,7 @@ class SettingsView(QWidget):
         from PyQt6.QtWidgets import QScrollArea
 
         self._panels = QStackedWidget()
+        self._panels.setObjectName("SettingsStack")
         self._panel_widgets = [
             AppearancePanel(self),
             ReadingPanel(self),
@@ -526,10 +540,13 @@ class SettingsView(QWidget):
             AboutPanel(self),
         ]
         for panel in self._panel_widgets:
+            panel.setObjectName("SettingsPanel")
             scroll = QScrollArea()
+            scroll.setObjectName("SettingsScroll")
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
             scroll.setWidget(panel)
+            scroll.viewport().setAutoFillBackground(False)
             self._panels.addWidget(scroll)
 
         right_layout.addWidget(header)
@@ -554,7 +571,22 @@ class SettingsView(QWidget):
 
     def apply_theme(self, c: dict) -> None:
         self._theme = c
-        self.setStyleSheet(f"QWidget {{ background: {c['app_bg']}; }}")
+        # Root paints the solid fallback (shown when no background image is set).
+        # The content containers on the right are transparent so the dimmed
+        # backdrop shows through; the nav and header stay solid. Controls keep an
+        # explicit solid fill so they read clearly over the image.
+        self.setStyleSheet(
+            f"#SettingsRoot {{ background: {c['app_bg']}; }}"
+            f"#SettingsRight, #SettingsStack, #SettingsScroll, #SettingsPanel"
+            f" {{ background: transparent; }}"
+            f"#SettingsScroll > QWidget {{ background: transparent; }}"
+            f"#SettingsPanel .QWidget {{ background: transparent; }}"
+            f"#SettingsRoot QComboBox, #SettingsRoot QFontComboBox,"
+            f" #SettingsRoot QSpinBox {{ background: {c['input_bg']};"
+            f" color: {c['text']}; border: 1px solid {c['border']};"
+            f" border-radius: 4px; padding: 4px 8px; }}"
+        )
+        self._render_background()
         self._nav.setStyleSheet(
             f"QListWidget {{ background: {c['sidebar_bg']}; border: none;"
             f" outline: none; padding: 8px 0; }}"
@@ -576,3 +608,56 @@ class SettingsView(QWidget):
         )
         for panel in self._panel_widgets:
             panel.apply_theme(c)
+
+    # ----- random backdrop -----
+
+    def set_background_image(self, img: QImage | None) -> None:
+        """Set (or clear) the dimmed backdrop. The main window supplies a fresh
+        random bookshelf background each time the settings page is opened."""
+        self._bg_source = img if (img is not None and not img.isNull()) else None
+        self._render_background()
+
+    def _render_background(self) -> None:
+        w, h = self.width(), self.height()
+        if self._bg_source is None or w <= 0 or h <= 0:
+            self._bg_label.hide()
+            return
+        dpr = self.devicePixelRatioF() or 1.0
+        pw, ph = max(1, int(w * dpr)), max(1, int(h * dpr))
+        src = self._bg_source
+        sw, sh = src.width(), src.height()
+        if sw <= 0 or sh <= 0:
+            self._bg_label.hide()
+            return
+        # Exact "cover" scale: fill the view, crop overflow from the center, then
+        # dim heavily toward the theme background so it sits quietly behind the UI.
+        scale = max(pw / sw, ph / sh)
+        scaled = src.scaled(
+            max(1, int(sw * scale)), max(1, int(sh * scale)),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        pix = QPixmap(pw, ph)
+        pix.fill(QColor(self._theme["app_bg"]))
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawImage(
+            (pw - scaled.width()) // 2, (ph - scaled.height()) // 2, scaled
+        )
+        overlay = QColor(self._theme["app_bg"])
+        overlay.setAlpha(198)
+        painter.fillRect(pix.rect(), overlay)
+        painter.end()
+        pix.setDevicePixelRatio(dpr)
+        self._bg_label.setGeometry(0, 0, w, h)
+        self._bg_label.setPixmap(pix)
+        self._bg_label.lower()
+        self._bg_label.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._render_background()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._render_background()

@@ -2729,6 +2729,26 @@ class BookshelfView(QWidget):
                 return spec
         return None
 
+    def random_background_image(self, min_long_side: int = 0) -> "QImage | None":
+        """A randomly chosen source image from among all saved bookshelf backgrounds.
+
+        Used by the Settings page, which has no comic tiles of its own. Specs are
+        shuffled and the first one that still decodes is returned, so the result is
+        both random and resilient to a background whose comic file is unavailable.
+        """
+        import random
+        specs = []
+        for raw in self._load_background_map().values():
+            spec = self._parse_bg_entry(raw)
+            if spec is not None:
+                specs.append(spec)
+        random.shuffle(specs)
+        for spec in specs:
+            img = self._source_image_from_spec(spec, min_long_side)
+            if img is not None:
+                return img
+        return None
+
     def _scope_has_own_background(self, parts: list | None = None) -> bool:
         parts = parts if parts is not None else self._current_scope_parts()
         return self._read_background_spec_for_parts(parts) is not None

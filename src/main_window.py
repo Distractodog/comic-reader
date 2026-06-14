@@ -1043,7 +1043,7 @@ class MainWindow(QMainWindow):
         self._bookshelf.comics_delete_requested.connect(self._prepare_comics_for_deletion)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
-        self._seek_bar.seeked.connect(self.seek_to_page)
+        self._seek_bar.seeked.connect(self._on_seek_bar)
         self._reader_bar.menu_requested.connect(self._show_reader_menu)
         self._thumb_strip.page_selected.connect(self.seek_to_page)
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
@@ -2223,6 +2223,16 @@ class MainWindow(QMainWindow):
             self._advance_preloader()
             self._save_progress()
 
+    def _on_seek_bar(self, value: int) -> None:
+        """Handle a click/drag on the seek bar.
+
+        In spread mode the seek bar counts two-page spreads, so it reports a
+        spread-pair index — convert it back to the pair's first page index.
+        In single mode the value is already a real page index.
+        """
+        page = value * 2 if self._spread_mode else value
+        self.seek_to_page(page)
+
     def seek_to_page(self, page: int):
         if not self._reader:
             return
@@ -2376,6 +2386,10 @@ class MainWindow(QMainWindow):
         self._seek_bar.setVisible(False)
         self._thumb_strip.setVisible(False)
         self._settings_view.reset()
+        # Pick a fresh random bookshelf background each time settings is opened.
+        self._settings_view.set_background_image(
+            self._bookshelf.random_background_image()
+        )
         self._sidebar.set_active("")
         self._stack.setCurrentIndex(4)
         self._show_sidebar()
