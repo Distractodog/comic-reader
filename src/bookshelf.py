@@ -897,8 +897,7 @@ class BookshelfView(QWidget):
     def _on_sort_changed(self, sort_by: str, order: str):
         self._sort_by = sort_by
         self._sort_order = order
-        if self._current_folder and not self._queue_mode and not self._show_hidden_mode:
-            self._save_folder_sort(self._current_folder)
+        self._persist_sort()
         self._repopulate()
 
     def _on_filter_changed(self, key: str):
@@ -1084,22 +1083,42 @@ class BookshelfView(QWidget):
     def _folder_sort_settings_key(self, folder_path: str) -> str:
         return f"folder_sort/{folder_path}"
 
+    _GLOBAL_SORT_KEY = "sort/last"
+
     def _restore_folder_sort(self, folder_path: str) -> None:
-        val = app_settings().value(
-            self._folder_sort_settings_key(folder_path)
-        )
-        if not val or not isinstance(val, str) or "/" not in val:
-            return
-        sort_by, order = val.split("/", 1)
+        """Apply this folder's saved sort, else the last sort chosen anywhere."""
         valid = {(key, ord_) for _, key, ord_ in self._header._SORT_OPTIONS}
-        if (sort_by, order) in valid:
-            self._apply_sort(sort_by, order)
+
+        def _try(val) -> bool:
+            if not isinstance(val, str) or "/" not in val:
+                return False
+            sort_by, order = val.split("/", 1)
+            if (sort_by, order) in valid:
+                self._apply_sort(sort_by, order)
+                return True
+            return False
+
+        if _try(app_settings().value(self._folder_sort_settings_key(folder_path))):
+            return
+        _try(app_settings().value(self._GLOBAL_SORT_KEY))
 
     def _save_folder_sort(self, folder_path: str) -> None:
         app_settings().setValue(
             self._folder_sort_settings_key(folder_path),
             f"{self._sort_by}/{self._sort_order}",
         )
+
+    def _persist_sort(self) -> None:
+        """Remember the chosen sort globally, and per-folder when inside one.
+
+        The global key is the fallback so the sort sticks across launches even
+        for folders/views that never had their own saved preference.
+        """
+        app_settings().setValue(
+            self._GLOBAL_SORT_KEY, f"{self._sort_by}/{self._sort_order}"
+        )
+        if self._current_folder and not self._queue_mode and not self._show_hidden_mode:
+            self._save_folder_sort(self._current_folder)
 
     def _nav_transition(self, switch_fn):
         """Grab current grid, run switch_fn, fade the grab out."""
@@ -2302,8 +2321,7 @@ class BookshelfView(QWidget):
             self._library.group_comics_as_series(comic_ids, name.strip())
             self._clear_selection()
             self._apply_sort("chapter", "asc")
-            if self._current_folder:
-                self._save_folder_sort(self._current_folder)
+            self._persist_sort()
             self._nav_transition(self._repopulate)
             n = len(comic_ids)
             self.window().statusBar().showMessage(
@@ -2317,8 +2335,7 @@ class BookshelfView(QWidget):
         self._library.set_comics_chapter_order(comic_ids)
         self._clear_selection()
         self._apply_sort("chapter", "asc")
-        if self._current_folder:
-            self._save_folder_sort(self._current_folder)
+        self._persist_sort()
         self._repopulate()
         n = len(comic_ids)
         self.window().statusBar().showMessage(

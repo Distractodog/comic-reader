@@ -553,8 +553,12 @@ class SeekBar(QWidget):
 # ---------------------------------------------------------------------------
 
 
-class _ComicThumbButton(QLabel):
-    """Small clickable cover thumbnail for the previous/next comic."""
+class ComicThumbButton(QLabel):
+    """Clickable cover thumbnail for the previous/next comic.
+
+    Used as a floating overlay above the reader footer, so it deliberately does
+    NOT manage its own visibility — the owner positions and shows/hides it.
+    """
 
     clicked = pyqtSignal()
 
@@ -564,14 +568,20 @@ class _ComicThumbButton(QLabel):
         self.setFixedSize(w, h)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # A border + dark backing so the cover reads as floating over the page.
+        self.setStyleSheet(
+            "background: #000000; border: 2px solid rgba(0, 0, 0, 0.7);"
+        )
         self._has_cover = False
 
+    def has_cover(self) -> bool:
+        return self._has_cover
+
     def set_cover(self, cover_path: str | None) -> None:
-        """Show the comic's cover, or hide the thumbnail when there's no neighbor."""
+        """Load the comic's cover; sets has_cover() but leaves visibility to the owner."""
         pixmap = QPixmap(cover_path) if cover_path else QPixmap()
         if pixmap.isNull():
             self.clear()
-            self.setVisible(False)
             self._has_cover = False
             return
         self.setPixmap(
@@ -581,7 +591,6 @@ class _ComicThumbButton(QLabel):
                 Qt.TransformationMode.SmoothTransformation,
             )
         )
-        self.setVisible(True)
         self._has_cover = True
 
     def mousePressEvent(self, event):
@@ -595,8 +604,9 @@ class ReaderFooter(QWidget):
     prev_comic_clicked = pyqtSignal()
     next_comic_clicked = pyqtSignal()
     HEIGHT = 56
-    _THUMB_W = 30
-    _THUMB_H = 42
+    # Floating cover thumbnails (drawn as overlays by the owner, above this bar).
+    THUMB_W = 60
+    THUMB_H = 84
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -606,41 +616,37 @@ class ReaderFooter(QWidget):
         self._total = 0
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 0, 16, 0)
+        # Leave room at each edge for the floating cover thumbnails, which sit
+        # outside the nav arrows (the owner positions them as overlays).
+        edge = self.THUMB_W + 16
+        layout.setContentsMargins(edge, 0, edge, 0)
         layout.setSpacing(10)
-
-        self._page_label = QLabel("")
-        self._page_label.setMinimumWidth(48)
-        self._page_label.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        )
-        layout.addWidget(self._page_label)
-
-        self._prev_thumb = _ComicThumbButton(self._THUMB_W, self._THUMB_H)
-        self._prev_thumb.clicked.connect(self.prev_comic_clicked)
-        layout.addWidget(self._prev_thumb)
 
         self._prev_btn = self._make_nav_button("‹", "Previous comic")
         self._prev_btn.clicked.connect(self.prev_comic_clicked)
         layout.addWidget(self._prev_btn)
 
+        # Page numbers hug the progress bar (current on its left, total on its right).
+        self._page_label = QLabel("")
+        self._page_label.setMinimumWidth(28)
+        self._page_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(self._page_label)
+
         self.seek_bar = SeekBar()
         layout.addWidget(self.seek_bar, stretch=1)
+
+        self._total_label = QLabel("")
+        self._total_label.setMinimumWidth(28)
+        self._total_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(self._total_label)
 
         self._next_btn = self._make_nav_button("›", "Next comic")
         self._next_btn.clicked.connect(self.next_comic_clicked)
         layout.addWidget(self._next_btn)
-
-        self._next_thumb = _ComicThumbButton(self._THUMB_W, self._THUMB_H)
-        self._next_thumb.clicked.connect(self.next_comic_clicked)
-        layout.addWidget(self._next_thumb)
-
-        self._total_label = QLabel("")
-        self._total_label.setMinimumWidth(48)
-        self._total_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        layout.addWidget(self._total_label)
 
     def _make_nav_button(self, glyph: str, tip: str) -> QPushButton:
         btn = QPushButton(glyph)
@@ -657,12 +663,10 @@ class ReaderFooter(QWidget):
     def set_current(self, page_1based: int) -> None:
         self._page_label.setText(str(page_1based) if self._total > 0 else "")
 
-    def set_neighbors(self, prev_cover: str | None, next_cover: str | None) -> None:
-        """Show cover thumbnails and enable buttons for available neighbors."""
-        self._prev_thumb.set_cover(prev_cover)
-        self._next_thumb.set_cover(next_cover)
-        self._prev_btn.setEnabled(prev_cover is not None)
-        self._next_btn.setEnabled(next_cover is not None)
+    def set_nav_enabled(self, prev: bool, next: bool) -> None:
+        """Enable the prev/next arrows for whichever neighbors exist."""
+        self._prev_btn.setEnabled(prev)
+        self._next_btn.setEnabled(next)
 
     def apply_theme(self, c: dict) -> None:
         self.setStyleSheet(

@@ -492,6 +492,7 @@ from preloader import PageCache, PagePreloader
 from settings_view import SettingsView
 from stats_dialog import StatsDialog
 from viewer import (
+    ComicThumbButton,
     ComicViewer,
     FitMode,
     ReaderFooter,
@@ -1065,6 +1066,18 @@ class MainWindow(QMainWindow):
         container.installEventFilter(self)
         self._position_sidebar_overlay()
 
+        # Prev/next comic covers float over the top edge of the reader footer.
+        # They're children of `content` (not the footer) so they aren't clipped
+        # to the thin bar and can rise above it over the page.
+        self._prev_thumb_ov = ComicThumbButton(ReaderFooter.THUMB_W, ReaderFooter.THUMB_H, content)
+        self._next_thumb_ov = ComicThumbButton(ReaderFooter.THUMB_W, ReaderFooter.THUMB_H, content)
+        self._prev_thumb_ov.clicked.connect(self._open_prev_comic)
+        self._next_thumb_ov.clicked.connect(self._open_next_comic)
+        self._prev_thumb_ov.hide()
+        self._next_thumb_ov.hide()
+        # Reposition/redisplay the thumbs whenever the footer shows, hides, or moves.
+        self._reader_footer.installEventFilter(self)
+
         self._trans_overlay = QLabel(content)
         self._trans_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._trans_overlay.hide()
@@ -1123,6 +1136,33 @@ class MainWindow(QMainWindow):
         self._sidebar.setGeometry(0, 0, self._sidebar.width(), host.height())
         self._sidebar.raise_()
 
+    def _position_footer_thumbs(self) -> None:
+        """Float the prev/next covers over the top edge of the footer bar.
+
+        Each cover overlaps the bar by a little and rises above it over the page.
+        Shown only while the footer is visible and the neighbor exists.
+        """
+        prev_ov = getattr(self, "_prev_thumb_ov", None)
+        if prev_ov is None:
+            return
+        footer = self._reader_footer
+        visible = footer.isVisible()
+        fw, fh = ReaderFooter.THUMB_W, ReaderFooter.THUMB_H
+        # Bottom of the cover rests just above the bottom of the bar; the rest
+        # of it rises above the bar over the page.
+        lift = 6
+        top = footer.y() + footer.height() - lift - fh
+        margin = 12
+        right_x = self._content.width() - margin - fw
+        for thumb, x in (
+            (self._prev_thumb_ov, margin),
+            (self._next_thumb_ov, right_x),
+        ):
+            thumb.move(x, top)
+            thumb.setVisible(visible and thumb.has_cover())
+            if thumb.isVisible():
+                thumb.raise_()
+
     def _set_gutter(self, on: bool) -> None:
         """Reserve (or release) the left gutter the floating sidebar sits in.
 
@@ -1150,6 +1190,13 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event) -> bool:
         if obj is getattr(self, "_sidebar_host", None) and event.type() == QEvent.Type.Resize:
             self._position_sidebar_overlay()
+            self._position_footer_thumbs()
+            return False
+        if obj is getattr(self, "_reader_footer", None) and event.type() in (
+            QEvent.Type.Show, QEvent.Type.Hide,
+            QEvent.Type.Move, QEvent.Type.Resize,
+        ):
+            self._position_footer_thumbs()
             return False
         if event.type() == QEvent.Type.KeyPress and self._is_reading_view():
             focus = QApplication.focusWidget()
@@ -2409,16 +2456,16 @@ class MainWindow(QMainWindow):
         self._reader_footer.set_current(page + 1)
 
     def _update_footer_neighbors(self) -> None:
-        """Refresh the prev/next comic thumbnails on the footer for the open comic."""
+        """Refresh the floating prev/next covers and nav arrows for the open comic."""
         prev_comic = next_comic = None
         if self._current_comic_id is not None:
             prev_comic, next_comic = self._library.get_comic_neighbors(
                 self._current_comic_id
             )
-        self._reader_footer.set_neighbors(
-            prev_comic.cover_path if prev_comic else None,
-            next_comic.cover_path if next_comic else None,
-        )
+        self._prev_thumb_ov.set_cover(prev_comic.cover_path if prev_comic else None)
+        self._next_thumb_ov.set_cover(next_comic.cover_path if next_comic else None)
+        self._reader_footer.set_nav_enabled(prev_comic is not None, next_comic is not None)
+        self._position_footer_thumbs()
 
     def _open_neighbor_comic(self, forward: bool) -> None:
         """Open the previous/next comic in series-or-folder order, if any."""
