@@ -614,44 +614,44 @@ class _RailButton(QPushButton):
         pen.setCapStyle(Qt.PenCapStyle.FlatCap)
         return pen
 
-    def _serif_h(self, painter: QPainter, x: float, y: float, t: float = 2.0) -> None:
-        """Vertical serif tick centred on the end of a horizontal stroke."""
-        painter.drawLine(QPointF(x, y - t), QPointF(x, y + t))
-
     def _serif_v(self, painter: QPainter, x: float, y: float, t: float = 1.8) -> None:
         """Horizontal serif foot centred on the end of a vertical stroke."""
         painter.drawLine(QPointF(x - t, y), QPointF(x + t, y))
 
     def _draw_book(self, painter: QPainter, cx: float, cy: float) -> None:
         r = self._icon_rect(cx, cy)
+        # Open book: each page is a parallelogram whose top AND bottom edges slope
+        # gently upward toward the outer corners (parallel, same direction).
+        rise = 1.6
+        top_c = r.top() + 2.5
+        bot_c = r.bottom() - 2.5
+        top_o = top_c - rise
+        bot_o = bot_c - rise
+        lx = r.left() + 1
+        rx = r.right() - 1
         path = QPainterPath()
-        path.moveTo(cx, r.top() + 2)
-        path.lineTo(r.left() + 1, r.top() + 1)
-        path.lineTo(r.left() + 1, r.bottom() - 1)
-        path.lineTo(cx, r.bottom() - 2)
-        path.moveTo(cx, r.top() + 2)
-        path.lineTo(r.right() - 1, r.top() + 1)
-        path.lineTo(r.right() - 1, r.bottom() - 1)
-        path.lineTo(cx, r.bottom() - 2)
-        path.moveTo(cx, r.top() + 2)
-        path.lineTo(cx, r.bottom() - 2)
+        path.moveTo(cx, top_c)
+        path.lineTo(lx, top_o)
+        path.lineTo(lx, bot_o)
+        path.lineTo(cx, bot_c)
+        path.moveTo(cx, top_c)
+        path.lineTo(rx, top_o)
+        path.lineTo(rx, bot_o)
+        path.lineTo(cx, bot_c)
+        path.moveTo(cx, top_c)
+        path.lineTo(cx, bot_c)
         painter.setPen(self._icon_pen(1.3))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
-        # serif feet at the outer base of each cover
-        self._serif_v(painter, r.left() + 1, r.bottom() - 1, 1.6)
-        self._serif_v(painter, r.right() - 1, r.bottom() - 1, 1.6)
 
     def _draw_hamburger(self, painter: QPainter, cx: float, cy: float) -> None:
-        # Three serifed hairlines that echo the serif title beside them; the top
-        # and bottom lines align with the title's cap-top and baseline.
+        # Three thin lines; the top and bottom align with the title's cap-top and
+        # baseline beside them.
         half_w = 8.0
         half_h = bookshelf_mod.header_title_cap_band() / 2
-        painter.setPen(self._icon_pen(1.2))
+        painter.setPen(self._icon_pen(1.3))
         for y in (cy - half_h, cy, cy + half_h):
             painter.drawLine(QPointF(cx - half_w, y), QPointF(cx + half_w, y))
-            self._serif_h(painter, cx - half_w, y, 1.9)
-            self._serif_h(painter, cx + half_w, y, 1.9)
 
     def _draw_menu(self, painter: QPainter, cx: float, cy: float) -> None:
         self._draw_hamburger(painter, cx, cy)
@@ -725,7 +725,7 @@ class _Sidebar(QWidget):
 
     COLLAPSED_W = 60
     CELL = 60
-    EXPANDED_W = 200
+    EXPANDED_W = 220  # widened ~two spaces so labels like "Currently Reading" aren't tight
 
     def __init__(self, *, show_app_menu: bool = False, parent=None):
         super().__init__(parent)
@@ -753,7 +753,7 @@ class _Sidebar(QWidget):
         self._top_box.setObjectName("SidebarTop")
         self._top_box.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         top_layout = QVBoxLayout(self._top_box)
-        top_layout.setContentsMargins(0, 8, 0, 0)
+        top_layout.setContentsMargins(0, 0, 0, 0)
         top_layout.setSpacing(0)
 
         self._btn_hamburger = self._make_item("", "", kind="hamburger")
@@ -928,7 +928,7 @@ class _Sidebar(QWidget):
         c = self._theme
         # The sidebar itself stays transparent/click-through; the two boxes paint.
         self.setStyleSheet("background: transparent;")
-        self._top_box.setStyleSheet(f"#SidebarTop {{ background: {c['sidebar_bg']}; }}")
+        self._top_box.setStyleSheet("#SidebarTop { background: transparent; }")
         self._panel.setStyleSheet(f"#SidebarPanel {{ background: {c['sidebar_bg']}; }}")
         expanded = self._expanded or self._search_active
         # Icons keep their full collapsed size whether or not the rail is expanded;
@@ -951,7 +951,7 @@ class _Sidebar(QWidget):
             # Background/hover/active only — the glyph is painted by _RailButton.
             btn.setStyleSheet(
                 f"QPushButton {{ border: none; background: {bg};"
-                f" border-radius: 6px; margin: 6px; }}"
+                f" border-radius: 0; margin: 0; }}"
                 f"QPushButton:hover {{ background: rgba(255,255,255,0.08); }}"
             )
         self._search_input.setStyleSheet(
@@ -1134,9 +1134,13 @@ class MainWindow(QMainWindow):
 
         content = QWidget()
         self._content = content
+        content.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        content.setAutoFillBackground(False)
+        content.setStyleSheet("background: transparent;")
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
+        self._stack.setStyleSheet("background: transparent;")
         content_layout.addWidget(self._stack)
         self._reader_bar.setParent(content)
         self._thumb_strip.setParent(content)
@@ -1165,10 +1169,17 @@ class MainWindow(QMainWindow):
         h_layout.addWidget(content)
         self.setCentralWidget(container)
 
+        # One solid strip for the whole top icon/title row — sidebar + library
+        # header both sit on this so the colour is identical pixel-for-pixel.
+        self._top_chrome = QWidget(container)
+        self._top_chrome.setObjectName("TopChrome")
+        self._top_chrome.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
         # Float the sidebar over the content as an overlay child of the container.
         self._sidebar.setParent(container)
         self._sidebar.raise_()
         self._sidebar.show()
+        self._top_chrome.show()
         self._sidebar.expanded_changed.connect(self._position_sidebar_overlay)
         container.installEventFilter(self)
         self._position_sidebar_overlay()
@@ -1249,6 +1260,10 @@ class MainWindow(QMainWindow):
         host = getattr(self, "_sidebar_host", None)
         if host is None:
             return
+        chrome = getattr(self, "_top_chrome", None)
+        if chrome is not None and chrome.isVisible():
+            chrome.setGeometry(0, 0, host.width(), _Sidebar.CELL)
+            chrome.lower()
         self._sidebar.setGeometry(0, 0, self._sidebar.width(), host.height())
         self._sidebar.raise_()
 
@@ -1319,9 +1334,14 @@ class MainWindow(QMainWindow):
     def _show_sidebar(self) -> None:
         self._set_gutter(True)
         self._sidebar.show()
+        if getattr(self, "_top_chrome", None) is not None:
+            self._top_chrome.show()
+            self._position_sidebar_overlay()
 
     def _hide_sidebar(self) -> None:
         self._sidebar.hide()
+        if getattr(self, "_top_chrome", None) is not None:
+            self._top_chrome.hide()
         self._set_gutter(False)
 
     def eventFilter(self, obj, event) -> bool:
@@ -1997,6 +2017,11 @@ class MainWindow(QMainWindow):
         from PyQt6.QtWidgets import QApplication
         self._theme = c
         QApplication.instance().setStyleSheet(themes.app_stylesheet(c))
+        chrome = getattr(self, "_top_chrome", None)
+        if chrome is not None:
+            chrome.setStyleSheet(
+                f"#TopChrome {{ background-color: {c['sidebar_bg']}; border: none; }}"
+            )
         self._sidebar.apply_theme(c)
         self._reader_bar.apply_theme(c)
         self._reader_footer.apply_theme(c)

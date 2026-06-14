@@ -52,6 +52,12 @@ from batch_tools import BatchPlan, BatchWorker, plan_convert_to_cbz, plan_rename
 from app_info import app_settings
 from library import Comic, Folder, Library, Shelf
 
+
+def _hex_to_rgba(hex_color: str, alpha: int) -> str:
+    color = QColor(hex_color)
+    return f"rgba({color.red()}, {color.green()}, {color.blue()}, {alpha})"
+
+
 TILE_W = 200
 COVER_H = 300
 _TITLE_FONT_SIZE = 14
@@ -607,10 +613,10 @@ class _HeaderBackButton(QPushButton):
         self.setToolTip("Back")
         self.setFixedSize(self.WIDTH, self.HEIGHT)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        # Same rounded hover highlight as the sidebar rail icons.
+        # Same hover highlight as the sidebar rail icons — flush 60×60 square.
         self.setStyleSheet(
             "QPushButton { background: transparent; border: none;"
-            " border-radius: 6px; margin: 6px; }"
+            " border-radius: 0; margin: 0; }"
             "QPushButton:hover { background: rgba(255,255,255,0.08); }"
         )
 
@@ -654,11 +660,6 @@ class _HeaderBackButton(QPushButton):
             QPointF(left, cy),
             QPointF(left + arm, bottom),
         )
-        # serif foot at the shaft tail, echoing the serif title
-        painter.drawLine(
-            QPointF(right, cy - 2.2),
-            QPointF(right, cy + 2.2),
-        )
 
 
 class _HeaderTitle(QLabel):
@@ -686,7 +687,14 @@ class _HeaderTitle(QLabel):
         cap_band = -fm.tightBoundingRect("Lh").top()
         target_center = self.height() / 2
         baseline = target_center + cap_band / 2
-        painter.drawText(0, int(round(baseline)), self.text())
+        text = self.text()
+        # Inset the text by the same gap the rail icons / back arrow have from the
+        # bar edge (carried via contentsMargins so the label reserves the room),
+        # and cancel the first glyph's left side-bearing so the *visible* left edge
+        # of the text lands exactly at that inset.
+        left_bearing = fm.tightBoundingRect(text or "M").left()
+        x = self.contentsRect().left() - left_bearing
+        painter.drawText(int(round(x)), int(round(baseline)), text)
 
 
 class _HeaderBar(QWidget):
@@ -714,13 +722,14 @@ class _HeaderBar(QWidget):
         super().__init__(parent)
         self.setObjectName("HeaderBar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setFixedHeight(68)
+        self.setFixedHeight(_HeaderBackButton.HEIGHT)
         self.setStyleSheet(
-            "#HeaderBar { background: #ecdede; border: none; }"
+            "#HeaderBar { background: transparent; border: none; }"
         )
+        self.setAutoFillBackground(False)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 8, 12, 0)
+        layout.setContentsMargins(0, 0, 12, 0)
         layout.setSpacing(8)
 
         # Back button — hidden on the root folder view, shown once you drill in.
@@ -731,6 +740,11 @@ class _HeaderBar(QWidget):
 
         self._title = _HeaderTitle("Library")
         self._title.setFont(header_title_font())
+        # Same gap from the bar edge that the rail icons / back arrow have: the
+        # arrow is a WIDTH-wide slot with a centred ICON_W glyph, so its inset is
+        # (WIDTH - ICON_W) / 2. Give the title that exact left inset.
+        title_inset = int((_HeaderBackButton.WIDTH - _HeaderBackButton.ICON_W) / 2)
+        self._title.setContentsMargins(title_inset, 0, 0, 0)
         self._title.setFixedHeight(_HeaderBackButton.HEIGHT)
         self._title.set_color("#2a1818")
         layout.addWidget(self._title)
@@ -817,8 +831,10 @@ class _HeaderBar(QWidget):
         self._filter_combo.setStyleSheet(combo_css)
 
     def apply_theme(self, c: dict):
+        bg = _hex_to_rgba(c["header_bg"], 218)
+        border = _hex_to_rgba(c["border"], 190)
         self.setStyleSheet(
-            f"#HeaderBar {{ background: {c['header_bg']}; border: none; }}"
+            f"#HeaderBar {{ background: {bg}; border-bottom: 2px solid {border}; }}"
         )
         self._title.set_color(c["text"])
         self._apply_btn_styles(c)
@@ -845,6 +861,7 @@ class BookshelfView(QWidget):
         self._currently_reading_mode: bool = False
         self._status_filter: str = ""   # '' | recently_read | unread | finished
         self._last_n_cols = 0
+        self._top_row_color = QColor("#171212")
 
         self._selected_ids: set[int] = set()
         self._comic_tiles: dict[int, ComicTile] = {}
@@ -865,14 +882,21 @@ class BookshelfView(QWidget):
         self._pre_search_shelf_id: int | None = None
         self._pre_search_shelf_name: str = ""
 
-        # Without WA_StyledBackground, a QWidget subclass ignores stylesheet
-        # backgrounds — needed now that the scroll area is transparent.
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet("background-color: #f0e8e8;")
+        self.setAutoFillBackground(False)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        # Solid chrome row — same colour as the sidebar rail — so tile_bg / background
+        # art never tints the library header (that caused the seam mismatch).
+        self._header_chrome = QWidget()
+        self._header_chrome.setObjectName("HeaderChrome")
+        self._header_chrome.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._header_chrome.setFixedHeight(_HeaderBackButton.HEIGHT)
+        chrome_layout = QHBoxLayout(self._header_chrome)
+        chrome_layout.setContentsMargins(0, 0, 0, 0)
+        chrome_layout.setSpacing(0)
 
         self._header = _HeaderBar()
         self._header.back_clicked.connect(self._on_back_clicked)
@@ -880,7 +904,8 @@ class BookshelfView(QWidget):
         self._header.filter_changed.connect(self._on_filter_changed)
         self._header.options_menu_requested.connect(self._on_options_menu)
         self._header.customContextMenuRequested.connect(self._on_header_folder_menu)
-        root.addWidget(self._header)
+        chrome_layout.addWidget(self._header)
+        root.addWidget(self._header_chrome)
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -899,9 +924,9 @@ class BookshelfView(QWidget):
         self._scroll.viewport().installEventFilter(self)
         root.addWidget(self._scroll)
 
-        # Fixed (non-scrolling) background image, behind the grid inside the viewport.
+        # Fixed background image — content area only (never under the header row).
         self._bg_spec: dict | None = None  # v2 source spec — rendered at display resolution
-        self._bg_label = QLabel(self._scroll.viewport())
+        self._bg_label = QLabel(self)
         self._bg_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._bg_label.setScaledContents(False)
         self._bg_label.hide()
@@ -921,7 +946,7 @@ class BookshelfView(QWidget):
         self._grid_widget = QWidget()
         _transparent(self._grid_widget)
         self._scroll.setWidget(self._grid_widget)
-        self._bg_label.stackUnder(self._grid_widget)
+        self._bg_label.lower()
 
         self._migrate_background_cover_paths()
         self._maybe_migrate_background_storage()
@@ -1260,11 +1285,20 @@ class BookshelfView(QWidget):
         _PROGRESS_TRACK = QColor(c["progress_track"])
         _PROGRESS_FILL = QColor(c["progress_fill"])
         _PLACEHOLDER_FG = QColor(c["placeholder_fg"])
-        self.setStyleSheet(f"background-color: {c['tile_bg']};")
         self._scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         self._header.apply_theme(c)
+        self._header_chrome.setStyleSheet(
+            "#HeaderChrome { background: transparent; border: none; }"
+        )
+        self._top_row_color = QColor(c["sidebar_bg"])
+        self.update()
         self._apply_background()
         self.refresh()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), _BG)
+        p.end()
 
     def _show_folders(self):
         def do():
@@ -1461,7 +1495,7 @@ class BookshelfView(QWidget):
         self._grid_widget = QWidget()
         _transparent(self._grid_widget)
         self._scroll.setWidget(self._grid_widget)
-        self._bg_label.stackUnder(self._grid_widget)
+        self._bg_label.lower()
         self._apply_background()
 
         layout = QVBoxLayout(self._grid_widget)
@@ -3043,21 +3077,20 @@ class BookshelfView(QWidget):
     def _apply_background(self) -> None:
         vp = self._scroll.viewport()
         dpr = self._background_device_pixel_ratio(vp)
-        w = max(1, int(vp.width() * dpr))
-        h = max(1, int(vp.height() * dpr))
-        if not self._bg_spec or vp.width() <= 0 or vp.height() <= 0:
+        if not self._bg_spec or self.width() <= 0 or self.height() <= 0:
             self._bg_label.hide()
             return
+        w = max(1, int(self.width() * dpr))
+        h = max(1, int(self.height() * dpr))
         pix = self._build_background_pixmap(w, h)
         if pix is None:
             self._bg_label.hide()
             return
         pix.setDevicePixelRatio(dpr)
-        self._bg_label.setGeometry(0, 0, vp.width(), vp.height())
+        self._bg_label.setGeometry(0, 0, self.width(), self.height())
         self._bg_label.setPixmap(pix)
-        self._bg_label.stackUnder(self._grid_widget)
-        self._bg_label.show()
         self._bg_label.lower()
+        self._bg_label.show()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -3070,5 +3103,6 @@ class BookshelfView(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._apply_background()
         if self._n_cols() != self._last_n_cols:
             self._repopulate()
