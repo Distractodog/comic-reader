@@ -5,11 +5,16 @@ from __future__ import annotations
 from enum import Enum
 
 from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton, QScrollArea, QToolTip, QWidget
 
 CLICK_ZONE_FRACTION = 0.30  # left/right 30% = nav zones, middle 40% = dead zone
 _SLIDE_DURATION_MS = 120
+
+
+def _hex_to_rgba(hex_color: str, alpha: int) -> str:
+    color = QColor(hex_color)
+    return f"rgba({color.red()}, {color.green()}, {color.blue()}, {alpha})"
 
 
 class FitMode(Enum):
@@ -71,6 +76,7 @@ class ComicViewer(QGraphicsView):
 
     page_forward = pyqtSignal()
     page_back = pyqtSignal()
+    center_clicked = pyqtSignal()
     mouse_moved = pyqtSignal(int)  # viewport y — used for fullscreen bar reveal
 
     def __init__(self, parent=None):
@@ -104,6 +110,8 @@ class ComicViewer(QGraphicsView):
         self._rtl = False
         self._animate = True
         self._click_nav = True
+        self._defer_resize_fit = False
+        self._resize_fit_pending = False
         self._swipe_x = 0
         self._swipe_y = 0
         self._swipe_fired = False
@@ -138,6 +146,15 @@ class ComicViewer(QGraphicsView):
 
     def set_click_nav(self, enabled: bool) -> None:
         self._click_nav = enabled
+
+    def set_defer_resize_fit(self, enabled: bool) -> None:
+        """Temporarily defer fit recalculation during chrome height animations."""
+        self._defer_resize_fit = enabled
+        if not enabled and self._resize_fit_pending:
+            self._resize_fit_pending = False
+            if self._has_image and self._fit_mode != FitMode.ACTUAL_SIZE:
+                self._apply_display_pixmap()
+                self._apply_fit()
 
     def set_image(self, image_bytes: bytes, direction: int = 0):
         """Load a new page from raw bytes."""
@@ -287,18 +304,19 @@ class ComicViewer(QGraphicsView):
         self._apply_fit()
 
     def mousePressEvent(self, event):
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and self._has_image
-            and self._click_nav
-        ):
+        if event.button() == Qt.MouseButton.LeftButton and self._has_image:
             x = event.position().x()
             w = self.viewport().width()
-            if x < w * CLICK_ZONE_FRACTION:
+            left_edge = w * CLICK_ZONE_FRACTION
+            right_edge = w * (1 - CLICK_ZONE_FRACTION)
+            if self._click_nav and x < left_edge:
                 (self.page_forward if self._rtl else self.page_back).emit()
                 return
-            elif x > w * (1 - CLICK_ZONE_FRACTION):
+            elif self._click_nav and x > right_edge:
                 (self.page_back if self._rtl else self.page_forward).emit()
+                return
+            elif left_edge <= x <= right_edge:
+                self.center_clicked.emit()
                 return
         super().mousePressEvent(event)
 
@@ -351,6 +369,9 @@ class ComicViewer(QGraphicsView):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._has_image and self._fit_mode != FitMode.ACTUAL_SIZE:
+            if self._defer_resize_fit:
+                self._resize_fit_pending = True
+                return
             self._apply_display_pixmap()
             self._apply_fit()
 
@@ -598,15 +619,60 @@ class ComicThumbButton(QLabel):
             self.clicked.emit()
 
 
+class _FooterJumpButton(QPushButton):
+    """Prev/next comic button with a thin stop line and matching-height arrow."""
+
+    def __init__(self, forward: bool, tip: str, parent=None):
+        super().__init__(parent)
+        self._forward = forward
+        self._color = QColor("#ffffff")
+        self._disabled_color = QColor("#8a7a7a")
+        self.setFlat(True)
+        self.setFixedSize(44, 41)
+        self.setToolTip(tip)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet("background: transparent; border: none; padding: 0;")
+
+    def set_colors(self, color: QColor, disabled: QColor) -> None:
+        self._color = color
+        self._disabled_color = disabled
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = self._color if self.isEnabled() else self._disabled_color
+        pen = QPen(
+            color,
+            2,
+            Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.RoundCap,
+            Qt.PenJoinStyle.RoundJoin,
+        )
+        painter.setPen(pen)
+
+        y_top = 9
+        y_mid = self.height() // 2
+        y_bottom = self.height() - 9
+        if self._forward:
+            painter.drawLine(QPoint(18, y_top), QPoint(29, y_mid))
+            painter.drawLine(QPoint(29, y_mid), QPoint(18, y_bottom))
+            painter.drawLine(QPoint(33, y_top), QPoint(33, y_bottom))
+        else:
+            painter.drawLine(QPoint(11, y_top), QPoint(11, y_bottom))
+            painter.drawLine(QPoint(26, y_top), QPoint(14, y_mid))
+            painter.drawLine(QPoint(14, y_mid), QPoint(26, y_bottom))
+
+
 class ReaderFooter(QWidget):
     """Bottom reader bar: current page, prev/next comic thumbs + buttons, seek bar, total pages."""
 
     prev_comic_clicked = pyqtSignal()
     next_comic_clicked = pyqtSignal()
-    HEIGHT = 56
+    HEIGHT = 63
     # Floating cover thumbnails (drawn as overlays by the owner, above this bar).
-    THUMB_W = 60
-    THUMB_H = 84
+    THUMB_W = 68
+    THUMB_H = 95
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -618,17 +684,17 @@ class ReaderFooter(QWidget):
         layout = QHBoxLayout(self)
         # Leave room at each edge for the floating cover thumbnails, which sit
         # outside the nav arrows (the owner positions them as overlays).
-        edge = self.THUMB_W + 16
+        edge = self.THUMB_W + 33
         layout.setContentsMargins(edge, 0, edge, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(11)
 
-        self._prev_btn = self._make_nav_button("‹", "Previous comic")
+        self._prev_btn = self._make_nav_button(False, "Previous comic")
         self._prev_btn.clicked.connect(self.prev_comic_clicked)
         layout.addWidget(self._prev_btn)
 
         # Page numbers hug the progress bar (current on its left, total on its right).
         self._page_label = QLabel("")
-        self._page_label.setMinimumWidth(28)
+        self._page_label.setMinimumWidth(32)
         self._page_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
@@ -638,23 +704,18 @@ class ReaderFooter(QWidget):
         layout.addWidget(self.seek_bar, stretch=1)
 
         self._total_label = QLabel("")
-        self._total_label.setMinimumWidth(28)
+        self._total_label.setMinimumWidth(32)
         self._total_label.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
         layout.addWidget(self._total_label)
 
-        self._next_btn = self._make_nav_button("›", "Next comic")
+        self._next_btn = self._make_nav_button(True, "Next comic")
         self._next_btn.clicked.connect(self.next_comic_clicked)
         layout.addWidget(self._next_btn)
 
-    def _make_nav_button(self, glyph: str, tip: str) -> QPushButton:
-        btn = QPushButton(glyph)
-        btn.setFlat(True)
-        btn.setFixedSize(28, 28)
-        btn.setToolTip(tip)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        return btn
+    def _make_nav_button(self, forward: bool, tip: str) -> QPushButton:
+        return _FooterJumpButton(forward, tip)
 
     def set_total(self, total: int) -> None:
         self._total = total
@@ -669,20 +730,18 @@ class ReaderFooter(QWidget):
         self._next_btn.setEnabled(next)
 
     def apply_theme(self, c: dict) -> None:
+        bg = _hex_to_rgba(c["reader_bar_bg"], 218)
+        border = _hex_to_rgba(c["border"], 190)
         self.setStyleSheet(
-            f"#ReaderFooter {{ background: {c['reader_bar_bg']};"
-            f" border-top: 2px solid {c['border']}; }}"
+            f"#ReaderFooter {{ background: {bg};"
+            f" border-top: 2px solid {border}; }}"
         )
-        label_style = f"background: transparent; color: {c['text']}; font-size: 13px;"
+        label_style = f"background: transparent; color: {c['text']}; font-size: 15px;"
         self._page_label.setStyleSheet(label_style)
         self._total_label.setStyleSheet(label_style)
-        btn_style = (
-            f"QPushButton {{ background: transparent; color: {c['accent']};"
-            f" border: none; font-size: 22px; padding: 0; }}"
-            f"QPushButton:disabled {{ color: {c['border']}; }}"
-        )
-        self._prev_btn.setStyleSheet(btn_style)
-        self._next_btn.setStyleSheet(btn_style)
+        disabled = QColor(c["border"])
+        self._prev_btn.set_colors(QColor("#ffffff"), disabled)
+        self._next_btn.set_colors(QColor("#ffffff"), disabled)
 
 
 # ---------------------------------------------------------------------------

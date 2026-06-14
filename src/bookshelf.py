@@ -11,6 +11,7 @@ from PyQt6.QtCore import (
     QEvent,
     QMimeData,
     QPoint,
+    QPointF,
     QPropertyAnimation,
     QSettings,
     QRect,
@@ -568,6 +569,126 @@ class ShelfTile(_Tile):
         self.shelf_opened.emit(self._shelf.id, self._shelf.name)
 
 
+HEADER_TITLE_PX = 18
+
+
+def header_title_font() -> QFont:
+    """The header title font, shared so the hamburger/back icons can match it."""
+    f = QFont("Libre Baskerville")
+    f.setPixelSize(HEADER_TITLE_PX)
+    f.setWeight(QFont.Weight.DemiBold)
+    return f
+
+
+def header_title_cap_band() -> int:
+    """Height in px of the title's *regular-letter* band: cap/ascender top down
+    to the baseline, ignoring descenders (the tail of 'y'). The hamburger and
+    back-arrow size their top/bottom edges to this so they line up with the text.
+    """
+    fm = QFontMetrics(header_title_font())
+    # "Lh" = a capital + an ascender, the tallest regular ink; top() is negative
+    # (above baseline), baseline is 0, so the band height is just -top().
+    return -fm.tightBoundingRect("Lh").top()
+
+
+class _HeaderBackButton(QPushButton):
+    """Back button painted in the same slot as the sidebar rail icons."""
+
+    WIDTH = 60
+    HEIGHT = 60
+    ICON_W = 16.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._color = QColor("#ffffff")
+        self._hover_color = QColor("#ffffff")
+        self.setFlat(True)
+        self.setText("")
+        self.setToolTip("Back")
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # Same rounded hover highlight as the sidebar rail icons.
+        self.setStyleSheet(
+            "QPushButton { background: transparent; border: none;"
+            " border-radius: 6px; margin: 6px; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.08); }"
+        )
+
+    def set_colors(self, color: str, hover: str | None = None) -> None:
+        self._color = QColor(color)
+        self._hover_color = QColor(hover or color)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = self._hover_color if self.underMouse() else self._color
+        pen = QPen(
+            color,
+            1.3,
+            Qt.PenStyle.SolidLine,
+            Qt.PenCapStyle.FlatCap,
+            Qt.PenJoinStyle.MiterJoin,
+        )
+        painter.setPen(pen)
+        cx = self.width() / 2
+        cy = self.height() / 2
+        # Height matches the title's regular-letter band so the arrow's top/bottom
+        # line up with the cap-top and baseline of the title text beside it.
+        icon_h = header_title_cap_band()
+        left = cx - self.ICON_W / 2
+        right = cx + self.ICON_W / 2
+        top = cy - icon_h / 2
+        bottom = cy + icon_h / 2
+        arm = self.ICON_W * 0.42
+        painter.drawLine(
+            QPointF(left, cy),
+            QPointF(right, cy),
+        )
+        painter.drawLine(
+            QPointF(left, cy),
+            QPointF(left + arm, top),
+        )
+        painter.drawLine(
+            QPointF(left, cy),
+            QPointF(left + arm, bottom),
+        )
+        # serif foot at the shaft tail, echoing the serif title
+        painter.drawLine(
+            QPointF(right, cy - 2.2),
+            QPointF(right, cy + 2.2),
+        )
+
+
+class _HeaderTitle(QLabel):
+    """Header title painted with explicit vertical centering in the header slot."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._color = QColor("#2a1818")
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setStyleSheet("background: transparent;")
+
+    def set_color(self, color: str) -> None:
+        self._color = QColor(color)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        painter.setFont(self.font())
+        painter.setPen(self._color)
+        fm = QFontMetrics(self.font())
+        # Center the *regular-letter* band (cap/ascender top → baseline), ignoring
+        # descenders, so the visible top and bottom of the text match the
+        # hamburger / back-arrow icons that are sized to the same band.
+        cap_band = -fm.tightBoundingRect("Lh").top()
+        target_center = self.height() / 2
+        baseline = target_center + cap_band / 2
+        painter.drawText(0, int(round(baseline)), self.text())
+
+
 class _HeaderBar(QWidget):
     back_clicked = pyqtSignal()                        # ← back button (only shown off-root)
     sort_changed = pyqtSignal(str, str)                # sort_by, order
@@ -593,31 +714,25 @@ class _HeaderBar(QWidget):
         super().__init__(parent)
         self.setObjectName("HeaderBar")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setFixedHeight(56)
+        self.setFixedHeight(68)
         self.setStyleSheet(
             "#HeaderBar { background: #ecdede; border: none; }"
         )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 0, 12, 0)
+        layout.setContentsMargins(0, 8, 12, 0)
         layout.setSpacing(8)
 
         # Back button — hidden on the root folder view, shown once you drill in.
-        # Wider than tall so the arrow glyph never clips against the button edge.
-        self._back_btn = QPushButton("‹")
-        self._back_btn.setFlat(True)
-        self._back_btn.setToolTip("Back")
-        self._back_btn.setFixedSize(44, 38)
+        self._back_btn = _HeaderBackButton()
         self._back_btn.clicked.connect(self.back_clicked)
         self._back_btn.hide()
         layout.addWidget(self._back_btn)
 
-        self._title = QLabel("Library")
-        title_font = QFont("Libre Baskerville")
-        title_font.setPixelSize(22)
-        title_font.setWeight(QFont.Weight.DemiBold)
-        self._title.setFont(title_font)
-        self._title.setStyleSheet("background: transparent; color: #2a1818;")
+        self._title = _HeaderTitle("Library")
+        self._title.setFont(header_title_font())
+        self._title.setFixedHeight(_HeaderBackButton.HEIGHT)
+        self._title.set_color("#2a1818")
         layout.addWidget(self._title)
         layout.addStretch()
 
@@ -696,15 +811,7 @@ class _HeaderBar(QWidget):
             f"QPushButton:hover {{ color: {text}; }}"
         )
         self._options_btn.setStyleSheet(btn_css)
-        # Back chevron uses the default UI font (not the serif) and centers via
-        # text-align so the glyph never clips against the button edge.
-        back_css = (
-            f"QPushButton {{ color: {text_sec}; border: none; font-size: 28px;"
-            f" font-weight: bold; text-align: center; padding: 0px;"
-            f" background: transparent; }}"
-            f"QPushButton:hover {{ color: {text}; }}"
-        )
-        self._back_btn.setStyleSheet(back_css)
+        self._back_btn.set_colors("#ffffff", "#ffffff")
         combo_css = "QComboBox::drop-down { border: none; width: 20px; }"
         self._sort_combo.setStyleSheet(combo_css)
         self._filter_combo.setStyleSheet(combo_css)
@@ -713,7 +820,7 @@ class _HeaderBar(QWidget):
         self.setStyleSheet(
             f"#HeaderBar {{ background: {c['header_bg']}; border: none; }}"
         )
-        self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
+        self._title.set_color(c["text"])
         self._apply_btn_styles(c)
 
 

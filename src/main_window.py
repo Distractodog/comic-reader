@@ -15,6 +15,7 @@ from PyQt6.QtCore import (
     QPoint,
     QPointF,
     QPropertyAnimation,
+    QRectF,
     QSettings,
     QThread,
     QTimer,
@@ -63,6 +64,11 @@ from PyQt6.QtWidgets import (
 # screen reads as a deliberate transition (and the reader finishes preparing
 # underneath) instead of an unrecognizable flicker.
 _MIN_LOADING_SCREEN_S = 0.7
+
+
+def _hex_to_rgba(hex_color: str, alpha: int) -> str:
+    color = QColor(hex_color)
+    return f"rgba({color.red()}, {color.green()}, {color.blue()}, {alpha})"
 
 
 class _LoadingOverlay(QWidget):
@@ -214,15 +220,14 @@ class _ComicOpenWorker(QThread):
 
 
 class _ReaderBar(QWidget):
-    """Top bar shown while reading — back, title, tool icons, fullscreen, and ⋮ menu."""
+    """Top bar shown while reading — back, title, reader tools, and ⋮ menu."""
     back_clicked = pyqtSignal()
     menu_requested = pyqtSignal()
-    fullscreen_clicked = pyqtSignal()
     bookmark_requested = pyqtSignal()
     fit_requested = pyqtSignal()
     page_mode_requested = pyqtSignal()
     manga_requested = pyqtSignal()
-    HEIGHT = 56
+    HEIGHT = 63
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -234,18 +239,19 @@ class _ReaderBar(QWidget):
             "#ReaderBar { background: #ecdede; border-bottom: 2px solid #c4aeae; }"
         )
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 0, 16, 0)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 0, 18, 0)
+        layout.setSpacing(14)
 
         self._back_btn = QPushButton("←")
         self._back_btn.setFlat(True)
-        self._back_btn.setStyleSheet("color: #8b2a2a; border: none; padding: 4px 8px;")
+        self._back_btn.setFixedSize(41, 41)
+        self._back_btn.setStyleSheet("color: #8b2a2a; border: none; font-size: 24px; padding: 0;")
         self._back_btn.clicked.connect(self.back_clicked)
         layout.addWidget(self._back_btn)
 
         self._title = QLabel()
         title_font = QFont("Libre Baskerville")
-        title_font.setPixelSize(22)
+        title_font.setPixelSize(25)
         title_font.setWeight(QFont.Weight.DemiBold)
         self._title.setFont(title_font)
         self._title.setStyleSheet("background: transparent; color: #2a1818;")
@@ -255,10 +261,10 @@ class _ReaderBar(QWidget):
         def _tool_btn(glyph: str, tooltip: str) -> QPushButton:
             btn = QPushButton(glyph)
             btn.setFlat(True)
-            btn.setFixedSize(36, 36)
+            btn.setFixedSize(47, 47)
             btn.setToolTip(tooltip)
             btn.setStyleSheet(
-                "color: #8b2a2a; border: none; font-size: 18px; padding: 0;"
+                "color: #8b2a2a; border: none; font-size: 26px; padding: 0;"
             )
             layout.addWidget(btn)
             return btn
@@ -273,15 +279,12 @@ class _ReaderBar(QWidget):
         self._manga_btn = _tool_btn("漫", "Reading direction (manga)")
         self._manga_btn.clicked.connect(self.manga_requested)
 
-        self._fullscreen_btn = _tool_btn("⛶", "Hide reader bars")
-        self._fullscreen_btn.clicked.connect(self.fullscreen_clicked.emit)
-
         self._menu_btn = _tool_btn("⋮", "More")
         self._menu_btn.clicked.connect(self.menu_requested)
 
         self._tool_buttons = [
             self._bookmark_btn, self._fit_btn, self._page_mode_btn,
-            self._manga_btn, self._fullscreen_btn, self._menu_btn,
+            self._manga_btn, self._menu_btn,
         ]
 
         self.hide()
@@ -315,25 +318,21 @@ class _ReaderBar(QWidget):
         return self._btn_global_pos(self._manga_btn)
 
     def apply_theme(self, c: dict):
+        bg = _hex_to_rgba(c["reader_bar_bg"], 218)
+        border = _hex_to_rgba(c["border"], 190)
         self.setStyleSheet(
-            f"#ReaderBar {{ background: {c['reader_bar_bg']}; border-bottom: 2px solid {c['border']}; }}"
+            f"#ReaderBar {{ background: {bg}; border-bottom: 2px solid {border}; }}"
         )
         self._back_btn.setStyleSheet(
-            f"background: transparent; color: {c['accent']}; border: none; padding: 4px 8px;"
+            f"background: transparent; color: {c['accent']}; border: none; font-size: 24px; padding: 0;"
         )
         btn_style = (
             f"background: transparent; color: {c['accent']}; border: none;"
-            f" font-size: 18px; padding: 0;"
+            f" font-size: 26px; padding: 0;"
         )
         for btn in self._tool_buttons:
             btn.setStyleSheet(btn_style)
         self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
-
-    def set_chrome_hidden(self, hidden: bool) -> None:
-        self._fullscreen_btn.setToolTip(
-            "Show reader bars" if hidden else "Hide reader bars"
-        )
-
 
 class _AnnotationDialog(QDialog):
     """Small themed editor for one page note."""
@@ -515,14 +514,16 @@ class _RailButton(QPushButton):
     come from the stylesheet (drawn by super().paintEvent).
     """
 
+    ICON_SIDE = 18.0
+
     def __init__(self, icon_char: str, label_text: str, kind: str = "glyph", parent=None):
         super().__init__(parent)
         self._icon = icon_char
         self._label = label_text
-        self._kind = kind  # "glyph" (font char) or "book" (vector outline)
+        self._kind = kind  # "glyph" or a vector-painted rail icon
         self._expanded = False
         self._fg = QColor("#2a1818")
-        self._icon_size = 21  # glyph/vector size, independent of the label font
+        self._icon_size = 21  # label fallback size; vectors use ICON_SIDE
         self.setFlat(True)
         self.setText("")  # we draw the glyph ourselves
 
@@ -559,8 +560,8 @@ class _RailButton(QPushButton):
             # Icon stays centered on the collapsed rail center (x=30) so it never
             # moves when the panel opens; the label is drawn to its right.
             icon_cx = _Sidebar.COLLAPSED_W / 2
-            if self._kind == "book":
-                self._draw_book(painter, icon_cx, h / 2)
+            if self._draw_vector_icon(painter, icon_cx, h / 2):
+                pass
             else:
                 painter.setFont(icon_font)
                 ifm = QFontMetrics(icon_font)
@@ -574,8 +575,8 @@ class _RailButton(QPushButton):
             painter.setPen(self._fg)
             painter.drawText(int(_Sidebar.COLLAPSED_W) + 4, int(round(lbaseline)), self._label)
         else:
-            if self._kind == "book":
-                self._draw_book(painter, self.width() / 2, h / 2)
+            if self._draw_vector_icon(painter, self.width() / 2, h / 2):
+                pass
             else:
                 painter.setFont(icon_font)
                 ifm = QFontMetrics(icon_font)
@@ -585,41 +586,123 @@ class _RailButton(QPushButton):
                 painter.drawText(int(round(x)), int(round(baseline)), self._icon)
         painter.end()
 
-    def _draw_book(self, painter: QPainter, cx: float, cy: float) -> None:
-        """Stroke an open-book outline centered at (cx, cy), sized to the icon font."""
-        s = self._icon_px()
-        k = 0.70                 # overall scale, tuned to match the glyph icons' size
-        hw = s * 0.60 * k        # half width (sets the diagonal's horizontal reach)
-        # Vertically symmetric: page tops rise gently to the outer corners and the
-        # bottoms mirror that same gentle angle. The spine and outer vertical edges
-        # run longer than the short top/bottom diagonals.
-        outer_top_y = cy - s * 0.56 * k
-        spine_top_y = cy - s * 0.48 * k   # barely below the outer corners — gentle slope
-        outer_bot_y = cy + s * 0.48 * k   # mirror of the top angle
-        spine_bot_y = cy + s * 0.56 * k
+    def _icon_rect(self, cx: float, cy: float) -> QRectF:
+        side = 16.0 if self._kind == "hamburger" else self.ICON_SIDE
+        return QRectF(cx - side / 2, cy - side / 2, side, side)
 
-        path = QPainterPath()
-        # left page — straight lines only
-        path.moveTo(cx, spine_top_y)
-        path.lineTo(cx - hw, outer_top_y)      # short diagonal up to outer top corner
-        path.lineTo(cx - hw, outer_bot_y)      # long outer edge down
-        path.lineTo(cx, spine_bot_y)
-        # right page (mirror)
-        path.moveTo(cx, spine_top_y)
-        path.lineTo(cx + hw, outer_top_y)
-        path.lineTo(cx + hw, outer_bot_y)
-        path.lineTo(cx, spine_bot_y)
-        # spine — long center line
-        path.moveTo(cx, spine_top_y)
-        path.lineTo(cx, spine_bot_y)
+    def _draw_vector_icon(self, painter: QPainter, cx: float, cy: float) -> bool:
+        drawers = {
+            "hamburger": self._draw_hamburger,
+            "home": self._draw_home,
+            "book": self._draw_book,
+            "search": self._draw_search,
+            "menu": self._draw_menu,
+            "settings": self._draw_settings,
+        }
+        drawer = drawers.get(self._kind)
+        if drawer is None:
+            return False
+        drawer(painter, cx, cy)
+        return True
 
+    def _icon_pen(self, width: float = 1.3) -> QPen:
+        # Libre Baskerville vibe: thin engraved stroke, sharp mitred corners and
+        # flat terminals (we add our own serifs) rather than a modern monoline.
         pen = QPen(self._fg)
-        pen.setWidthF(max(1.3, s * 0.085))
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(pen)
+        pen.setWidthF(width)
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        return pen
+
+    def _serif_h(self, painter: QPainter, x: float, y: float, t: float = 2.0) -> None:
+        """Vertical serif tick centred on the end of a horizontal stroke."""
+        painter.drawLine(QPointF(x, y - t), QPointF(x, y + t))
+
+    def _serif_v(self, painter: QPainter, x: float, y: float, t: float = 1.8) -> None:
+        """Horizontal serif foot centred on the end of a vertical stroke."""
+        painter.drawLine(QPointF(x - t, y), QPointF(x + t, y))
+
+    def _draw_book(self, painter: QPainter, cx: float, cy: float) -> None:
+        r = self._icon_rect(cx, cy)
+        path = QPainterPath()
+        path.moveTo(cx, r.top() + 2)
+        path.lineTo(r.left() + 1, r.top() + 1)
+        path.lineTo(r.left() + 1, r.bottom() - 1)
+        path.lineTo(cx, r.bottom() - 2)
+        path.moveTo(cx, r.top() + 2)
+        path.lineTo(r.right() - 1, r.top() + 1)
+        path.lineTo(r.right() - 1, r.bottom() - 1)
+        path.lineTo(cx, r.bottom() - 2)
+        path.moveTo(cx, r.top() + 2)
+        path.lineTo(cx, r.bottom() - 2)
+        painter.setPen(self._icon_pen(1.3))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
+        # serif feet at the outer base of each cover
+        self._serif_v(painter, r.left() + 1, r.bottom() - 1, 1.6)
+        self._serif_v(painter, r.right() - 1, r.bottom() - 1, 1.6)
+
+    def _draw_hamburger(self, painter: QPainter, cx: float, cy: float) -> None:
+        # Three serifed hairlines that echo the serif title beside them; the top
+        # and bottom lines align with the title's cap-top and baseline.
+        half_w = 8.0
+        half_h = bookshelf_mod.header_title_cap_band() / 2
+        painter.setPen(self._icon_pen(1.2))
+        for y in (cy - half_h, cy, cy + half_h):
+            painter.drawLine(QPointF(cx - half_w, y), QPointF(cx + half_w, y))
+            self._serif_h(painter, cx - half_w, y, 1.9)
+            self._serif_h(painter, cx + half_w, y, 1.9)
+
+    def _draw_menu(self, painter: QPainter, cx: float, cy: float) -> None:
+        self._draw_hamburger(painter, cx, cy)
+
+    def _draw_home(self, painter: QPainter, cx: float, cy: float) -> None:
+        r = self._icon_rect(cx, cy)
+        path = QPainterPath()
+        path.moveTo(r.left() + 1, cy - 1)
+        path.lineTo(cx, r.top() + 1)
+        path.lineTo(r.right() - 1, cy - 1)
+        path.moveTo(r.left() + 4, cy - 1)
+        path.lineTo(r.left() + 4, r.bottom() - 1)
+        path.lineTo(r.right() - 4, r.bottom() - 1)
+        path.lineTo(r.right() - 4, cy - 1)
+        painter.setPen(self._icon_pen(1.3))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+        # serif feet under the walls
+        self._serif_v(painter, r.left() + 4, r.bottom() - 1, 1.6)
+        self._serif_v(painter, r.right() - 4, r.bottom() - 1, 1.6)
+
+    def _draw_search(self, painter: QPainter, cx: float, cy: float) -> None:
+        r = self._icon_rect(cx, cy)
+        painter.setPen(self._icon_pen(1.3))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QRectF(r.left() + 1, r.top() + 1, 12, 12))
+        # handle with a small serif foot at its end
+        end = QPointF(r.right() - 1, r.bottom() - 1)
+        painter.drawLine(QPointF(cx + 3, cy + 3), end)
+        painter.drawLine(
+            QPointF(end.x() - 1.4, end.y() + 1.4),
+            QPointF(end.x() + 1.4, end.y() - 1.4),
+        )
+
+    def _draw_settings(self, painter: QPainter, cx: float, cy: float) -> None:
+        r = self._icon_rect(cx, cy)
+        painter.setPen(self._icon_pen(1.2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(QRectF(r.left() + 1, r.top() + 1, 16, 16))
+        painter.drawEllipse(QRectF(cx - 4, cy - 4, 8, 8))
+        for x1, y1, x2, y2 in (
+            (cx, r.top() + 1, cx, r.top() + 4),
+            (cx, r.bottom() - 4, cx, r.bottom() - 1),
+            (r.left() + 1, cy, r.left() + 4, cy),
+            (r.right() - 4, cy, r.right() - 1, cy),
+            (r.left() + 3, r.top() + 3, r.left() + 5, r.top() + 5),
+            (r.right() - 5, r.top() + 5, r.right() - 3, r.top() + 3),
+            (r.left() + 3, r.bottom() - 3, r.left() + 5, r.bottom() - 5),
+            (r.right() - 5, r.bottom() - 5, r.right() - 3, r.bottom() - 3),
+        ):
+            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
 
 class _Sidebar(QWidget):
@@ -641,6 +724,7 @@ class _Sidebar(QWidget):
     expanded_changed = pyqtSignal()  # emitted when the rail width changes (overlay re-layout)
 
     COLLAPSED_W = 60
+    CELL = 60
     EXPANDED_W = 200
 
     def __init__(self, *, show_app_menu: bool = False, parent=None):
@@ -670,9 +754,9 @@ class _Sidebar(QWidget):
         self._top_box.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         top_layout = QVBoxLayout(self._top_box)
         top_layout.setContentsMargins(0, 8, 0, 0)
-        top_layout.setSpacing(2)
+        top_layout.setSpacing(0)
 
-        self._btn_hamburger = self._make_item("☰", "")
+        self._btn_hamburger = self._make_item("", "", kind="hamburger")
         self._btn_hamburger.setToolTip("Show/hide labels")
         self._btn_hamburger.clicked.connect(self.toggle_expanded)
         top_layout.addWidget(self._btn_hamburger)
@@ -683,18 +767,18 @@ class _Sidebar(QWidget):
         self._panel.setObjectName("SidebarPanel")
         self._panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         panel_layout = QVBoxLayout(self._panel)
-        panel_layout.setContentsMargins(0, 2, 0, 8)
-        panel_layout.setSpacing(2)
+        panel_layout.setContentsMargins(0, 0, 0, 8)
+        panel_layout.setSpacing(0)
 
-        self._btn_home = self._make_item("⌂", "Library")
+        self._btn_home = self._make_item("", "Library", kind="home")
         self._btn_home.clicked.connect(self._on_home)
         panel_layout.addWidget(self._btn_home)
 
-        self._btn_reading = self._make_item("📖", "Currently Reading", kind="book")
+        self._btn_reading = self._make_item("", "Currently Reading", kind="book")
         self._btn_reading.clicked.connect(self._on_reading)
         panel_layout.addWidget(self._btn_reading)
 
-        self._btn_search = self._make_item("⌕", "Search")
+        self._btn_search = self._make_item("", "Search", kind="search")
         self._btn_search.clicked.connect(self._on_search)
         panel_layout.addWidget(self._btn_search)
 
@@ -712,12 +796,12 @@ class _Sidebar(QWidget):
         # Optional app menu (non-macOS only) near the bottom of the panel.
         self._btn_menu: QPushButton | None = None
         if show_app_menu:
-            self._btn_menu = self._make_item("≡", "Menu")
+            self._btn_menu = self._make_item("", "Menu", kind="menu")
             self._btn_menu.clicked.connect(self.app_menu_requested.emit)
             panel_layout.addWidget(self._btn_menu)
 
         # Settings sits at the very bottom of the panel.
-        self._btn_settings = self._make_item("⚙", "Settings")
+        self._btn_settings = self._make_item("", "Settings", kind="settings")
         self._btn_settings.clicked.connect(self._on_settings)
         panel_layout.addWidget(self._btn_settings)
 
@@ -737,7 +821,7 @@ class _Sidebar(QWidget):
         btn = _RailButton(icon, label, kind=kind)
         if label:
             btn.setToolTip(label)
-        btn.setFixedHeight(48)
+        btn.setFixedHeight(self.CELL)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         return btn
 
@@ -857,7 +941,7 @@ class _Sidebar(QWidget):
             key = active_map.get(id(btn))
             active = key is not None and key == self._active
             bg = "rgba(255,255,255,0.13)" if active else "transparent"
-            icon_px = 18 if btn is self._btn_reading else 21
+            icon_px = 21
             label_px = 13 if (expanded and btn in self._panel_buttons) else icon_px
             font = QFont("Libre Baskerville")
             font.setPixelSize(label_px)
@@ -867,7 +951,7 @@ class _Sidebar(QWidget):
             # Background/hover/active only — the glyph is painted by _RailButton.
             btn.setStyleSheet(
                 f"QPushButton {{ border: none; background: {bg};"
-                f" border-radius: 6px; margin: 1px 6px; }}"
+                f" border-radius: 6px; margin: 6px; }}"
                 f"QPushButton:hover {{ background: rgba(255,255,255,0.08); }}"
             )
         self._search_input.setStyleSheet(
@@ -994,13 +1078,36 @@ class MainWindow(QMainWindow):
         self._reader_footer = ReaderFooter()
         self._reader_footer.setVisible(False)
         self._seek_bar = self._reader_footer.seek_bar  # inner bar; existing calls reuse it
+        self._reader_footer_opacity = QGraphicsOpacityEffect(self._reader_footer)
+        self._reader_footer.setGraphicsEffect(self._reader_footer_opacity)
+        self._reader_footer_opacity.setOpacity(1.0)
+        self._reader_footer_height_anim = QPropertyAnimation(
+            self._reader_footer, b"maximumHeight", self
+        )
+        self._reader_footer_height_anim.setDuration(260)
+        self._reader_footer_height_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._reader_footer_opacity_anim = QPropertyAnimation(
+            self._reader_footer_opacity, b"opacity", self
+        )
+        self._reader_footer_opacity_anim.setDuration(260)
+        self._reader_footer_opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._reader_footer_opacity_anim.valueChanged.connect(
+            lambda value: self._set_footer_thumb_opacity(float(value))
+        )
+        self._reader_footer_anim = QParallelAnimationGroup(self)
+        self._reader_footer_anim.addAnimation(self._reader_footer_height_anim)
+        self._reader_footer_anim.addAnimation(self._reader_footer_opacity_anim)
+        self._reader_footer_anim.finished.connect(
+            self._on_reader_footer_anim_finished
+        )
+        self._reader_footer_should_hide = False
+        self._reader_footer_target_visible = False
 
         self._thumb_strip = ThumbnailStrip()
         self._thumb_strip.setVisible(False)
 
         self._reader_bar = _ReaderBar()
         self._reader_bar.back_clicked.connect(self._back_to_library)
-        self._reader_bar.fullscreen_clicked.connect(self._toggle_reading_chrome)
         self._reader_bar.bookmark_requested.connect(self._show_bookmark_menu)
         self._reader_bar.fit_requested.connect(self._show_fit_menu)
         self._reader_bar.page_mode_requested.connect(self._show_page_mode_menu)
@@ -1010,10 +1117,10 @@ class MainWindow(QMainWindow):
         self._reader_bar_opacity.setOpacity(1.0)
 
         self._reader_bar_height_anim = QPropertyAnimation(self._reader_bar, b"maximumHeight", self)
-        self._reader_bar_height_anim.setDuration(180)
+        self._reader_bar_height_anim.setDuration(260)
         self._reader_bar_height_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._reader_bar_opacity_anim = QPropertyAnimation(self._reader_bar_opacity, b"opacity", self)
-        self._reader_bar_opacity_anim.setDuration(150)
+        self._reader_bar_opacity_anim.setDuration(260)
         self._reader_bar_opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._reader_bar_anim = QParallelAnimationGroup(self)
         self._reader_bar_anim.addAnimation(self._reader_bar_height_anim)
@@ -1030,10 +1137,10 @@ class MainWindow(QMainWindow):
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
-        content_layout.addWidget(self._reader_bar)
         content_layout.addWidget(self._stack)
-        content_layout.addWidget(self._thumb_strip)
-        content_layout.addWidget(self._reader_footer)
+        self._reader_bar.setParent(content)
+        self._thumb_strip.setParent(content)
+        self._reader_footer.setParent(content)
 
         self._sidebar = _Sidebar(show_app_menu=sys.platform != "darwin")
         self._sidebar.app_menu_requested.connect(self._show_app_menu)
@@ -1075,8 +1182,16 @@ class MainWindow(QMainWindow):
         self._next_thumb_ov.clicked.connect(self._open_next_comic)
         self._prev_thumb_ov.hide()
         self._next_thumb_ov.hide()
+        self._prev_thumb_opacity = QGraphicsOpacityEffect(self._prev_thumb_ov)
+        self._next_thumb_opacity = QGraphicsOpacityEffect(self._next_thumb_ov)
+        self._prev_thumb_ov.setGraphicsEffect(self._prev_thumb_opacity)
+        self._next_thumb_ov.setGraphicsEffect(self._next_thumb_opacity)
+        self._prev_thumb_opacity.setOpacity(1.0)
+        self._next_thumb_opacity.setOpacity(1.0)
         # Reposition/redisplay the thumbs whenever the footer shows, hides, or moves.
         self._reader_footer.installEventFilter(self)
+        content.installEventFilter(self)
+        self._position_reader_overlays()
 
         self._trans_overlay = QLabel(content)
         self._trans_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -1098,6 +1213,7 @@ class MainWindow(QMainWindow):
         self._bookshelf.comics_delete_requested.connect(self._prepare_comics_for_deletion)
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
+        self.viewer.center_clicked.connect(self._toggle_reading_chrome)
         self._seek_bar.seeked.connect(self._on_seek_bar)
         self._seek_bar.preview.connect(self._on_seek_preview)
         self._reader_footer.prev_comic_clicked.connect(self._open_prev_comic)
@@ -1136,6 +1252,21 @@ class MainWindow(QMainWindow):
         self._sidebar.setGeometry(0, 0, self._sidebar.width(), host.height())
         self._sidebar.raise_()
 
+    def _position_reader_overlays(self) -> None:
+        """Pin reader chrome over the page without reserving layout space."""
+        content = getattr(self, "_content", None)
+        if content is None:
+            return
+        w = content.width()
+        h = content.height()
+        self._reader_bar.setGeometry(0, 0, w, _ReaderBar.HEIGHT)
+        self._reader_footer.setGeometry(0, h - ReaderFooter.HEIGHT, w, ReaderFooter.HEIGHT)
+        strip_h = self._thumb_strip.sizeHint().height()
+        if strip_h <= 0:
+            strip_h = self._thumb_strip.height() or 110
+        self._thumb_strip.setGeometry(0, max(0, h - ReaderFooter.HEIGHT - strip_h), w, strip_h)
+        self._position_footer_thumbs()
+
     def _position_footer_thumbs(self) -> None:
         """Float the prev/next covers over the top edge of the footer bar.
 
@@ -1146,13 +1277,13 @@ class MainWindow(QMainWindow):
         if prev_ov is None:
             return
         footer = self._reader_footer
-        visible = footer.isVisible()
+        visible = footer.isVisible() and not self._reader_footer_should_hide
         fw, fh = ReaderFooter.THUMB_W, ReaderFooter.THUMB_H
         # Bottom of the cover rests just above the bottom of the bar; the rest
         # of it rises above the bar over the page.
-        lift = 6
+        lift = 7
         top = footer.y() + footer.height() - lift - fh
-        margin = 12
+        margin = 14
         right_x = self._content.width() - margin - fw
         for thumb, x in (
             (self._prev_thumb_ov, margin),
@@ -1162,6 +1293,12 @@ class MainWindow(QMainWindow):
             thumb.setVisible(visible and thumb.has_cover())
             if thumb.isVisible():
                 thumb.raise_()
+
+    def _set_footer_thumb_opacity(self, opacity: float) -> None:
+        if getattr(self, "_prev_thumb_opacity", None) is None:
+            return
+        self._prev_thumb_opacity.setOpacity(opacity)
+        self._next_thumb_opacity.setOpacity(opacity)
 
     def _set_gutter(self, on: bool) -> None:
         """Reserve (or release) the left gutter the floating sidebar sits in.
@@ -1192,6 +1329,9 @@ class MainWindow(QMainWindow):
             self._position_sidebar_overlay()
             self._position_footer_thumbs()
             return False
+        if obj is getattr(self, "_content", None) and event.type() == QEvent.Type.Resize:
+            self._position_reader_overlays()
+            return False
         if obj is getattr(self, "_reader_footer", None) and event.type() in (
             QEvent.Type.Show, QEvent.Type.Hide,
             QEvent.Type.Move, QEvent.Type.Resize,
@@ -1201,6 +1341,14 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.Type.KeyPress and self._is_reading_view():
             focus = QApplication.focusWidget()
             if focus is not None and self.isAncestorOf(focus):
+                if (
+                    event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                    and event.modifiers() == Qt.KeyboardModifier.NoModifier
+                    and self._is_at_last_page()
+                ):
+                    self._last_right_key_ms = None
+                    if self._advance_to_next_comic(prompt=False):
+                        return True
                 if (
                     event.key() == Qt.Key.Key_Right
                     and event.modifiers() == Qt.KeyboardModifier.NoModifier
@@ -1476,9 +1624,7 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
 
-        # Fit / page layout / manga direction now live as top-bar icons.
-        # Spread/webtoon/fit/zoom already auto-save to this comic's series.
-        apply_folder_act = menu.addAction("Use these settings for the whole folder")
+        apply_folder_act = menu.addAction("Apply settings to folder")
         apply_folder_act.triggered.connect(self._apply_reading_settings_to_folder)
 
         menu.addSeparator()
@@ -1488,13 +1634,13 @@ class MainWindow(QMainWindow):
             note = self._library.get_annotation_for_page(
                 self._current_comic_id, self._current_page
             )
-        note_text = "Edit note for this page…" if note else "Add note for this page…"
+        note_text = "Edit note" if note else "Add note"
         note_act = menu.addAction(note_text)
         note_act.triggered.connect(self._edit_page_note)
 
         menu.addSeparator()
 
-        thumb_act = menu.addAction("Page thumbnails")
+        thumb_act = menu.addAction("Thumbnails")
         thumb_act.setCheckable(True)
         thumb_act.setChecked(self._thumb_strip.isVisible())
         thumb_act.triggered.connect(self._toggle_thumb_strip)
@@ -1613,19 +1759,6 @@ class MainWindow(QMainWindow):
         rtl_act.setChecked(self._is_manga)
         rtl_act.triggered.connect(self._toggle_manga)
 
-        comic = (
-            self._library.get_comic_by_id(self._current_comic_id)
-            if self._current_comic_id is not None
-            else None
-        )
-        if comic is not None:
-            menu.addSeparator()
-            folder_act = menu.addAction("Apply direction to whole folder")
-            folder_act.triggered.connect(self._apply_manga_to_folder)
-            if comic.series:
-                series_act = menu.addAction(f"Apply direction to series “{comic.series}”")
-                series_act.triggered.connect(self._apply_manga_to_series)
-
         menu.exec(self._reader_bar.manga_btn_global_pos())
 
     def _set_page_mode(self, mode: str) -> None:
@@ -1642,31 +1775,6 @@ class MainWindow(QMainWindow):
         want_spread = mode == "double"
         if self._spread_mode != want_spread:
             self._toggle_spread()
-
-    def _apply_manga_to_folder(self) -> None:
-        if self._current_comic_id is None:
-            return
-        comic = self._library.get_comic_by_id(self._current_comic_id)
-        if comic is None:
-            return
-        folder = str(Path(comic.file_path).parent)
-        n = self._library.set_folder_is_manga(folder, self._is_manga)
-        state = "right-to-left" if self._is_manga else "left-to-right"
-        self.statusBar().showMessage(
-            f"Set {n} comic(s) in “{Path(folder).name}” to {state}", 4000
-        )
-
-    def _apply_manga_to_series(self) -> None:
-        if self._current_comic_id is None:
-            return
-        comic = self._library.get_comic_by_id(self._current_comic_id)
-        if comic is None or not comic.series:
-            return
-        n = self._library.set_series_is_manga(comic.series, self._is_manga)
-        state = "right-to-left" if self._is_manga else "left-to-right"
-        self.statusBar().showMessage(
-            f"Set {n} comic(s) in “{comic.series}” to {state}", 4000
-        )
 
     # ----- Toggle handlers -----
 
@@ -2101,10 +2209,9 @@ class MainWindow(QMainWindow):
         # The loading overlay already covers the stack — switch underneath it
         # right away so the reader keeps preparing (webtoon pages decode, the
         # preloader warms neighbors) while the loading screen is still up.
-        self._reader_footer.setVisible(True)
         self._stack.setCurrentIndex(target_index)
         self._hide_sidebar()
-        self._chrome_hidden = False
+        self._chrome_hidden = True
         self._apply_reading_chrome()
 
         # Reveal only when BOTH are true: the minimum hold time has passed AND
@@ -2534,21 +2641,6 @@ class MainWindow(QMainWindow):
             self._library.set_fit_mode(comic.id, settings.fit_mode)
             self._library.set_zoom(comic.id, settings.zoom)
 
-    def _apply_reading_settings_to_folder(self) -> None:
-        """Push the current viewer settings to every comic in this folder."""
-        if self._current_comic_id is None:
-            return
-        comic = self._library.get_comic_by_id(self._current_comic_id)
-        if comic is None:
-            return
-        folder = str(Path(comic.file_path).parent)
-        self._library.set_folder_reading_settings(
-            folder, self._current_reading_settings()
-        )
-        self.statusBar().showMessage(
-            f"Reading settings applied to “{Path(folder).name}”", 4000
-        )
-
     def _record_reading_session(self) -> None:
         """Flush elapsed time + net forward pages for the current comic into stats.
 
@@ -2583,30 +2675,47 @@ class MainWindow(QMainWindow):
         self.viewer.set_fit_mode(mode)
         self._persist_reading_settings()
 
+    def _apply_reading_settings_to_folder(self) -> None:
+        """Push the current viewer settings to every comic in this folder."""
+        if self._current_comic_id is None:
+            return
+        comic = self._library.get_comic_by_id(self._current_comic_id)
+        if comic is None:
+            return
+        folder = str(Path(comic.file_path).parent)
+        self._library.set_folder_reading_settings(
+            folder, self._current_reading_settings()
+        )
+        self.statusBar().showMessage(
+            f"Reading settings applied to “{Path(folder).name}”", 4000
+        )
+
     # ----- Window helpers -----
 
     def _is_reading_view(self) -> bool:
         return self._stack.currentIndex() in (1, 2, 3)
 
-    def _apply_reading_chrome(self) -> None:
+    def _apply_reading_chrome(self, animated: bool = False) -> None:
         """Top + bottom reader bars: always on unless chrome-hidden mode is active."""
-        self._reader_bar.set_chrome_hidden(self._chrome_hidden)
         if not self._is_reading_view():
             return
 
         hidden = self._chrome_hidden
         if hidden:
             self._thumb_strip_before_chrome = self._thumb_strip.isVisible()
-            self._hide_reader_bar(animated=False)
+            self._hide_reader_bar(animated=animated)
         else:
-            self._show_reader_bar(animated=False)
+            self._show_reader_bar(animated=animated)
 
         if self._ebook_mode:
             self._ebook_viewer.set_reader_chrome_visible(not hidden)
-            self._reader_footer.setVisible(False)
+            self._hide_reader_footer(animated=False)
             self._thumb_strip.setVisible(False)
         else:
-            self._reader_footer.setVisible(not hidden)
+            if hidden:
+                self._hide_reader_footer(animated=animated)
+            else:
+                self._show_reader_footer(animated=animated)
             if hidden:
                 self._thumb_strip.hide()
             elif self._thumb_strip_before_chrome:
@@ -2617,7 +2726,7 @@ class MainWindow(QMainWindow):
         if not self._is_reading_view():
             return
         self._chrome_hidden = not self._chrome_hidden
-        self._apply_reading_chrome()
+        self._apply_reading_chrome(animated=True)
 
     def _show_app_menu(self) -> None:
         """Popup File/View/Navigate/Library menus — used on Windows/Linux."""
@@ -2779,13 +2888,16 @@ class MainWindow(QMainWindow):
         self._reader_bar_target_visible = True
         self._reader_bar_should_hide = False
         self._reader_bar_anim.stop()
-        self._reader_bar.setMinimumHeight(_ReaderBar.HEIGHT)
         self._reader_bar.show()
         self._reader_bar.raise_()
+        self._position_reader_overlays()
         if not animated:
+            self._reader_bar.setMinimumHeight(_ReaderBar.HEIGHT)
             self._reader_bar.setMaximumHeight(_ReaderBar.HEIGHT)
             self._reader_bar_opacity.setOpacity(1.0)
             return
+        self._reader_bar.setMinimumHeight(_ReaderBar.HEIGHT)
+        self._reader_bar.setMaximumHeight(_ReaderBar.HEIGHT)
         self._animate_reader_bar(_ReaderBar.HEIGHT, 1.0)
 
     def _hide_reader_bar(self, animated: bool):
@@ -2800,11 +2912,13 @@ class MainWindow(QMainWindow):
             self._reader_bar_opacity.setOpacity(0.0)
             self._reader_bar.hide()
             return
+        self._reader_bar.setMinimumHeight(_ReaderBar.HEIGHT)
+        self._reader_bar.setMaximumHeight(_ReaderBar.HEIGHT)
         self._animate_reader_bar(0, 0.0)
 
     def _animate_reader_bar(self, height: int, opacity: float):
-        self._reader_bar_height_anim.setStartValue(self._reader_bar.maximumHeight())
-        self._reader_bar_height_anim.setEndValue(height)
+        self._reader_bar_height_anim.setStartValue(_ReaderBar.HEIGHT)
+        self._reader_bar_height_anim.setEndValue(_ReaderBar.HEIGHT)
         self._reader_bar_opacity_anim.setStartValue(self._reader_bar_opacity.opacity())
         self._reader_bar_opacity_anim.setEndValue(opacity)
         self._reader_bar_anim.start()
@@ -2813,6 +2927,69 @@ class MainWindow(QMainWindow):
         if self._reader_bar_should_hide:
             self._reader_bar.setMinimumHeight(0)
             self._reader_bar.hide()
+        else:
+            self._reader_bar.setMinimumHeight(_ReaderBar.HEIGHT)
+            self._reader_bar.setMaximumHeight(_ReaderBar.HEIGHT)
+
+    def _show_reader_footer(self, animated: bool):
+        if self._reader_footer_target_visible and self._reader_footer.isVisible():
+            return
+        self._reader_footer_target_visible = True
+        self._reader_footer_should_hide = False
+        self._reader_footer_anim.stop()
+        self._reader_footer.show()
+        self._reader_footer.raise_()
+        self._position_reader_overlays()
+        if not animated:
+            self._reader_footer.setMinimumHeight(ReaderFooter.HEIGHT)
+            self._reader_footer.setMaximumHeight(ReaderFooter.HEIGHT)
+            self._reader_footer_opacity.setOpacity(1.0)
+            self._set_footer_thumb_opacity(1.0)
+            return
+        self._reader_footer.setMinimumHeight(ReaderFooter.HEIGHT)
+        self._reader_footer.setMaximumHeight(ReaderFooter.HEIGHT)
+        self._animate_reader_footer(ReaderFooter.HEIGHT, 1.0)
+
+    def _hide_reader_footer(self, animated: bool):
+        if (
+            not self._reader_footer_target_visible
+            and not self._reader_footer.isVisible()
+        ):
+            return
+        self._reader_footer_target_visible = False
+        self._reader_footer_should_hide = True
+        self._reader_footer_anim.stop()
+        if not animated:
+            self._reader_footer.setMinimumHeight(0)
+            self._reader_footer.setMaximumHeight(0)
+            self._reader_footer_opacity.setOpacity(0.0)
+            self._set_footer_thumb_opacity(0.0)
+            self._reader_footer.hide()
+            self._position_footer_thumbs()
+            return
+        self._reader_footer.setMinimumHeight(ReaderFooter.HEIGHT)
+        self._reader_footer.setMaximumHeight(ReaderFooter.HEIGHT)
+        self._animate_reader_footer(0, 0.0)
+
+    def _animate_reader_footer(self, height: int, opacity: float):
+        self._reader_footer_height_anim.setStartValue(ReaderFooter.HEIGHT)
+        self._reader_footer_height_anim.setEndValue(ReaderFooter.HEIGHT)
+        self._reader_footer_opacity_anim.setStartValue(
+            self._reader_footer_opacity.opacity()
+        )
+        self._reader_footer_opacity_anim.setEndValue(opacity)
+        self._reader_footer_anim.start()
+
+    def _on_reader_footer_anim_finished(self):
+        if self._reader_footer_should_hide:
+            self._reader_footer.setMinimumHeight(0)
+            self._reader_footer.hide()
+            self._position_footer_thumbs()
+        else:
+            self._reader_footer.setMinimumHeight(ReaderFooter.HEIGHT)
+            self._reader_footer.setMaximumHeight(ReaderFooter.HEIGHT)
+            self._set_footer_thumb_opacity(1.0)
+            self._position_footer_thumbs()
 
     def _restore_window_state(self):
         geom = self._settings.value("geometry")
