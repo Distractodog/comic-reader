@@ -1146,6 +1146,30 @@ class Library:
             return None
         return series_comics[next_index]
 
+    def get_comic_neighbors(
+        self, comic_id: int
+    ) -> tuple["Comic | None", "Comic | None"]:
+        """Return (previous, next) comic in reading order around comic_id.
+
+        Order is the comic's series (if it belongs to one), otherwise the order
+        of its containing folder. Either side is None at the ends of the list.
+        """
+        comic = self.get_comic_by_id(comic_id)
+        if comic is None:
+            return (None, None)
+        folder = _parent_dir(comic.file_path)
+        if comic.series:
+            siblings = self.get_comics_in_series(folder, comic.series)
+        else:
+            siblings = self.get_comics_in_folder(folder)
+        ids = [c.id for c in siblings]
+        if comic_id not in ids:
+            return (None, None)
+        i = ids.index(comic_id)
+        prev_comic = siblings[i - 1] if i > 0 else None
+        next_comic = siblings[i + 1] if i + 1 < len(siblings) else None
+        return (prev_comic, next_comic)
+
     def search_library(
         self, query: str, sort_by: str = "title", order: str = "asc"
     ) -> tuple[list[Folder], list[Comic]]:
@@ -1768,8 +1792,32 @@ class Library:
                 (1 if is_manga else 0, comic_id),
             )
 
+    def set_folder_is_manga(self, folder_path: str, is_manga: bool) -> int:
+        """Apply the manga (right-to-left) flag to every comic in a folder.
+
+        Returns the number of comics updated.
+        """
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET is_manga = ? WHERE parent_dir = ?",
+                (1 if is_manga else 0, folder_path),
+            )
+            return cur.rowcount
+
+    def set_series_is_manga(self, series_name: str, is_manga: bool) -> int:
+        """Apply the manga (right-to-left) flag to every comic in a series.
+
+        Returns the number of comics updated.
+        """
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET is_manga = ? WHERE series = ?",
+                (1 if is_manga else 0, series_name),
+            )
+            return cur.rowcount
+
     def set_fit_mode(self, comic_id: int, fit_mode: str) -> None:
-        if fit_mode not in ("actual", "width", "page"):
+        if fit_mode not in ("actual", "width", "height", "page"):
             raise ValueError(f"Invalid fit_mode: {fit_mode!r}")
         with self.transaction() as cur:
             cur.execute(
@@ -1800,7 +1848,7 @@ class Library:
     def _validated_settings_values(s: ReadingSettings) -> tuple:
         if s.reading_mode is not None and s.reading_mode not in ("single", "webtoon"):
             raise ValueError(f"Invalid reading_mode: {s.reading_mode!r}")
-        if s.fit_mode is not None and s.fit_mode not in ("actual", "width", "page"):
+        if s.fit_mode is not None and s.fit_mode not in ("actual", "width", "height", "page"):
             raise ValueError(f"Invalid fit_mode: {s.fit_mode!r}")
         return (
             s.reading_mode,

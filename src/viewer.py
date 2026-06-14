@@ -6,7 +6,7 @@ from enum import Enum
 
 from PyQt6.QtCore import Qt, QEasingCurve, QParallelAnimationGroup, QPoint, QPointF, QPropertyAnimation, QRect, QRectF, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPixmap
-from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QScrollArea, QToolTip, QWidget
+from PyQt6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton, QScrollArea, QToolTip, QWidget
 
 CLICK_ZONE_FRACTION = 0.30  # left/right 30% = nav zones, middle 40% = dead zone
 _SLIDE_DURATION_MS = 120
@@ -15,6 +15,7 @@ _SLIDE_DURATION_MS = 120
 class FitMode(Enum):
     ACTUAL_SIZE = "actual"
     FIT_WIDTH = "width"
+    FIT_HEIGHT = "height"
     FIT_PAGE = "page"
 
 
@@ -145,18 +146,14 @@ class ComicViewer(QGraphicsView):
         self.set_image_pixmap(pixmap, direction)
 
     def _slide_pixmap(self, scene_pixmap: QPixmap) -> QPixmap:
-        """Build a viewport-sized slide frame without an expensive widget grab."""
-        vp = self.viewport().size()
-        frame = QPixmap(vp)
-        frame.fill(Qt.GlobalColor.black)
-        if scene_pixmap.isNull():
-            return frame
-        painter = QPainter(frame)
-        x = (vp.width() - scene_pixmap.width()) // 2
-        y = (vp.height() - scene_pixmap.height()) // 2
-        painter.drawPixmap(x, y, scene_pixmap)
-        painter.end()
-        return frame
+        """Snapshot exactly what the viewport is showing for a slide frame.
+
+        Grabbing the live viewport (rather than recomposing a centred frame)
+        keeps the slide aligned with the real view in every fit mode — in
+        fit-width the page is taller than the viewport and scrolled to the top,
+        so a centred frame would jump vertically mid-animation.
+        """
+        return self.viewport().grab()
 
     def set_image_pixmap(self, pixmap: QPixmap, direction: int = 0):
         """Load a pre-built pixmap (e.g. from the page cache or spread composer)."""
@@ -194,6 +191,14 @@ class ComicViewer(QGraphicsView):
             if src.width() > vw:
                 key = ("fitw", vw)
                 disp = src.scaledToWidth(vw, smooth)
+            else:
+                key = ("src",)
+                disp = src
+        elif self._fit_mode == FitMode.FIT_HEIGHT:
+            vh = max(1, self.viewport().height())
+            if src.height() > vh:
+                key = ("fith", vh)
+                disp = src.scaledToHeight(vh, smooth)
             else:
                 key = ("src",)
                 disp = src
@@ -364,6 +369,12 @@ class ComicViewer(QGraphicsView):
                 self.scale(scale, scale)
             # Snap scroll position to top of the page when entering fit-width
             self.verticalScrollBar().setValue(0)
+        elif self._fit_mode == FitMode.FIT_HEIGHT:
+            if pix_size.height() > 0:
+                scale = self.viewport().height() / pix_size.height()
+                self.scale(scale, scale)
+            # Snap scroll position to the left edge when entering fit-height
+            self.horizontalScrollBar().setValue(0)
         else:  # ACTUAL_SIZE with zoom factor
             self.scale(self._zoom_factor, self._zoom_factor)
 
@@ -379,7 +390,8 @@ _BOOKMARK_SNAP_PX = 5  # pixels either side of a tick that triggers tooltip
 class SeekBar(QWidget):
     """Thin interactive seek bar for scrubbing through comic pages."""
 
-    seeked = pyqtSignal(int)  # page index to jump to
+    seeked = pyqtSignal(int)   # page index to jump to (on release/click)
+    preview = pyqtSignal(int)  # page index under the handle while dragging
 
     _GROOVE_H = 4    # height of the drawn groove
     _HANDLE_D = 14   # diameter of the round handle
@@ -395,7 +407,6 @@ class SeekBar(QWidget):
         self._page_count: int = 0
         self._total_pages: int = 0
         self._spread_mode: bool = False
-        self._current_index: int = 0
         self._hover: bool = False
         self._bookmarks: list[tuple[int, str | None]] = []  # (page_index, label)
         self._notes: list[tuple[int, str]] = []              # (page_index, body)
@@ -405,13 +416,9 @@ class SeekBar(QWidget):
         self.update()
 
     def set_display_mode(self, *, spread: bool = False, total_pages: int = 0) -> None:
-        """How to label pages in hover tooltips (spread uses two-page spreads)."""
+        """How pages map to bar units (spread mode counts two-page spreads)."""
         self._spread_mode = spread
         self._total_pages = total_pages
-
-    def set_current_index(self, index: int) -> None:
-        """Current page (or spread-pair index) for the handle hover tooltip."""
-        self._current_index = max(0, index)
 
     def set_progress(self, ratio: float):
         self._ratio = max(0.0, min(1.0, ratio))
@@ -435,14 +442,6 @@ class SeekBar(QWidget):
             return 0
         return min(self._page_count - 1, int(ratio * self._page_count))
 
-    def _handle_x(self) -> float:
-        w = self.width()
-        ratio = self._drag_ratio if self._drag_ratio is not None else self._ratio
-        return max(self._HANDLE_D / 2, min(w - self._HANDLE_D / 2, w * ratio))
-
-    def _near_handle(self, x: float) -> bool:
-        return abs(x - self._handle_x()) <= self._HANDLE_D / 2 + 2
-
     def _tick_x(self, page_idx: int) -> int:
         """X position of a bookmark/note tick.
 
@@ -457,30 +456,16 @@ class SeekBar(QWidget):
             return 0
         return int(self.width() * page_idx / total)
 
-    def _format_page_tooltip(self, seek_index: int) -> str:
-        if self._spread_mode and self._total_pages > 0:
-            p1 = seek_index * 2
-            p2 = min(p1 + 1, self._total_pages - 1)
-            if p1 == p2:
-                return f"Page {p1 + 1}"
-            return f"Pages {p1 + 1}–{p2 + 1}"
-        return f"Page {seek_index + 1}"
-
-    def _show_page_tooltip(self, event, seek_index: int) -> None:
-        QToolTip.showText(
-            event.globalPosition().toPoint(),
-            self._format_page_tooltip(seek_index),
-            self,
-        )
-
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._drag_ratio = self._ratio_from_x(event.position().x())
+            self.preview.emit(self._page_from_ratio(self._drag_ratio))
             self.update()
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.LeftButton and self._drag_ratio is not None:
             self._drag_ratio = self._ratio_from_x(event.position().x())
+            self.preview.emit(self._page_from_ratio(self._drag_ratio))
             self.update()
             return
 
@@ -506,16 +491,6 @@ class SeekBar(QWidget):
                     text = label if label else f"Page {page_idx + 1}"
                     QToolTip.showText(event.globalPosition().toPoint(), text, self)
                     return
-
-        if self._page_count > 0:
-            mx = event.position().x()
-            if self._near_handle(mx):
-                if self._drag_ratio is not None:
-                    seek_index = self._page_from_ratio(self._drag_ratio)
-                else:
-                    seek_index = self._current_index
-                self._show_page_tooltip(event, seek_index)
-                return
 
         QToolTip.hideText()
 
@@ -571,6 +546,139 @@ class SeekBar(QWidget):
         hx = max(self._HANDLE_D / 2, min(w - self._HANDLE_D / 2, w * ratio))
         painter.setBrush(_BAR_HANDLE_HOVER if self._hover else _BAR_FILL)
         painter.drawEllipse(QPointF(hx, cy), self._HANDLE_D / 2, self._HANDLE_D / 2)
+
+
+# ---------------------------------------------------------------------------
+# Reader footer (bottom bar): page number, prev/next comic, and the seek bar
+# ---------------------------------------------------------------------------
+
+
+class _ComicThumbButton(QLabel):
+    """Small clickable cover thumbnail for the previous/next comic."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, w: int, h: int, parent=None):
+        super().__init__(parent)
+        self._w, self._h = w, h
+        self.setFixedSize(w, h)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._has_cover = False
+
+    def set_cover(self, cover_path: str | None) -> None:
+        """Show the comic's cover, or hide the thumbnail when there's no neighbor."""
+        pixmap = QPixmap(cover_path) if cover_path else QPixmap()
+        if pixmap.isNull():
+            self.clear()
+            self.setVisible(False)
+            self._has_cover = False
+            return
+        self.setPixmap(
+            pixmap.scaled(
+                self._w, self._h,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        self.setVisible(True)
+        self._has_cover = True
+
+    def mousePressEvent(self, event):
+        if self._has_cover and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+
+class ReaderFooter(QWidget):
+    """Bottom reader bar: current page, prev/next comic thumbs + buttons, seek bar, total pages."""
+
+    prev_comic_clicked = pyqtSignal()
+    next_comic_clicked = pyqtSignal()
+    HEIGHT = 56
+    _THUMB_W = 30
+    _THUMB_H = 42
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ReaderFooter")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(self.HEIGHT)
+        self._total = 0
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(10)
+
+        self._page_label = QLabel("")
+        self._page_label.setMinimumWidth(48)
+        self._page_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(self._page_label)
+
+        self._prev_thumb = _ComicThumbButton(self._THUMB_W, self._THUMB_H)
+        self._prev_thumb.clicked.connect(self.prev_comic_clicked)
+        layout.addWidget(self._prev_thumb)
+
+        self._prev_btn = self._make_nav_button("‹", "Previous comic")
+        self._prev_btn.clicked.connect(self.prev_comic_clicked)
+        layout.addWidget(self._prev_btn)
+
+        self.seek_bar = SeekBar()
+        layout.addWidget(self.seek_bar, stretch=1)
+
+        self._next_btn = self._make_nav_button("›", "Next comic")
+        self._next_btn.clicked.connect(self.next_comic_clicked)
+        layout.addWidget(self._next_btn)
+
+        self._next_thumb = _ComicThumbButton(self._THUMB_W, self._THUMB_H)
+        self._next_thumb.clicked.connect(self.next_comic_clicked)
+        layout.addWidget(self._next_thumb)
+
+        self._total_label = QLabel("")
+        self._total_label.setMinimumWidth(48)
+        self._total_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(self._total_label)
+
+    def _make_nav_button(self, glyph: str, tip: str) -> QPushButton:
+        btn = QPushButton(glyph)
+        btn.setFlat(True)
+        btn.setFixedSize(28, 28)
+        btn.setToolTip(tip)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        return btn
+
+    def set_total(self, total: int) -> None:
+        self._total = total
+        self._total_label.setText(str(total) if total > 0 else "")
+
+    def set_current(self, page_1based: int) -> None:
+        self._page_label.setText(str(page_1based) if self._total > 0 else "")
+
+    def set_neighbors(self, prev_cover: str | None, next_cover: str | None) -> None:
+        """Show cover thumbnails and enable buttons for available neighbors."""
+        self._prev_thumb.set_cover(prev_cover)
+        self._next_thumb.set_cover(next_cover)
+        self._prev_btn.setEnabled(prev_cover is not None)
+        self._next_btn.setEnabled(next_cover is not None)
+
+    def apply_theme(self, c: dict) -> None:
+        self.setStyleSheet(
+            f"#ReaderFooter {{ background: {c['reader_bar_bg']};"
+            f" border-top: 2px solid {c['border']}; }}"
+        )
+        label_style = f"background: transparent; color: {c['text']}; font-size: 13px;"
+        self._page_label.setStyleSheet(label_style)
+        self._total_label.setStyleSheet(label_style)
+        btn_style = (
+            f"QPushButton {{ background: transparent; color: {c['accent']};"
+            f" border: none; font-size: 22px; padding: 0; }}"
+            f"QPushButton:disabled {{ color: {c['border']}; }}"
+        )
+        self._prev_btn.setStyleSheet(btn_style)
+        self._next_btn.setStyleSheet(btn_style)
 
 
 # ---------------------------------------------------------------------------

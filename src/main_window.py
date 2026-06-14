@@ -214,10 +214,14 @@ class _ComicOpenWorker(QThread):
 
 
 class _ReaderBar(QWidget):
-    """Top bar shown while reading — back, title, fullscreen, and ⋮ menu."""
+    """Top bar shown while reading — back, title, tool icons, fullscreen, and ⋮ menu."""
     back_clicked = pyqtSignal()
     menu_requested = pyqtSignal()
     fullscreen_clicked = pyqtSignal()
+    bookmark_requested = pyqtSignal()
+    fit_requested = pyqtSignal()
+    page_mode_requested = pyqtSignal()
+    manga_requested = pyqtSignal()
     HEIGHT = 56
 
     def __init__(self, parent=None):
@@ -248,34 +252,67 @@ class _ReaderBar(QWidget):
         layout.addWidget(self._title)
         layout.addStretch()
 
-        self._fullscreen_btn = QPushButton("⛶")
-        self._fullscreen_btn.setFlat(True)
-        self._fullscreen_btn.setFixedSize(36, 36)
-        self._fullscreen_btn.setToolTip("Hide reader bars")
-        self._fullscreen_btn.setStyleSheet(
-            "color: #8b2a2a; border: none; font-size: 18px; padding: 0;"
-        )
-        self._fullscreen_btn.clicked.connect(self.fullscreen_clicked.emit)
-        layout.addWidget(self._fullscreen_btn)
+        def _tool_btn(glyph: str, tooltip: str) -> QPushButton:
+            btn = QPushButton(glyph)
+            btn.setFlat(True)
+            btn.setFixedSize(36, 36)
+            btn.setToolTip(tooltip)
+            btn.setStyleSheet(
+                "color: #8b2a2a; border: none; font-size: 18px; padding: 0;"
+            )
+            layout.addWidget(btn)
+            return btn
 
-        self._menu_btn = QPushButton("⋮")
-        self._menu_btn.setFlat(True)
-        self._menu_btn.setFixedSize(36, 36)
-        self._menu_btn.setStyleSheet(
-            "color: #8b2a2a; border: none; font-size: 18px; padding: 0;"
-        )
+        # Reader tools, in order: bookmarks, fit, page layout, manga direction.
+        self._bookmark_btn = _tool_btn("⚑", "Bookmarks")
+        self._bookmark_btn.clicked.connect(self.bookmark_requested)
+        self._fit_btn = _tool_btn("⤢", "Fit image")
+        self._fit_btn.clicked.connect(self.fit_requested)
+        self._page_mode_btn = _tool_btn("▤", "Page layout")
+        self._page_mode_btn.clicked.connect(self.page_mode_requested)
+        self._manga_btn = _tool_btn("漫", "Reading direction (manga)")
+        self._manga_btn.clicked.connect(self.manga_requested)
+
+        self._fullscreen_btn = _tool_btn("⛶", "Hide reader bars")
+        self._fullscreen_btn.clicked.connect(self.fullscreen_clicked.emit)
+
+        self._menu_btn = _tool_btn("⋮", "More")
         self._menu_btn.clicked.connect(self.menu_requested)
-        layout.addWidget(self._menu_btn)
+
+        self._tool_buttons = [
+            self._bookmark_btn, self._fit_btn, self._page_mode_btn,
+            self._manga_btn, self._fullscreen_btn, self._menu_btn,
+        ]
 
         self.hide()
 
     def set_title(self, title: str):
         self._title.setText(title)
 
+    def set_comic_tools_visible(self, visible: bool) -> None:
+        """Bookmarks/fit/page/manga only apply to image comics, not text EPUBs."""
+        for btn in (self._bookmark_btn, self._fit_btn,
+                    self._page_mode_btn, self._manga_btn):
+            btn.setVisible(visible)
+
+    @staticmethod
+    def _btn_global_pos(btn: QPushButton) -> QPoint:
+        return btn.mapToGlobal(QPoint(0, btn.height()))
+
     def menu_btn_global_pos(self) -> QPoint:
-        return self._menu_btn.mapToGlobal(
-            QPoint(0, self._menu_btn.height())
-        )
+        return self._btn_global_pos(self._menu_btn)
+
+    def bookmark_btn_global_pos(self) -> QPoint:
+        return self._btn_global_pos(self._bookmark_btn)
+
+    def fit_btn_global_pos(self) -> QPoint:
+        return self._btn_global_pos(self._fit_btn)
+
+    def page_mode_btn_global_pos(self) -> QPoint:
+        return self._btn_global_pos(self._page_mode_btn)
+
+    def manga_btn_global_pos(self) -> QPoint:
+        return self._btn_global_pos(self._manga_btn)
 
     def apply_theme(self, c: dict):
         self.setStyleSheet(
@@ -288,8 +325,8 @@ class _ReaderBar(QWidget):
             f"background: transparent; color: {c['accent']}; border: none;"
             f" font-size: 18px; padding: 0;"
         )
-        self._fullscreen_btn.setStyleSheet(btn_style)
-        self._menu_btn.setStyleSheet(btn_style)
+        for btn in self._tool_buttons:
+            btn.setStyleSheet(btn_style)
         self._title.setStyleSheet(f"background: transparent; color: {c['text']};")
 
     def set_chrome_hidden(self, hidden: bool) -> None:
@@ -457,8 +494,8 @@ from stats_dialog import StatsDialog
 from viewer import (
     ComicViewer,
     FitMode,
+    ReaderFooter,
     ReadingMode,
-    SeekBar,
     ThumbnailStrip,
     make_spread_pixmap,
     make_spread_pixmap_from_images,
@@ -953,8 +990,9 @@ class MainWindow(QMainWindow):
         self._open_min_elapsed = False
         self._open_page_ready = False
 
-        self._seek_bar = SeekBar()
-        self._seek_bar.setVisible(False)
+        self._reader_footer = ReaderFooter()
+        self._reader_footer.setVisible(False)
+        self._seek_bar = self._reader_footer.seek_bar  # inner bar; existing calls reuse it
 
         self._thumb_strip = ThumbnailStrip()
         self._thumb_strip.setVisible(False)
@@ -962,6 +1000,10 @@ class MainWindow(QMainWindow):
         self._reader_bar = _ReaderBar()
         self._reader_bar.back_clicked.connect(self._back_to_library)
         self._reader_bar.fullscreen_clicked.connect(self._toggle_reading_chrome)
+        self._reader_bar.bookmark_requested.connect(self._show_bookmark_menu)
+        self._reader_bar.fit_requested.connect(self._show_fit_menu)
+        self._reader_bar.page_mode_requested.connect(self._show_page_mode_menu)
+        self._reader_bar.manga_requested.connect(self._show_manga_menu)
         self._reader_bar_opacity = QGraphicsOpacityEffect(self._reader_bar)
         self._reader_bar.setGraphicsEffect(self._reader_bar_opacity)
         self._reader_bar_opacity.setOpacity(1.0)
@@ -990,7 +1032,7 @@ class MainWindow(QMainWindow):
         content_layout.addWidget(self._reader_bar)
         content_layout.addWidget(self._stack)
         content_layout.addWidget(self._thumb_strip)
-        content_layout.addWidget(self._seek_bar)
+        content_layout.addWidget(self._reader_footer)
 
         self._sidebar = _Sidebar(show_app_menu=sys.platform != "darwin")
         self._sidebar.app_menu_requested.connect(self._show_app_menu)
@@ -1044,6 +1086,9 @@ class MainWindow(QMainWindow):
         self.viewer.page_forward.connect(self.next_page)
         self.viewer.page_back.connect(self.prev_page)
         self._seek_bar.seeked.connect(self._on_seek_bar)
+        self._seek_bar.preview.connect(self._on_seek_preview)
+        self._reader_footer.prev_comic_clicked.connect(self._open_prev_comic)
+        self._reader_footer.next_comic_clicked.connect(self._open_next_comic)
         self._reader_bar.menu_requested.connect(self._show_reader_menu)
         self._thumb_strip.page_selected.connect(self.seek_to_page)
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
@@ -1339,7 +1384,7 @@ class MainWindow(QMainWindow):
         if self._stack.currentIndex() != 0:
             self._chrome_hidden = False
             self._hide_reader_bar(animated=False)
-            self._seek_bar.setVisible(False)
+            self._reader_footer.setVisible(False)
             self._thumb_strip.setVisible(False)
             self._stack.setCurrentIndex(0)
             self._show_sidebar()
@@ -1366,7 +1411,7 @@ class MainWindow(QMainWindow):
         def do_switch():
             self._chrome_hidden = False
             self._hide_reader_bar(animated=False)
-            self._seek_bar.setVisible(False)
+            self._reader_footer.setVisible(False)
             self._thumb_strip.setVisible(False)
             self._bookshelf.refresh()
             self._stack.setCurrentIndex(0)
@@ -1384,31 +1429,12 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
 
-        spread_act = menu.addAction("Spread mode")
-        spread_act.setCheckable(True)
-        spread_act.setChecked(self._spread_mode)
-        spread_act.triggered.connect(self._toggle_spread)
-
-        manga_act = menu.addAction("Manga (right-to-left)")
-        manga_act.setCheckable(True)
-        manga_act.setChecked(self._is_manga)
-        manga_act.triggered.connect(self._toggle_manga)
-
-        webtoon_act = menu.addAction("Webtoon / scroll mode")
-        webtoon_act.setCheckable(True)
-        webtoon_act.setChecked(self._webtoon_mode)
-        webtoon_act.triggered.connect(self._toggle_webtoon)
-
+        # Fit / page layout / manga direction now live as top-bar icons.
         # Spread/webtoon/fit/zoom already auto-save to this comic's series.
         apply_folder_act = menu.addAction("Use these settings for the whole folder")
         apply_folder_act.triggered.connect(self._apply_reading_settings_to_folder)
 
         menu.addSeparator()
-
-        is_bm = self._current_page_is_bookmarked()
-        bm_text = "Remove bookmark" if is_bm else "Bookmark this page…"
-        bm_act = menu.addAction(bm_text)
-        bm_act.triggered.connect(self._toggle_bookmark)
 
         note = None
         if self._current_comic_id is not None:
@@ -1463,6 +1489,137 @@ class MainWindow(QMainWindow):
         )
 
         menu.exec(self._reader_bar.menu_btn_global_pos())
+
+    # ----- Top-bar tool menus -----
+
+    def _show_bookmark_menu(self) -> None:
+        if self._current_comic_id is None or not self._reader:
+            return
+        menu = QMenu(self)
+
+        is_bm = self._current_page_is_bookmarked()
+        toggle = menu.addAction(
+            "Remove bookmark from this page" if is_bm else "Bookmark this page…"
+        )
+        toggle.triggered.connect(self._toggle_bookmark)
+
+        bookmarks = sorted(
+            self._library.get_bookmarks(self._current_comic_id),
+            key=lambda b: b.page_index,
+        )
+        if bookmarks:
+            menu.addSeparator()
+            jump = menu.addMenu("Go to bookmark")
+            for b in bookmarks:
+                label = b.label or f"Page {b.page_index + 1}"
+                act = jump.addAction(label)
+                act.triggered.connect(lambda _c=False, p=b.page_index: self.seek_to_page(p))
+
+        menu.exec(self._reader_bar.bookmark_btn_global_pos())
+
+    def _show_fit_menu(self) -> None:
+        if not self._reader:
+            return
+        menu = QMenu(self)
+        current = self.viewer.fit_mode
+        options = [
+            ("Fit width", FitMode.FIT_WIDTH),
+            ("Fit height", FitMode.FIT_HEIGHT),
+            ("Fit both", FitMode.FIT_PAGE),
+        ]
+        for label, mode in options:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(current == mode)
+            act.triggered.connect(lambda _c=False, m=mode: self._set_fit_mode(m))
+        menu.exec(self._reader_bar.fit_btn_global_pos())
+
+    def _show_page_mode_menu(self) -> None:
+        if not self._reader:
+            return
+        menu = QMenu(self)
+        if self._webtoon_mode:
+            current = "webtoon"
+        elif self._spread_mode:
+            current = "double"
+        else:
+            current = "single"
+        options = [
+            ("Single page", "single"),
+            ("Double page", "double"),
+            ("Webtoon (continuous scroll)", "webtoon"),
+        ]
+        for label, mode in options:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(current == mode)
+            act.triggered.connect(lambda _c=False, m=mode: self._set_page_mode(m))
+        menu.exec(self._reader_bar.page_mode_btn_global_pos())
+
+    def _show_manga_menu(self) -> None:
+        if not self._reader:
+            return
+        menu = QMenu(self)
+
+        rtl_act = menu.addAction("Right-to-left (manga)")
+        rtl_act.setCheckable(True)
+        rtl_act.setChecked(self._is_manga)
+        rtl_act.triggered.connect(self._toggle_manga)
+
+        comic = (
+            self._library.get_comic_by_id(self._current_comic_id)
+            if self._current_comic_id is not None
+            else None
+        )
+        if comic is not None:
+            menu.addSeparator()
+            folder_act = menu.addAction("Apply direction to whole folder")
+            folder_act.triggered.connect(self._apply_manga_to_folder)
+            if comic.series:
+                series_act = menu.addAction(f"Apply direction to series “{comic.series}”")
+                series_act.triggered.connect(self._apply_manga_to_series)
+
+        menu.exec(self._reader_bar.manga_btn_global_pos())
+
+    def _set_page_mode(self, mode: str) -> None:
+        """Switch between single / double (spread) / webtoon page layouts."""
+        if self._ebook_mode or not self._reader:
+            return
+        if mode == "webtoon":
+            if not self._webtoon_mode:
+                self._toggle_webtoon()
+            return
+        # single / double both require webtoon off first.
+        if self._webtoon_mode:
+            self._toggle_webtoon()
+        want_spread = mode == "double"
+        if self._spread_mode != want_spread:
+            self._toggle_spread()
+
+    def _apply_manga_to_folder(self) -> None:
+        if self._current_comic_id is None:
+            return
+        comic = self._library.get_comic_by_id(self._current_comic_id)
+        if comic is None:
+            return
+        folder = str(Path(comic.file_path).parent)
+        n = self._library.set_folder_is_manga(folder, self._is_manga)
+        state = "right-to-left" if self._is_manga else "left-to-right"
+        self.statusBar().showMessage(
+            f"Set {n} comic(s) in “{Path(folder).name}” to {state}", 4000
+        )
+
+    def _apply_manga_to_series(self) -> None:
+        if self._current_comic_id is None:
+            return
+        comic = self._library.get_comic_by_id(self._current_comic_id)
+        if comic is None or not comic.series:
+            return
+        n = self._library.set_series_is_manga(comic.series, self._is_manga)
+        state = "right-to-left" if self._is_manga else "left-to-right"
+        self.statusBar().showMessage(
+            f"Set {n} comic(s) in “{comic.series}” to {state}", 4000
+        )
 
     # ----- Toggle handlers -----
 
@@ -1642,6 +1799,7 @@ class MainWindow(QMainWindow):
         page_count = self._reader.page_count() if self._reader else 0
         if page_count > 0:
             self._seek_bar.set_progress((page + 1) / page_count)
+        self._reader_footer.set_current(page + 1)
         self._webtoon_save_timer.start()
 
     # ----- Shortcuts dialog -----
@@ -1686,6 +1844,7 @@ class MainWindow(QMainWindow):
         QApplication.instance().setStyleSheet(themes.app_stylesheet(c))
         self._sidebar.apply_theme(c)
         self._reader_bar.apply_theme(c)
+        self._reader_footer.apply_theme(c)
         self._bookshelf.apply_theme(c)
         self._ebook_viewer.apply_theme(c)
         self._settings_view.apply_theme(c)
@@ -1804,6 +1963,7 @@ class MainWindow(QMainWindow):
         title = Path(path).stem
         self.setWindowTitle(f"{APP_DISPLAY_NAME} — {title}")
         self._reader_bar.set_title(title)
+        self._reader_bar.set_comic_tools_visible(True)
         # Reset session state
         self._thumb_strip.setVisible(False)
         self._thumb_strip_loaded = False
@@ -1813,6 +1973,7 @@ class MainWindow(QMainWindow):
         _fit_mode_map = {
             "actual": FitMode.ACTUAL_SIZE,
             "width":  FitMode.FIT_WIDTH,
+            "height": FitMode.FIT_HEIGHT,
             "page":   FitMode.FIT_PAGE,
         }
         default_rtl = prefs.get_bool(prefs.DEFAULT_RTL)
@@ -1873,6 +2034,9 @@ class MainWindow(QMainWindow):
         self._reload_bookmarks()
 
         page_count = self._reader.page_count()
+        self._reader_footer.set_total(page_count)
+        self._reader_footer.set_current(self._current_page + 1)
+        self._update_footer_neighbors()
         if self._webtoon_mode:
             self._seek_bar.set_page_count(page_count)
             self._webtoon_viewer.set_width_fraction(self._webtoon_width_pct / 100)
@@ -1890,7 +2054,7 @@ class MainWindow(QMainWindow):
         # The loading overlay already covers the stack — switch underneath it
         # right away so the reader keeps preparing (webtoon pages decode, the
         # preloader warms neighbors) while the loading screen is still up.
-        self._seek_bar.setVisible(True)
+        self._reader_footer.setVisible(True)
         self._stack.setCurrentIndex(target_index)
         self._hide_sidebar()
         self._chrome_hidden = False
@@ -1956,8 +2120,9 @@ class MainWindow(QMainWindow):
         title = book.title or Path(path).stem
         self.setWindowTitle(f"{APP_DISPLAY_NAME} — {title}")
         self._reader_bar.set_title(title)
+        self._reader_bar.set_comic_tools_visible(False)
         # Hide comic-only chrome.
-        self._seek_bar.setVisible(False)
+        self._reader_footer.setVisible(False)
         self._thumb_strip.setVisible(False)
 
         # Restore progress (current chapter) and the saved reading font size.
@@ -2026,7 +2191,7 @@ class MainWindow(QMainWindow):
             self.viewer.set_image(data, direction)
         if page_count > 0:
             self._seek_bar.set_progress((self._current_page + 1) / page_count)
-            self._seek_bar.set_current_index(self._current_page)
+        self._reader_footer.set_current(self._current_page + 1)
         if self._thumb_strip.isVisible():
             self._thumb_strip.set_current(self._current_page)
 
@@ -2053,7 +2218,8 @@ class MainWindow(QMainWindow):
         pair_index = p1 // 2
         if pair_count > 0:
             self._seek_bar.set_progress((pair_index + 1) / pair_count)
-            self._seek_bar.set_current_index(pair_index)
+        # The left label shows the real first page of the spread, not the pair index.
+        self._reader_footer.set_current(p1 + 1)
 
     def _last_spread_start(self, page_count: int) -> int:
         return ((page_count - 1) // 2) * 2
@@ -2233,6 +2399,44 @@ class MainWindow(QMainWindow):
         page = value * 2 if self._spread_mode else value
         self.seek_to_page(page)
 
+    def _on_seek_preview(self, value: int) -> None:
+        """Live-update the footer's page number while dragging, without navigating.
+
+        Replaces the old page-number-on-the-handle tooltip. The seek bar reports
+        spread-pair indices in spread mode, so convert back to a real page.
+        """
+        page = value * 2 if self._spread_mode else value
+        self._reader_footer.set_current(page + 1)
+
+    def _update_footer_neighbors(self) -> None:
+        """Refresh the prev/next comic thumbnails on the footer for the open comic."""
+        prev_comic = next_comic = None
+        if self._current_comic_id is not None:
+            prev_comic, next_comic = self._library.get_comic_neighbors(
+                self._current_comic_id
+            )
+        self._reader_footer.set_neighbors(
+            prev_comic.cover_path if prev_comic else None,
+            next_comic.cover_path if next_comic else None,
+        )
+
+    def _open_neighbor_comic(self, forward: bool) -> None:
+        """Open the previous/next comic in series-or-folder order, if any."""
+        if self._current_comic_id is None:
+            return
+        prev_comic, next_comic = self._library.get_comic_neighbors(
+            self._current_comic_id
+        )
+        target = next_comic if forward else prev_comic
+        if target is not None:
+            self.load_file(target.file_path)
+
+    def _open_prev_comic(self) -> None:
+        self._open_neighbor_comic(forward=False)
+
+    def _open_next_comic(self) -> None:
+        self._open_neighbor_comic(forward=True)
+
     def seek_to_page(self, page: int):
         if not self._reader:
             return
@@ -2323,6 +2527,7 @@ class MainWindow(QMainWindow):
     _FIT_MODE_STR = {
         FitMode.ACTUAL_SIZE: "actual",
         FitMode.FIT_WIDTH:   "width",
+        FitMode.FIT_HEIGHT:  "height",
         FitMode.FIT_PAGE:    "page",
     }
 
@@ -2351,10 +2556,10 @@ class MainWindow(QMainWindow):
 
         if self._ebook_mode:
             self._ebook_viewer.set_reader_chrome_visible(not hidden)
-            self._seek_bar.setVisible(False)
+            self._reader_footer.setVisible(False)
             self._thumb_strip.setVisible(False)
         else:
-            self._seek_bar.setVisible(not hidden)
+            self._reader_footer.setVisible(not hidden)
             if hidden:
                 self._thumb_strip.hide()
             elif self._thumb_strip_before_chrome:
@@ -2383,7 +2588,7 @@ class MainWindow(QMainWindow):
         # Settings shares the bookshelf chrome rules: no reader/seek/thumb bars.
         self._chrome_hidden = False
         self._hide_reader_bar(animated=False)
-        self._seek_bar.setVisible(False)
+        self._reader_footer.setVisible(False)
         self._thumb_strip.setVisible(False)
         self._settings_view.reset()
         # Pick a fresh random bookshelf background each time settings is opened.
