@@ -101,6 +101,8 @@ class ComicViewer(QGraphicsView):
         self._source_pixmap: QPixmap | None = None
         self._display_key = None
         self._rtl = False
+        self._animate = True
+        self._click_nav = True
         self._swipe_x = 0
         self._swipe_y = 0
         self._swipe_fired = False
@@ -130,6 +132,12 @@ class ComicViewer(QGraphicsView):
     def set_rtl(self, rtl: bool) -> None:
         self._rtl = rtl
 
+    def set_animate(self, enabled: bool) -> None:
+        self._animate = enabled
+
+    def set_click_nav(self, enabled: bool) -> None:
+        self._click_nav = enabled
+
     def set_image(self, image_bytes: bytes, direction: int = 0):
         """Load a new page from raw bytes."""
         pixmap = QPixmap()
@@ -156,7 +164,7 @@ class ComicViewer(QGraphicsView):
         self._overlay.hide()
         self._overlay_new.hide()
 
-        should_animate = direction != 0 and self._has_image
+        should_animate = direction != 0 and self._has_image and self._animate
         old_slide = (
             self._slide_pixmap(self._pixmap_item.pixmap()) if should_animate else None
         )
@@ -274,7 +282,11 @@ class ComicViewer(QGraphicsView):
         self._apply_fit()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self._has_image:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._has_image
+            and self._click_nav
+        ):
             x = event.position().x()
             w = self.viewport().width()
             if x < w * CLICK_ZONE_FRACTION:
@@ -287,7 +299,7 @@ class ComicViewer(QGraphicsView):
 
     def mouseMoveEvent(self, event):
         self.mouse_moved.emit(int(event.position().y()))
-        if self._has_image:
+        if self._has_image and self._click_nav:
             x = event.position().x()
             w = self.viewport().width()
             if x < w * CLICK_ZONE_FRACTION or x > w * (1 - CLICK_ZONE_FRACTION):

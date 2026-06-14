@@ -91,6 +91,28 @@ def folder_cover_path_for(folder_path: str) -> Path:
     return _thumbnail_cache_base() / f"folder_{h}.jpg"
 
 
+def shelf_cover_path_for(shelf_id: int) -> Path:
+    """Stable cache path for a custom bookshelf cover, keyed by shelf id."""
+    return _thumbnail_cache_base() / f"shelf_{shelf_id}.jpg"
+
+
+def copy_image_as_cover(image_path: str, output_path: Path) -> bool:
+    """Save an image file as a cover at full resolution (no downscaling).
+
+    Used for bookshelf covers, where the same image also drives the full-size
+    bookshelf background — downscaling to a thumbnail would make it blurry.
+    Returns True on success.
+    """
+    try:
+        image = QImage(image_path)
+        if image.isNull():
+            return False
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        return image.save(str(output_path), "JPEG", 92)
+    except Exception:
+        return False
+
+
 def comic_cover_override_path_for(comic_id: int) -> Path:
     """Cache path for a comic's manual cover override.
 

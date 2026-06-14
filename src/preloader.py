@@ -12,6 +12,22 @@ _PRELOAD_OFFSETS = [1, 2, -1, 3, 4, 5, -2]
 _CACHE_MAX = 20
 
 
+def _offsets_for_radius(radius: int) -> list[int]:
+    """Prioritized preload offsets for a forward-biased window of ``radius``.
+
+    Forward pages first (most likely next), then one page back for quick
+    back-navigation, then the rest forward.
+    """
+    if radius <= 0:
+        return []
+    offsets = [1] if radius >= 1 else []
+    if radius >= 2:
+        offsets.append(2)
+    offsets.append(-1)
+    offsets.extend(range(3, radius + 1))
+    return offsets
+
+
 class PageCache:
     """Thread-safe LRU cache mapping page index → QImage."""
 
@@ -42,13 +58,14 @@ class PageCache:
 class PagePreloader(QThread):
     """Preloads pages around the current reading position into a PageCache."""
 
-    def __init__(self, reader, cache: PageCache, parent=None):
+    def __init__(self, reader, cache: PageCache, parent=None, radius: int | None = None):
         super().__init__(parent)
         self._reader = reader
         self._cache = cache
         self._center = 0
         self._lock = threading.Lock()
         self._abort = threading.Event()
+        self._offsets = _offsets_for_radius(radius) if radius is not None else _PRELOAD_OFFSETS
 
     def set_center(self, page_index: int) -> None:
         with self._lock:
@@ -64,7 +81,7 @@ class PagePreloader(QThread):
                 center = self._center
 
             did_work = False
-            for offset in _PRELOAD_OFFSETS:
+            for offset in self._offsets:
                 if self._abort.is_set():
                     return
                 with self._lock:

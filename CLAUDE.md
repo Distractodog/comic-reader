@@ -128,6 +128,126 @@ comic-reader/
   - PyInstaller spec includes fonts and can bundle `unrar.exe` on Windows CI
 - Next: push and verify GitHub Actions artifacts; fix any CI-only packaging failures
 
+## Settings Page — Plan (started 2026-06-13)
+
+A dedicated **Settings area** is being built. The entry point exists: a gear
+(⚙) `_RailButton` pinned to the very bottom of the sidebar rail (`_Sidebar` in
+`main_window.py`), wired through a `settings_clicked` signal to
+`MainWindow._open_settings`.
+
+**Scaffold + navigation are DONE** (2026-06-13). `src/settings_view.py` holds the
+`SettingsView` shell: a left `QListWidget` category nav + right `QStackedWidget` of
+panels (one `_PlaceholderPanel` per section in `SECTIONS`), themed via `apply_theme`.
+It is wired into the main-window `QStackedWidget` as **index 4**. `_open_settings`
+switches to index 4 (hides reader/seek/thumb chrome); `_close_settings` returns to
+the bookshelf. Escape, the back button (`back_requested`), and the sidebar
+Library/Currently-Reading buttons (`_go_home` / `_show_currently_reading`) all leave
+settings. Every panel is still a "coming soon" placeholder.
+
+**ALL PANELS BUILT** (2026-06-13). `src/settings_view.py` now has real,
+functional panels (no more placeholders) and a new `src/prefs.py` centralizes
+global defaults in QSettings (typed getters/setters, namespaced keys). Panels
+emit signals; `MainWindow` applies them live. Summary:
+
+- **Appearance** — Theme Dark/Light (`apply_theme` swap, persisted, applied at
+  startup; unlocks the previously-unused `themes.LIGHT`), Animations toggle
+  (gates `_fade_switch` via `self._animations_enabled`), Bookshelf tile size
+  Small/Medium/Large (`bookshelf.set_tile_scale` rescales module `TILE_W`/
+  `COVER_H` + refresh), Sidebar-on-launch Collapsed/Expanded.
+- **Reading** — default fit mode / reading mode / spread / zoom / direction
+  (RTL), click-zone nav toggle (`viewer.set_click_nav`), page-turn animation
+  toggle (`viewer.set_animate`), and pages-to-preload (`PagePreloader(radius=)`
+  via `preloader._offsets_for_radius`). `Library.resolve_reading_settings` now
+  takes an optional `defaults: ReadingSettings` (global base beneath the DB);
+  `MainWindow._global_reading_defaults()` builds it from prefs. NOTE: because
+  fit/zoom/mode are stored per-comic at scan time, global defaults mainly affect
+  ad-hoc (non-library) opens + the `spread` field + direction; already-scanned
+  comics keep their stored values.
+- **Ebook & Text** — default font size (shares the existing `ebook_font_pt`
+  key) + optional font family (`EbookViewer.set_font_family`, new).
+- **Library & Data** — buttons routed through `MainWindow._on_library_action`
+  to existing methods (add folder/files, rescan all, export/import, import
+  shelf, duplicates, stats) plus new thumbnail cache regenerate/clear
+  (`_regenerate_thumbnails` / `_clear_thumbnail_cache`).
+- **Shortcuts** — button opens the existing `KeybindingDialog`.
+- **Sidebar** — placeholder note only. The current `_Sidebar` rail is a FIXED
+  button set with no dynamic shelves; `_HideSidebarDialog` exists but is unwired
+  and has no persistence. Wire this once shelves can be pinned to the rail.
+- **About** — app name/version (`APP_VERSION`/`APP_REPO_URL` in `app_info.py`),
+  repo link, offline positioning.
+
+Not yet committed. Next candidates: commit; optionally make new-comic scans
+inherit the global reading defaults so they apply to library comics too; build
+out the real Sidebar visibility panel when rail-shelves exist.
+
+### Architecture (decided)
+
+- **Full page inside the main window**, NOT a dialog. Add a new `SettingsView`
+  widget to the existing `QStackedWidget` as a new index (current stack: 0 =
+  bookshelf, 1 = viewer, 2 = webtoon, 3 = ebook → **settings = index 4**).
+- `_open_settings` switches the stack to the settings index; Escape, the sidebar
+  Library button, and a back affordance return to the bookshelf. Hide the
+  reader/seek/thumb bars while settings is showing (same chrome handling as the
+  bookshelf view).
+- **Internal layout:** a left category list (`QListWidget`) + a right
+  `QStackedWidget` of panels — one panel per section below. Mirror the app's
+  look via `apply_theme(c)` like every other view.
+- **Persistence:** global preferences go in `QSettings` (the app already uses
+  `self._settings` / `bookshelf.app_settings()`). Namespace keys, e.g.
+  `settings/theme`, `reading/default_fit_mode`. Per-comic / per-series / per-folder
+  `ReadingSettings` already exist in the DB and are unchanged — the new global
+  defaults sit *beneath* them.
+- **Reading-defaults resolution:** extend `resolve_reading_settings` so the
+  fallback order becomes comic-specific → series → folder → **global defaults
+  (QSettings)** → hardcoded constant. Today it stops at the comic's own fields.
+
+### Sections / panels
+
+**1. Appearance**
+- Theme: Dark / Light. `themes.LIGHT` is fully defined but currently unused —
+  `apply_theme(themes.DARK)` is hardcoded at app start. Wire a theme selector that
+  re-runs `apply_theme` across all views and persists the choice.
+- Animations on/off: page-slide transition + bookshelf↔reader fade.
+- Bookshelf tile size / column behavior.
+- Sidebar starts expanded or collapsed (default for `_Sidebar.set_expanded`).
+
+**2. Reading defaults** (new global defaults new comics inherit before any override)
+- Default fit mode (`actual` / `width` / `page`).
+- Default reading mode (`single` / `webtoon`) and default spread on/off.
+- Default zoom.
+- Default reading direction (LTR / RTL-manga).
+- Click-zone navigation on/off; page-turn animation on/off.
+- Page preload count (feeds `preloader.py`).
+
+**3. Ebook / text**
+- Default font size (currently persisted as `ebook_font_pt`) and font family for
+  text EPUBs rendered in `EbookViewer`.
+
+**4. Library & data**
+- Manage library folders: add / rescan / remove (consolidates the Library menu).
+- Thumbnail cache: regenerate or clear (`thumbnails.py` cache dir).
+- Export / import library, import shelf.
+- Links to existing tools: Scan for Duplicates, Reading Statistics.
+
+**5. Shortcuts**
+- Embed the existing keybindings editor (`keybindings.py`, "Customize Shortcuts"
+  dialog) as a panel.
+
+**6. Sidebar**
+- Which library views / shelves appear in the rail (the existing
+  hide-from-sidebar dialog, moved in here).
+
+**7. About**
+- App version, GitHub repo link, and the "100% offline / no telemetry" positioning.
+
+### Build order
+
+Build **one section at a time** (per the user's working style). Suggested order:
+scaffold the `SettingsView` shell + navigation first, then Appearance (most visible
+payoff and unlocks Light mode), then Reading defaults, then the remaining panels.
+Each section: implement → relaunch locally for visual confirmation → only then move
+on. Nothing ships to Windows until pushed (push triggers the GitHub Actions build).
+
 ## Known issues
 
 - **macOS file dialog greys out comic files.** macOS Tahoe requires UTI registration for `.cbz`, `.cbr`, etc. in the file picker. Drag-and-drop and clicking tiles in the bookshelf both work as workarounds.

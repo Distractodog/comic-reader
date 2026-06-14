@@ -54,6 +54,19 @@ from library import Comic, Folder, Library, Shelf
 TILE_W = 200
 COVER_H = 300
 _TITLE_FONT_SIZE = 14
+
+_TILE_SCALES = {"small": 164, "medium": 200, "large": 248}
+
+
+def set_tile_scale(name: str) -> None:
+    """Adjust the module-level tile dimensions. Rebuild tiles after calling.
+
+    Tiles read ``TILE_W`` / ``COVER_H`` at construct + paint time, so updating
+    these globals and refreshing the bookshelf reflows everything.
+    """
+    global TILE_W, COVER_H
+    TILE_W = _TILE_SCALES.get(name, 200)
+    COVER_H = int(TILE_W * 1.5)
 _TITLE_PAD = 4
 STATUS_H = 22
 TILE_SPACING = 18
@@ -923,7 +936,11 @@ class BookshelfView(QWidget):
     # ----- Bookshelf tile helpers -----
 
     def _shelf_tile_cover(self, shelf: Shelf, comics: list[Comic]) -> str | None:
-        """The image a shelf tile shows: its background source, else first comic cover."""
+        """The image a shelf tile shows: custom cover, else background source, else first comic cover."""
+        from thumbnails import shelf_cover_path_for
+        custom = shelf_cover_path_for(shelf.id)
+        if custom.exists():
+            return str(custom)
         spec = self._read_background_spec_for_parts(["shelf", shelf.id])
         if spec:
             cid = spec.get("comic_id")
@@ -966,9 +983,14 @@ class BookshelfView(QWidget):
         menu.addAction("Export bookshelf…").triggered.connect(
             lambda: self.export_shelf_requested.emit(shelf_id, shelf.name)
         )
-        if self._read_background_spec_for_parts(["shelf", shelf_id]) is not None:
+        menu.addSeparator()
+        menu.addAction("Choose cover image…").triggered.connect(
+            lambda: self._set_shelf_cover_from_image(shelf_id)
+        )
+        from thumbnails import shelf_cover_path_for
+        if shelf_cover_path_for(shelf_id).exists():
             menu.addAction("Clear cover image").triggered.connect(
-                lambda: self._clear_background(["shelf", shelf_id])
+                lambda: self._clear_shelf_cover(shelf_id)
             )
         menu.addSeparator()
         menu.addAction("Delete bookshelf").triggered.connect(
@@ -1322,12 +1344,9 @@ class BookshelfView(QWidget):
             )
             items = folders + self._filter_comics(comics)
             empty_msg = f'No results for "{self._search_query}"'
-        elif self._current_shelf_id is not None:
-            # Inside a bookshelf: show its comics directly (flat — no folder level).
-            items = self._filter_comics(self._library.get_comics_in_shelf(
-                self._current_shelf_id,
-                sort_by=self._sort_by, order=self._sort_order,
-            ))
+        elif self._current_shelf_id is not None and self._current_folder is None:
+            # Shelf top level — show folder tiles for folders with comics on this shelf.
+            items = self._library.get_shelf_folders(self._current_shelf_id)
             empty_msg = "This shelf is empty."
         elif self._current_folder is not None:
             items, empty_msg = self._folder_grid_items()
@@ -1386,6 +1405,8 @@ class BookshelfView(QWidget):
                 tile = FolderTile(item)
                 if self._search_query:
                     tile.opened.connect(self._open_folder_from_search)
+                elif self._current_shelf_id is not None:
+                    tile.opened.connect(self._show_shelf_folder)
                 else:
                     tile.opened.connect(self._show_comics)
                 tile.menu_requested.connect(self._on_folder_context_menu)
@@ -2105,6 +2126,34 @@ class BookshelfView(QWidget):
     def _reset_folder_cover(self, folder_path: str):
         self._library.clear_folder_cover(folder_path)
         self._nav_transition(self._repopulate)
+
+    # ----- Per-bookshelf (shelf) cover -----
+
+    def _set_shelf_cover_from_image(self, shelf_id: int):
+        from thumbnails import copy_image_as_cover, shelf_cover_path_for
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose Cover Image", str(Path.home()),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.gif)",
+        )
+        if not path:
+            return
+        out = shelf_cover_path_for(shelf_id)
+        if not copy_image_as_cover(path, out):
+            QMessageBox.warning(
+                self, "Choose Cover Image", "Could not load that image file."
+            )
+            return
+        self._nav_transition(self._repopulate)
+        self.shelf_changed.emit()
+
+    def _clear_shelf_cover(self, shelf_id: int):
+        from thumbnails import shelf_cover_path_for
+        try:
+            shelf_cover_path_for(shelf_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._nav_transition(self._repopulate)
+        self.shelf_changed.emit()
 
     # ----- Per-comic cover override -----
 

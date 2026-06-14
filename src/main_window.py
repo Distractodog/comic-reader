@@ -18,6 +18,7 @@ from PyQt6.QtCore import (
     QSettings,
     QThread,
     QTimer,
+    QVariantAnimation,
     Qt,
     pyqtSignal,
 )
@@ -32,6 +33,7 @@ from PyQt6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QRegion,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -439,6 +441,8 @@ class _HideSidebarDialog(QDialog):
 
 
 from archive_handler import ComicReader, open_comic
+import bookshelf as bookshelf_mod
+import prefs
 from bookshelf import BookshelfView
 from dedupe_scanner import DuplicateScanner
 from duplicates_dialog import DuplicatesDialog
@@ -448,6 +452,7 @@ from keybindings import ACTIONS, KeybindingDialog, KeybindingManager
 from library import Library, ReadingSettings, Shelf
 from library_scanner import SCANNABLE_EXTENSIONS, LibraryScanner
 from preloader import PageCache, PagePreloader
+from settings_view import SettingsView
 from stats_dialog import StatsDialog
 from viewer import (
     ComicViewer,
@@ -479,6 +484,7 @@ class _RailButton(QPushButton):
         self._kind = kind  # "glyph" (font char) or "book" (vector outline)
         self._expanded = False
         self._fg = QColor("#2a1818")
+        self._icon_size = 21  # glyph/vector size, independent of the label font
         self.setFlat(True)
         self.setText("")  # we draw the glyph ourselves
 
@@ -490,8 +496,13 @@ class _RailButton(QPushButton):
         self._fg = QColor(color)
         self.update()
 
+    def set_icon_size(self, px: int) -> None:
+        """Pin the drawn glyph size so icons don't shrink when labels appear."""
+        self._icon_size = px
+        self.update()
+
     def _icon_px(self) -> int:
-        return self.font().pixelSize() if self.font().pixelSize() > 0 else 18
+        return self._icon_size if self._icon_size > 0 else 18
 
     def paintEvent(self, event):
         super().paintEvent(event)  # stylesheet background / hover / active
@@ -499,23 +510,38 @@ class _RailButton(QPushButton):
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(self._fg)
-        painter.setFont(self.font())
-        fm = QFontMetrics(self.font())
         h = self.height()
 
+        # Icon is always drawn at its pinned size; the label (expanded only) uses
+        # the smaller widget font so the glyph never shrinks to make text fit.
+        icon_font = QFont(self.font())
+        icon_font.setPixelSize(self._icon_px())
+
         if self._expanded and self._label:
-            baseline = h / 2 + (fm.ascent() - fm.descent()) / 2
+            # Icon stays centered on the collapsed rail center (x=30) so it never
+            # moves when the panel opens; the label is drawn to its right.
+            icon_cx = _Sidebar.COLLAPSED_W / 2
             if self._kind == "book":
-                self._draw_book(painter, 24, h / 2)
-                painter.setPen(self._fg)
-                painter.drawText(44, int(round(baseline)), self._label)
+                self._draw_book(painter, icon_cx, h / 2)
             else:
-                painter.drawText(16, int(round(baseline)), f"{self._icon}   {self._label}")
+                painter.setFont(icon_font)
+                ifm = QFontMetrics(icon_font)
+                tight = ifm.tightBoundingRect(self._icon)
+                ix = icon_cx - tight.left() - tight.width() / 2
+                ibaseline = h / 2 - (tight.top() + tight.height() / 2)
+                painter.drawText(int(round(ix)), int(round(ibaseline)), self._icon)
+            painter.setFont(self.font())
+            lfm = QFontMetrics(self.font())
+            lbaseline = h / 2 + (lfm.ascent() - lfm.descent()) / 2
+            painter.setPen(self._fg)
+            painter.drawText(int(_Sidebar.COLLAPSED_W) + 4, int(round(lbaseline)), self._label)
         else:
             if self._kind == "book":
                 self._draw_book(painter, self.width() / 2, h / 2)
             else:
-                tight = fm.tightBoundingRect(self._icon)
+                painter.setFont(icon_font)
+                ifm = QFontMetrics(icon_font)
+                tight = ifm.tightBoundingRect(self._icon)
                 x = self.width() / 2 - tight.left() - tight.width() / 2
                 baseline = h / 2 - (tight.top() + tight.height() / 2)
                 painter.drawText(int(round(x)), int(round(baseline)), self._icon)
@@ -524,25 +550,30 @@ class _RailButton(QPushButton):
     def _draw_book(self, painter: QPainter, cx: float, cy: float) -> None:
         """Stroke an open-book outline centered at (cx, cy), sized to the icon font."""
         s = self._icon_px()
-        hw = s * 0.60          # half width
-        hh = s * 0.42          # half height
-        spine_top = QPointF(cx, cy - hh * 0.72)
-        spine_bot = QPointF(cx, cy + hh)
+        k = 0.70                 # overall scale, tuned to match the glyph icons' size
+        hw = s * 0.60 * k        # half width (sets the diagonal's horizontal reach)
+        # Vertically symmetric: page tops rise gently to the outer corners and the
+        # bottoms mirror that same gentle angle. The spine and outer vertical edges
+        # run longer than the short top/bottom diagonals.
+        outer_top_y = cy - s * 0.56 * k
+        spine_top_y = cy - s * 0.48 * k   # barely below the outer corners — gentle slope
+        outer_bot_y = cy + s * 0.48 * k   # mirror of the top angle
+        spine_bot_y = cy + s * 0.56 * k
 
         path = QPainterPath()
-        # left page
-        path.moveTo(spine_top)
-        path.quadTo(cx - hw * 0.5, cy - hh, cx - hw, cy - hh * 0.5)
-        path.lineTo(cx - hw, cy + hh * 0.62)
-        path.quadTo(cx - hw * 0.5, cy + hh * 0.42, spine_bot.x(), spine_bot.y())
+        # left page — straight lines only
+        path.moveTo(cx, spine_top_y)
+        path.lineTo(cx - hw, outer_top_y)      # short diagonal up to outer top corner
+        path.lineTo(cx - hw, outer_bot_y)      # long outer edge down
+        path.lineTo(cx, spine_bot_y)
         # right page (mirror)
-        path.moveTo(spine_top)
-        path.quadTo(cx + hw * 0.5, cy - hh, cx + hw, cy - hh * 0.5)
-        path.lineTo(cx + hw, cy + hh * 0.62)
-        path.quadTo(cx + hw * 0.5, cy + hh * 0.42, spine_bot.x(), spine_bot.y())
-        # spine
-        path.moveTo(spine_top)
-        path.lineTo(spine_bot)
+        path.moveTo(cx, spine_top_y)
+        path.lineTo(cx + hw, outer_top_y)
+        path.lineTo(cx + hw, outer_bot_y)
+        path.lineTo(cx, spine_bot_y)
+        # spine — long center line
+        path.moveTo(cx, spine_top_y)
+        path.lineTo(cx, spine_bot_y)
 
         pen = QPen(self._fg)
         pen.setWidthF(max(1.3, s * 0.085))
@@ -554,11 +585,13 @@ class _RailButton(QPushButton):
 
 
 class _Sidebar(QWidget):
-    """Slim icon rail: Library / Currently Reading / Search, expandable with labels.
+    """Slim icon rail split into two independent sections.
 
-    The hamburger that toggles the labels lives in the top bar; this rail just
-    shows icons (collapsed) or icons + labels (expanded). Clicking Search reveals
-    a search field right here in the sidebar.
+    A fixed top box (hamburger + Library) is part of the top-bar zone and never
+    widens or shows labels. Below it, an expanding panel (Currently Reading,
+    Search, Settings) is the only part that opens out — it overlays the comics
+    with labels when the hamburger is clicked. The widget is masked to those two
+    boxes so the empty area beside the top box stays click-through.
     """
 
     home_clicked = pyqtSignal()
@@ -566,6 +599,8 @@ class _Sidebar(QWidget):
     search_changed = pyqtSignal(str)
     search_closed = pyqtSignal()
     app_menu_requested = pyqtSignal()
+    settings_clicked = pyqtSignal()
+    expanded_changed = pyqtSignal()  # emitted when the rail width changes (overlay re-layout)
 
     COLLAPSED_W = 60
     EXPANDED_W = 200
@@ -576,31 +611,54 @@ class _Sidebar(QWidget):
         self._expanded = False
         self._active = "library"
         self._search_active = False
+        self._panel_w = self.COLLAPSED_W  # current (animated) panel width
 
-        self.setFixedWidth(self.COLLAPSED_W)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # Smoothly slide the panel open/closed instead of snapping.
+        self._panel_anim = QVariantAnimation(self)
+        self._panel_anim.setDuration(190)
+        self._panel_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._panel_anim.valueChanged.connect(self._on_panel_anim)
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 8, 0, 8)
-        outer.setSpacing(2)
+        # The sidebar spans the full expanded width, but a mask clips it to just
+        # the two inner boxes (see _relayout). That keeps the fixed top box
+        # separate from the expanding panel below it and leaves the area beside
+        # the top box genuinely click-through to the comics behind it.
+        self.setFixedWidth(self.EXPANDED_W)
 
-        # Hamburger lives at the top of the rail and toggles the labels.
+        # --- Top box: fixed icon group (hamburger + Library), part of the top
+        #     bar. It never widens or shows labels when the panel expands. ---
+        self._top_box = QWidget(self)
+        self._top_box.setObjectName("SidebarTop")
+        self._top_box.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        top_layout = QVBoxLayout(self._top_box)
+        top_layout.setContentsMargins(0, 8, 0, 0)
+        top_layout.setSpacing(2)
+
         self._btn_hamburger = self._make_item("☰", "")
         self._btn_hamburger.setToolTip("Show/hide labels")
         self._btn_hamburger.clicked.connect(self.toggle_expanded)
-        outer.addWidget(self._btn_hamburger)
+        top_layout.addWidget(self._btn_hamburger)
+
+        # --- Panel: the expanding group (Library, Currently Reading, Search,
+        #     Settings). This is the only part that widens and overlays comics. ---
+        self._panel = QWidget(self)
+        self._panel.setObjectName("SidebarPanel")
+        self._panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        panel_layout = QVBoxLayout(self._panel)
+        panel_layout.setContentsMargins(0, 2, 0, 8)
+        panel_layout.setSpacing(2)
 
         self._btn_home = self._make_item("⌂", "Library")
         self._btn_home.clicked.connect(self._on_home)
-        outer.addWidget(self._btn_home)
+        panel_layout.addWidget(self._btn_home)
 
         self._btn_reading = self._make_item("📖", "Currently Reading", kind="book")
         self._btn_reading.clicked.connect(self._on_reading)
-        outer.addWidget(self._btn_reading)
+        panel_layout.addWidget(self._btn_reading)
 
         self._btn_search = self._make_item("⌕", "Search")
         self._btn_search.clicked.connect(self._on_search)
-        outer.addWidget(self._btn_search)
+        panel_layout.addWidget(self._btn_search)
 
         # Search field — hidden until Search is clicked.
         self._search_input = QLineEdit()
@@ -609,23 +667,31 @@ class _Sidebar(QWidget):
         self._search_input.textChanged.connect(self.search_changed)
         self._search_input.installEventFilter(self)
         self._search_input.hide()
-        outer.addWidget(self._search_input)
+        panel_layout.addWidget(self._search_input)
 
-        outer.addStretch(1)
+        panel_layout.addStretch(1)
 
-        # Optional app menu (non-macOS only) at the bottom of the rail.
+        # Optional app menu (non-macOS only) near the bottom of the panel.
         self._btn_menu: QPushButton | None = None
         if show_app_menu:
             self._btn_menu = self._make_item("≡", "Menu")
             self._btn_menu.clicked.connect(self.app_menu_requested.emit)
-            outer.addWidget(self._btn_menu)
+            panel_layout.addWidget(self._btn_menu)
 
-        self._nav_items = [self._btn_home, self._btn_reading, self._btn_search]
-        self._all_buttons = [self._btn_hamburger, *self._nav_items]
+        # Settings sits at the very bottom of the panel.
+        self._btn_settings = self._make_item("⚙", "Settings")
+        self._btn_settings.clicked.connect(self._on_settings)
+        panel_layout.addWidget(self._btn_settings)
+
+        self._top_buttons = [self._btn_hamburger]
+        self._panel_buttons = [self._btn_home, self._btn_reading, self._btn_search]
         if self._btn_menu is not None:
-            self._all_buttons.append(self._btn_menu)
+            self._panel_buttons.append(self._btn_menu)
+        self._panel_buttons.append(self._btn_settings)
+        self._all_buttons = [*self._top_buttons, *self._panel_buttons]
         self._refresh_text()
         self._apply_styles()
+        self._relayout()
 
     # ----- item construction -----
 
@@ -638,9 +704,38 @@ class _Sidebar(QWidget):
         return btn
 
     def _refresh_text(self) -> None:
-        expanded = self._expanded or self._search_active
-        for btn in self._all_buttons:
-            btn.set_expanded(expanded)
+        want = self._expanded or self._search_active
+        # The top group is fixed: it never shows labels. Only the panel expands.
+        for btn in self._top_buttons:
+            btn.set_expanded(False)
+        for btn in self._panel_buttons:
+            btn.set_expanded(want)
+
+    def _relayout(self) -> None:
+        """Lay the fixed top box above the panel at its current animated width."""
+        top_h = self._top_box.sizeHint().height()
+        self._top_box.setGeometry(0, 0, self.COLLAPSED_W, top_h)
+        self._panel.setGeometry(0, top_h, self._panel_w, max(0, self.height() - top_h))
+        # Clip to the two boxes so the gap beside the top box is click-through.
+        mask = QRegion(self._top_box.geometry()).united(QRegion(self._panel.geometry()))
+        self.setMask(mask)
+
+    def _on_panel_anim(self, value) -> None:
+        self._panel_w = int(value)
+        self._relayout()
+
+    def _animate_panel_to(self, target: int) -> None:
+        self._panel_anim.stop()
+        if self._panel_w == target:
+            self._relayout()
+            return
+        self._panel_anim.setStartValue(self._panel_w)
+        self._panel_anim.setEndValue(target)
+        self._panel_anim.start()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout()
 
     # ----- expand / collapse -----
 
@@ -650,10 +745,11 @@ class _Sidebar(QWidget):
     def set_expanded(self, expanded: bool) -> None:
         self._expanded = expanded
         want = expanded or self._search_active
-        self.setFixedWidth(self.EXPANDED_W if want else self.COLLAPSED_W)
         self._refresh_text()
         self._apply_styles()
         self._search_input.setVisible(self._search_active and want)
+        self._animate_panel_to(self.EXPANDED_W if want else self.COLLAPSED_W)
+        self.expanded_changed.emit()
 
     # ----- slots -----
 
@@ -672,6 +768,10 @@ class _Sidebar(QWidget):
         self.set_expanded(True)
         self._search_input.show()
         self._search_input.setFocus()
+
+    def _on_settings(self):
+        self._close_search_input()
+        self.settings_clicked.emit()
 
     def _close_search_input(self):
         if not self._search_active:
@@ -704,13 +804,13 @@ class _Sidebar(QWidget):
 
     def _apply_styles(self) -> None:
         c = self._theme
-        self.setStyleSheet(f"QWidget {{ background: {c['sidebar_bg']}; }}")
+        # The sidebar itself stays transparent/click-through; the two boxes paint.
+        self.setStyleSheet("background: transparent;")
+        self._top_box.setStyleSheet(f"#SidebarTop {{ background: {c['sidebar_bg']}; }}")
+        self._panel.setStyleSheet(f"#SidebarPanel {{ background: {c['sidebar_bg']}; }}")
         expanded = self._expanded or self._search_active
-        # Labels at 18px overflow the rail; shrink the text when expanded so
-        # "Currently Reading" fits. Icons stay large in the collapsed rail.
-        font_px = 13 if expanded else 18
-        icon_font = QFont("Libre Baskerville")
-        icon_font.setPixelSize(font_px)
+        # Icons keep their full collapsed size whether or not the rail is expanded;
+        # only the panel labels appear (top group never gets a label).
         active_map = {
             id(self._btn_home): "library",
             id(self._btn_reading): "currently_reading",
@@ -719,7 +819,12 @@ class _Sidebar(QWidget):
             key = active_map.get(id(btn))
             active = key is not None and key == self._active
             bg = "rgba(255,255,255,0.13)" if active else "transparent"
-            btn.setFont(icon_font)
+            icon_px = 18 if btn is self._btn_reading else 21
+            label_px = 13 if (expanded and btn in self._panel_buttons) else icon_px
+            font = QFont("Libre Baskerville")
+            font.setPixelSize(label_px)
+            btn.setFont(font)
+            btn.set_icon_size(icon_px)
             btn.set_fg(c["text"])
             # Background/hover/active only — the glyph is painted by _RailButton.
             btn.setStyleSheet(
@@ -811,14 +916,33 @@ class MainWindow(QMainWindow):
         self._RIGHT_DOUBLE_MS = 400
 
         self._stack = QStackedWidget()
+        bookshelf_mod.set_tile_scale(prefs.get_str(prefs.TILE_SIZE))
         self._bookshelf = BookshelfView(self._library)
         self.viewer = ComicViewer()
         self._webtoon_viewer = WebtoonViewer()
         self._ebook_viewer = EbookViewer()
+        self._settings_view = SettingsView()
+        self._settings_view.back_requested.connect(self._close_settings)
+        self._settings_view.theme_changed.connect(self._on_theme_changed)
+        self._settings_view.animations_changed.connect(self._on_animations_changed)
+        self._settings_view.tile_size_changed.connect(self._on_tile_size_changed)
+        self._settings_view.sidebar_default_changed.connect(
+            self._on_sidebar_default_changed
+        )
+        self._settings_view.reading_defaults_changed.connect(
+            self._on_reading_defaults_changed
+        )
+        self._settings_view.ebook_defaults_changed.connect(
+            self._on_ebook_defaults_changed
+        )
+        self._settings_view.library_action.connect(self._on_library_action)
+        self._settings_view.shortcuts_requested.connect(self._open_shortcuts_dialog)
+        self._animations_enabled = prefs.get_bool(prefs.ANIMATIONS)
         self._stack.addWidget(self._bookshelf)      # index 0
         self._stack.addWidget(self.viewer)           # index 1
         self._stack.addWidget(self._webtoon_viewer)  # index 2
         self._stack.addWidget(self._ebook_viewer)    # index 3 — text ebooks
+        self._stack.addWidget(self._settings_view)   # index 4 — settings page
 
         # Instant loading screen + background archive opening.
         self._loading_overlay = _LoadingOverlay(self._stack)
@@ -870,20 +994,33 @@ class MainWindow(QMainWindow):
 
         self._sidebar = _Sidebar(show_app_menu=sys.platform != "darwin")
         self._sidebar.app_menu_requested.connect(self._show_app_menu)
-        self._sidebar.home_clicked.connect(self._bookshelf.go_to_root)
+        self._sidebar.home_clicked.connect(self._go_home)
         self._sidebar.currently_reading_clicked.connect(
-            self._bookshelf.show_currently_reading
+            self._show_currently_reading
         )
         self._sidebar.search_changed.connect(self._bookshelf.search)
         self._sidebar.search_closed.connect(self._bookshelf.clear_search)
+        self._sidebar.settings_clicked.connect(self._open_settings)
 
         container = QWidget()
+        self._sidebar_host = container
         h_layout = QHBoxLayout(container)
         h_layout.setContentsMargins(0, 0, 0, 0)
         h_layout.setSpacing(0)
-        h_layout.addWidget(self._sidebar)
+        # Reserve a fixed gutter for the collapsed icon rail so the content never
+        # shifts. The sidebar itself floats on top (see below) and, when expanded,
+        # spills over the content instead of pushing it.
+        h_layout.addSpacing(_Sidebar.COLLAPSED_W)
         h_layout.addWidget(content)
         self.setCentralWidget(container)
+
+        # Float the sidebar over the content as an overlay child of the container.
+        self._sidebar.setParent(container)
+        self._sidebar.raise_()
+        self._sidebar.show()
+        self._sidebar.expanded_changed.connect(self._position_sidebar_overlay)
+        container.installEventFilter(self)
+        self._position_sidebar_overlay()
 
         self._trans_overlay = QLabel(content)
         self._trans_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -922,13 +1059,28 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self._restore_window_state()
 
-        self.apply_theme(themes.DARK)
+        if prefs.get_bool(prefs.SIDEBAR_EXPANDED):
+            self._sidebar.set_expanded(True)
+
+        start_theme = themes.LIGHT if prefs.get_str(prefs.THEME) == "light" else themes.DARK
+        self.apply_theme(start_theme)
 
         QApplication.instance().installEventFilter(self)
 
     # ----- UI construction -----
 
+    def _position_sidebar_overlay(self) -> None:
+        """Pin the floating sidebar to the left edge, full height, above content."""
+        host = getattr(self, "_sidebar_host", None)
+        if host is None:
+            return
+        self._sidebar.setGeometry(0, 0, self._sidebar.width(), host.height())
+        self._sidebar.raise_()
+
     def eventFilter(self, obj, event) -> bool:
+        if obj is getattr(self, "_sidebar_host", None) and event.type() == QEvent.Type.Resize:
+            self._position_sidebar_overlay()
+            return False
         if event.type() == QEvent.Type.KeyPress and self._is_reading_view():
             focus = QApplication.focusWidget()
             if focus is not None and self.isAncestorOf(focus):
@@ -1120,6 +1272,9 @@ class MainWindow(QMainWindow):
 
     def _fade_switch(self, switch_fn):
         """Capture the current stack view, run switch_fn, then fade the capture out."""
+        if not getattr(self, "_animations_enabled", True):
+            switch_fn()
+            return
         grab = self._stack.grab()
         stack_geom = self._stack.geometry()
         switch_fn()
@@ -1325,7 +1480,9 @@ class MainWindow(QMainWindow):
             self._stack.setCurrentIndex(2)
         else:
             self._cache.clear()
-            self._preloader = PagePreloader(self._reader, self._cache)
+            self._preloader = PagePreloader(
+                self._reader, self._cache, radius=prefs.get_int(prefs.PRELOAD)
+            )
             self._preloader.set_center(self._current_page)
             self._preloader.start()
             self._seek_bar.set_page_count(
@@ -1472,6 +1629,9 @@ class MainWindow(QMainWindow):
             self._build_menus()
 
     def _on_escape(self):
+        if self._stack.currentIndex() == 4:
+            self._close_settings()
+            return
         if self.isFullScreen():
             self._exit_window_fullscreen()
             return
@@ -1503,6 +1663,7 @@ class MainWindow(QMainWindow):
         self._reader_bar.apply_theme(c)
         self._bookshelf.apply_theme(c)
         self._ebook_viewer.apply_theme(c)
+        self._settings_view.apply_theme(c)
 
     # ----- File loading -----
 
@@ -1564,9 +1725,14 @@ class MainWindow(QMainWindow):
         webtoon = False
         if comic is not None:
             start_page = max(0, comic.current_page)
-            rs = self._library.resolve_reading_settings(comic)
+            rs = self._library.resolve_reading_settings(
+                comic, self._global_reading_defaults()
+            )
             webtoon = rs.reading_mode == "webtoon"
             spread = bool(rs.spread) and not webtoon
+        else:
+            webtoon = prefs.get_str(prefs.DEFAULT_MODE) == "webtoon"
+            spread = prefs.get_bool(prefs.DEFAULT_SPREAD) and not webtoon
         self._open_gen += 1
         self._opening_path = path
         self._open_started = time.monotonic()
@@ -1599,6 +1765,15 @@ class MainWindow(QMainWindow):
         self._reader = reader
         self._finish_open_comic(self._opening_path, images)
 
+    def _global_reading_defaults(self) -> ReadingSettings:
+        """Global default viewer settings from QSettings (base beneath the DB)."""
+        return ReadingSettings(
+            reading_mode=prefs.get_str(prefs.DEFAULT_MODE),
+            spread=prefs.get_bool(prefs.DEFAULT_SPREAD),
+            fit_mode=prefs.get_str(prefs.DEFAULT_FIT),
+            zoom=prefs.get_float(prefs.DEFAULT_ZOOM),
+        )
+
     def _finish_open_comic(self, path: str, images: dict | None = None) -> None:
         self._settings.setValue("last_dir", str(Path(path).parent))
         title = Path(path).stem
@@ -1615,23 +1790,35 @@ class MainWindow(QMainWindow):
             "width":  FitMode.FIT_WIDTH,
             "page":   FitMode.FIT_PAGE,
         }
+        default_rtl = prefs.get_bool(prefs.DEFAULT_RTL)
         if comic is not None:
             self._current_comic_id = comic.id
             self._current_page = comic.current_page if 0 < comic.current_page < self._reader.page_count() else 0
-            rs = self._library.resolve_reading_settings(comic)
+            rs = self._library.resolve_reading_settings(
+                comic, self._global_reading_defaults()
+            )
             self._webtoon_mode = rs.reading_mode == "webtoon"
             self._spread_mode = bool(rs.spread) and not self._webtoon_mode
-            self._is_manga = comic.is_manga  # reading direction stays per-comic
+            # Per-comic manga flag, falling back to the global default direction.
+            self._is_manga = comic.is_manga or default_rtl
             self.viewer.restore_view_state(
                 _fit_mode_map.get(rs.fit_mode, FitMode.FIT_PAGE), rs.zoom
             )
         else:
+            defaults = self._global_reading_defaults()
             self._current_comic_id = None
             self._current_page = 0
-            self._webtoon_mode = False
-            self._spread_mode = True
-            self._is_manga = False
-            self.viewer.restore_view_state(FitMode.FIT_PAGE, 1.0)
+            self._webtoon_mode = defaults.reading_mode == "webtoon"
+            self._spread_mode = bool(defaults.spread) and not self._webtoon_mode
+            self._is_manga = default_rtl
+            self.viewer.restore_view_state(
+                _fit_mode_map.get(defaults.fit_mode, FitMode.FIT_PAGE),
+                defaults.zoom or 1.0,
+            )
+
+        # Apply global reading prefs that aren't per-comic.
+        self.viewer.set_click_nav(prefs.get_bool(prefs.CLICK_NAV))
+        self.viewer.set_animate(prefs.get_bool(prefs.PAGE_ANIM))
 
         if self._spread_mode:
             self._current_page = (self._current_page // 2) * 2
@@ -1651,7 +1838,9 @@ class MainWindow(QMainWindow):
             # so showing the first page below is instant.
             for idx, img in (images or {}).items():
                 self._cache.put(idx, img)
-            self._preloader = PagePreloader(self._reader, self._cache)
+            self._preloader = PagePreloader(
+                self._reader, self._cache, radius=prefs.get_int(prefs.PRELOAD)
+            )
             self._preloader.set_center(self._current_page)
             self._preloader.start()
 
@@ -1767,6 +1956,7 @@ class MainWindow(QMainWindow):
         self._spread_mode = False
         self._current_page = start_chapter
         self._ebook_viewer.set_spread_mode(False)
+        self._ebook_viewer.set_font_family(prefs.get_str(prefs.EBOOK_FONT_FAMILY))
         self._ebook_viewer.load_book(book, start_chapter, font_pt)
 
         # Start a reading session for statistics.
@@ -2151,6 +2341,117 @@ class MainWindow(QMainWindow):
         menu.addMenu(self._library_menu)
         menu.exec(self._sidebar.mapToGlobal(QPoint(0, 56)))
 
+    def _open_settings(self) -> None:
+        """Switch to the full-page settings view (stack index 4)."""
+        if self._stack.currentIndex() == 4:
+            return
+        # Settings shares the bookshelf chrome rules: no reader/seek/thumb bars.
+        self._chrome_hidden = False
+        self._hide_reader_bar(animated=False)
+        self._seek_bar.setVisible(False)
+        self._thumb_strip.setVisible(False)
+        self._settings_view.reset()
+        self._sidebar.set_active("")
+        self._stack.setCurrentIndex(4)
+        self._sidebar.show()
+
+    def _close_settings(self) -> None:
+        """Leave the settings page and return to the bookshelf."""
+        if self._stack.currentIndex() != 4:
+            return
+        self._bookshelf.refresh()
+        self._stack.setCurrentIndex(0)
+        self._sidebar.show()
+        self._on_folder_level_changed(self._bookshelf._current_folder is not None)
+
+    # ----- settings handlers -----
+
+    def _on_theme_changed(self, name: str) -> None:
+        self.apply_theme(themes.LIGHT if name == "light" else themes.DARK)
+
+    def _on_animations_changed(self, enabled: bool) -> None:
+        self._animations_enabled = enabled
+
+    def _on_tile_size_changed(self, name: str) -> None:
+        bookshelf_mod.set_tile_scale(name)
+        self._bookshelf.refresh()
+
+    def _on_sidebar_default_changed(self, expanded: bool) -> None:
+        self._sidebar.set_expanded(expanded)
+
+    def _on_reading_defaults_changed(self) -> None:
+        # Apply global-only reading controls live; per-comic fit/zoom/mode still
+        # resolve when a comic is opened.
+        self.viewer.set_click_nav(prefs.get_bool(prefs.CLICK_NAV))
+        self.viewer.set_animate(prefs.get_bool(prefs.PAGE_ANIM))
+        if self._preloader and self._preloader.isRunning() and self._reader is not None:
+            center = self._current_page
+            self._stop_preloader()
+            self._cache.clear()
+            self._preloader = PagePreloader(
+                self._reader, self._cache, radius=prefs.get_int(prefs.PRELOAD)
+            )
+            self._preloader.set_center(center)
+            self._preloader.start()
+
+    def _on_ebook_defaults_changed(self) -> None:
+        # Apply the new defaults live if a text ebook is open.
+        if self._ebook_mode:
+            self._ebook_viewer.set_font_family(prefs.get_str(prefs.EBOOK_FONT_FAMILY))
+            self._ebook_viewer.set_font_pt(prefs.get_int(prefs.EBOOK_FONT_PT))
+
+    def _on_library_action(self, action: str) -> None:
+        handlers = {
+            "add_folder": self.add_folder_to_library,
+            "add_files": self.add_files_to_library,
+            "rescan_all": self.rescan_all_folders,
+            "regen_thumbs": self._regenerate_thumbnails,
+            "clear_thumbs": self._clear_thumbnail_cache,
+            "export": self.export_library,
+            "import": self.import_library,
+            "import_shelf": self.import_shelf,
+            "duplicates": self.scan_for_duplicates,
+            "stats": self.show_statistics,
+        }
+        fn = handlers.get(action)
+        if fn is not None:
+            fn()
+
+    def _regenerate_thumbnails(self) -> None:
+        """Clear the cache so covers are rebuilt on next display, then refresh."""
+        self._clear_thumbnail_cache(announce=False)
+        self._bookshelf.refresh()
+        QMessageBox.information(
+            self, "Thumbnails", "Thumbnail cache cleared. Covers will rebuild as you browse."
+        )
+
+    def _clear_thumbnail_cache(self, announce: bool = True) -> None:
+        import shutil
+        import thumbnails
+        cache_dir = thumbnails.thumbnail_cache_dir()
+        try:
+            if Path(cache_dir).exists():
+                shutil.rmtree(cache_dir)
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "Thumbnails", f"Could not clear cache:\n{exc}")
+            return
+        self._bookshelf.refresh()
+        if announce:
+            QMessageBox.information(self, "Thumbnails", "Thumbnail cache cleared.")
+
+    def _go_home(self) -> None:
+        """Sidebar Library button: leave settings if open, then go to root."""
+        if self._stack.currentIndex() == 4:
+            self._close_settings()
+        self._bookshelf.go_to_root()
+
+    def _show_currently_reading(self) -> None:
+        """Sidebar Currently Reading: leave settings if open first."""
+        if self._stack.currentIndex() == 4:
+            self._close_settings()
+        self._bookshelf.show_currently_reading()
+
     def _exit_window_fullscreen(self) -> None:
         if not self.isFullScreen():
             return
@@ -2455,12 +2756,21 @@ class MainWindow(QMainWindow):
         self._rescan_all_action.setEnabled(False)
 
         self._scan_thread = QThread(self)
+        reading_defaults = self._global_reading_defaults()
         if paths:
-            self._scanner = LibraryScanner(self._library, paths=[Path(p) for p in paths])
+            self._scanner = LibraryScanner(
+                self._library,
+                paths=[Path(p) for p in paths],
+                reading_defaults=reading_defaults,
+            )
             progress_label = "Adding files…"
             progress_title = "Adding to Library"
         else:
-            self._scanner = LibraryScanner(self._library, folder=Path(folder))
+            self._scanner = LibraryScanner(
+                self._library,
+                folder=Path(folder),
+                reading_defaults=reading_defaults,
+            )
             progress_label = "Finding comic files…"
             progress_title = "Scanning Library"
         self._scanner.moveToThread(self._scan_thread)

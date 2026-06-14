@@ -10,7 +10,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from archive_handler import open_comic
 from comicinfo import parse_comicinfo
 from epub_book import EpubBook, is_text_epub
-from library import Library, enrich_series_metadata
+from library import Library, ReadingSettings, enrich_series_metadata
 from thumbnails import (
     generate_thumbnail,
     generate_thumbnail_from_bytes,
@@ -70,12 +70,14 @@ class LibraryScanner(QObject):
         library: Library,
         folder: Path | None = None,
         paths: list[Path] | None = None,
+        reading_defaults: ReadingSettings | None = None,
         parent=None,
     ):
         super().__init__(parent)
         self._library = library
         self._folder = folder
         self._paths = [Path(p) for p in paths] if paths else None
+        self._reading_defaults = reading_defaults
         if self._folder is None and not self._paths:
             raise ValueError("LibraryScanner requires folder or paths")
         self._cancelled = False
@@ -147,6 +149,7 @@ class LibraryScanner(QObject):
                     page_count=page_count,
                     file_size=file_size,
                     source_folder=source_folder,
+                    reading_defaults=self._reading_defaults,
                     **meta,
                 )
                 result.added += 1

@@ -7,6 +7,10 @@ APP_DISPLAY_NAME = "Cover 2.0"
 APP_INTERNAL_NAME = "Comic Reader"
 APP_ORGANIZATION = "ComicReader"
 
+# User-facing version + project links (shown on the Settings → About panel).
+APP_VERSION = "1.0.0"
+APP_REPO_URL = "https://github.com/Distractodog/comic-reader"
+
 
 def app_settings():
     """Shared QSettings — stable path shared by dev runs and packaged builds.

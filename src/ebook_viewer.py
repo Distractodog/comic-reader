@@ -379,6 +379,7 @@ class EbookViewer(QWidget):
         self._page = 0
         self._page_count = 1
         self._font_pt = DEFAULT_FONT_PT
+        self._font_family = ""  # '' = app default serif stack
         self._spread_mode = False
         self._syncing = False   # guards programmatic seek-bar updates
         self._seek_dragging = False
@@ -615,6 +616,16 @@ class EbookViewer(QWidget):
         self._render_chapter(self._index, keep_index=True)
         self._goto_page(round(frac * self._page_count))
 
+    def set_font_family(self, family: str) -> None:
+        family = family or ""
+        if family == self._font_family:
+            return
+        frac = self._page / self._page_count if self._page_count else 0
+        self._font_family = family
+        if self._book is not None:
+            self._render_chapter(self._index, keep_index=True)
+            self._goto_page(round(frac * self._page_count))
+
     # ----- rendering / pagination -----
 
     def _render_chapter(self, index: int, to_last_page: bool = False, keep_index: bool = False) -> None:
@@ -679,15 +690,18 @@ class EbookViewer(QWidget):
 
     def _reader_font(self) -> QFont:
         font = QFont()
-        font.setFamilies(["Libre Baskerville", "Georgia", "serif"])
+        families = [self._font_family] if self._font_family else []
+        families += ["Libre Baskerville", "Georgia", "serif"]
+        font.setFamilies(families)
         font.setPointSize(self._font_pt)
         return font
 
     def _reader_css(self) -> str:
         pt = self._font_pt
+        family_prefix = f"'{self._font_family}', " if self._font_family else ""
         return (
             f"body {{ color: {_PAGE_FG}; font-size: {pt}pt;"
-            f" font-family: 'Libre Baskerville', Georgia, serif; }}"
+            f" font-family: {family_prefix}'Libre Baskerville', Georgia, serif; }}"
             f"p {{ margin-top: 0.5em; margin-bottom: 0.5em; }}"
             f"h1, h2, h3, h4 {{ font-weight: bold; margin: 0.8em 0 0.4em 0; }}"
             f"a {{ color: {_PAGE_FG}; }}"

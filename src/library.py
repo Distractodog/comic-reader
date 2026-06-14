@@ -628,20 +628,38 @@ class Library:
         publisher: str | None = None,
         year: int | None = None,
         source_folder: str | None = None,
+        reading_defaults: ReadingSettings | None = None,
     ) -> int:
         """Insert a comic. If the path already exists, returns the existing id."""
         now = datetime.now(timezone.utc).isoformat()
+        reading_mode = (
+            reading_defaults.reading_mode
+            if reading_defaults and reading_defaults.reading_mode
+            else "single"
+        )
+        fit_mode = (
+            reading_defaults.fit_mode
+            if reading_defaults and reading_defaults.fit_mode
+            else "page"
+        )
+        zoom = (
+            reading_defaults.zoom
+            if reading_defaults and reading_defaults.zoom is not None
+            else 1.0
+        )
         with self.transaction() as cur:
             cur.execute(
                 """
                 INSERT INTO comics
                     (file_path, page_count, file_size, title, series, series_number,
-                     author, publisher, year, date_added, source_folder, parent_dir)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     author, publisher, year, date_added, source_folder, parent_dir,
+                     reading_mode, fit_mode, zoom)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_path) DO NOTHING
                 """,
                 (file_path, page_count, file_size, title, series, series_number,
-                 author, publisher, year, now, source_folder, _parent_dir(file_path)),
+                 author, publisher, year, now, source_folder, _parent_dir(file_path),
+                 reading_mode, fit_mode, float(zoom)),
             )
         row = self._conn.execute(
             "SELECT id FROM comics WHERE file_path = ?", (file_path,)
@@ -1815,16 +1833,23 @@ class Library:
                 (folder_path, series_name),
             )
 
-    def resolve_reading_settings(self, comic: Comic) -> ReadingSettings:
+    def resolve_reading_settings(
+        self, comic: Comic, defaults: ReadingSettings | None = None
+    ) -> ReadingSettings:
         """Effective viewer settings for a comic.
 
         Precedence (most specific wins): series → folder → the comic's own
-        stored columns → app defaults. Always fully populated.
+        stored columns → global ``defaults`` (QSettings, passed in) → hardcoded
+        constants. Always fully populated.
+
+        ``spread`` isn't stored per comic, so the global default is the main
+        lever for it on library comics; the comic's own fit/zoom/mode override
+        the global defaults when set.
         """
         folder = _parent_dir(comic.file_path)
         resolved = ReadingSettings(
             reading_mode=comic.reading_mode,
-            spread=None,                 # spread isn't stored per comic
+            spread=defaults.spread if defaults else None,
             fit_mode=comic.fit_mode,
             zoom=comic.zoom,
         )
@@ -1840,11 +1865,11 @@ class Library:
             _overlay(self.get_series_reading_settings(folder, comic.series))
 
         if resolved.reading_mode is None:
-            resolved.reading_mode = "single"
+            resolved.reading_mode = defaults.reading_mode if defaults and defaults.reading_mode else "single"
         if resolved.fit_mode is None:
-            resolved.fit_mode = "page"
+            resolved.fit_mode = defaults.fit_mode if defaults and defaults.fit_mode else "page"
         if resolved.zoom is None:
-            resolved.zoom = 1.0
+            resolved.zoom = defaults.zoom if defaults and defaults.zoom else 1.0
         if resolved.spread is None:
             resolved.spread = resolved.reading_mode != "webtoon"
         return resolved
@@ -2567,6 +2592,20 @@ if __name__ == "__main__":
     assert lib.resolve_reading_settings(lib.get_comic_by_id(loose)).reading_mode == "single"
     lib.clear_series_reading_settings(rset_dir, "Naruto")
     assert lib.resolve_reading_settings(lib.get_comic_by_id(rs2)).fit_mode == "width"
+    defaults_id = lib.add_comic(
+        f"{rset_dir}/Defaults.cbz",
+        page_count=1,
+        file_size=100,
+        reading_defaults=ReadingSettings(
+            reading_mode="webtoon", fit_mode="width", zoom=1.25
+        ),
+    )
+    defaults_comic = lib.get_comic_by_id(defaults_id)
+    assert (
+        defaults_comic.reading_mode,
+        defaults_comic.fit_mode,
+        defaults_comic.zoom,
+    ) == ("webtoon", "width", 1.25)
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
