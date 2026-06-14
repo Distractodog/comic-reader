@@ -1865,9 +1865,13 @@ class Library:
             _overlay(self.get_series_reading_settings(folder, comic.series))
 
         if resolved.reading_mode is None:
-            resolved.reading_mode = defaults.reading_mode if defaults and defaults.reading_mode else "single"
+            resolved.reading_mode = (
+                defaults.reading_mode if defaults and defaults.reading_mode else "single"
+            )
         if resolved.fit_mode is None:
-            resolved.fit_mode = defaults.fit_mode if defaults and defaults.fit_mode else "page"
+            resolved.fit_mode = (
+                defaults.fit_mode if defaults and defaults.fit_mode else "page"
+            )
         if resolved.zoom is None:
             resolved.zoom = defaults.zoom if defaults and defaults.zoom else 1.0
         if resolved.spread is None:

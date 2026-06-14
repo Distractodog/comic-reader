@@ -2384,7 +2384,11 @@ class MainWindow(QMainWindow):
         # resolve when a comic is opened.
         self.viewer.set_click_nav(prefs.get_bool(prefs.CLICK_NAV))
         self.viewer.set_animate(prefs.get_bool(prefs.PAGE_ANIM))
-        if self._preloader and self._preloader.isRunning() and self._reader is not None:
+        if (
+            self._preloader
+            and self._preloader.isRunning()
+            and self._reader is not None
+        ):
             center = self._current_page
             self._stop_preloader()
             self._cache.clear()
