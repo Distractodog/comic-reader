@@ -2840,6 +2840,9 @@ class MainWindow(QMainWindow):
             self._ebook_viewer.set_font_pt(prefs.get_int(prefs.EBOOK_FONT_PT))
 
     def _on_library_action(self, action: str) -> None:
+        if action == "export_shelf":
+            self._export_shelf_from_settings()
+            return
         handlers = {
             "add_folder": self.add_folder_to_library,
             "add_files": self.add_files_to_library,
@@ -2855,6 +2858,22 @@ class MainWindow(QMainWindow):
         fn = handlers.get(action)
         if fn is not None:
             fn()
+
+    def _export_shelf_from_settings(self) -> None:
+        shelves = self._library.get_shelves()
+        user_shelves = [s for s in shelves if not s.is_smart]
+        if not user_shelves:
+            QMessageBox.information(self, "Export Shelf", "No bookshelves to export.")
+            return
+        names = [s.name for s in user_shelves]
+        name, ok = QInputDialog.getItem(
+            self, "Export Shelf", "Choose a bookshelf to export:", names, 0, False
+        )
+        if not ok or not name:
+            return
+        shelf = next((s for s in user_shelves if s.name == name), None)
+        if shelf:
+            self.export_shelf(shelf.id, shelf.name)
 
     def _regenerate_thumbnails(self) -> None:
         """Clear the cache so covers are rebuilt on next display, then refresh."""

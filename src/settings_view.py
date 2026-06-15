@@ -368,6 +368,7 @@ class LibraryPanel(_SettingsPanel):
         self._subheading("Import / export")
         self._full(self._btn("Export library…", "export"))
         self._full(self._btn("Import library…", "import"))
+        self._full(self._btn("Export shelf…", "export_shelf"))
         self._full(self._btn("Import shelf…", "import_shelf"))
 
         self._divider()

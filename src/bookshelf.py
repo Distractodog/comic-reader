@@ -1073,7 +1073,7 @@ class BookshelfView(QWidget):
         self._sort_by = sort_by
         self._sort_order = order
         self._persist_sort()
-        self._repopulate()
+        self._nav_transition(self._repopulate)
 
     def _on_filter_changed(self, key: str):
         self._status_filter = key
@@ -1147,15 +1147,8 @@ class BookshelfView(QWidget):
         if shelf is None:
             return
         menu = themes.make_menu(self)
-        menu.addAction("Open").triggered.connect(
-            lambda: self.show_shelf(shelf_id, shelf.name)
-        )
-        menu.addSeparator()
         menu.addAction("Rename bookshelf…").triggered.connect(
             lambda: self._rename_shelf(shelf_id, shelf.name)
-        )
-        menu.addAction("Export bookshelf…").triggered.connect(
-            lambda: self.export_shelf_requested.emit(shelf_id, shelf.name)
         )
         menu.addSeparator()
         menu.addAction("Choose cover image…").triggered.connect(
