@@ -1787,33 +1787,34 @@ class BookshelfView(QWidget):
             lambda: self._plan_batch_rename(target_ids)
         )
 
-        # Cover override (single comic only)
+        # Cover & background (single comic only)
         if not is_multi:
             comic = self._library.get_comic_by_id(comic_id)
             bg_noun = self._background_noun(self._current_scope_parts())
-            menu.addSeparator()
-            menu.addAction("Set cover from page…").triggered.connect(
+            cover_menu = menu.addMenu("Cover & Background")
+            cover_menu.addAction("Set cover from page…").triggered.connect(
                 lambda: self._set_comic_cover_from_page(comic_id)
             )
-            menu.addAction("Choose cover image…").triggered.connect(
+            cover_menu.addAction("Choose cover image…").triggered.connect(
                 lambda: self._set_comic_cover_from_image(comic_id)
             )
             if comic and comic.cover_override:
-                menu.addAction("Reset cover to default").triggered.connect(
+                cover_menu.addAction("Reset cover to default").triggered.connect(
                     lambda: self._reset_comic_cover(comic_id)
                 )
             if comic and comic.cover_path:
-                menu.addAction("Set as folder cover").triggered.connect(
+                cover_menu.addSeparator()
+                cover_menu.addAction("Set as folder cover").triggered.connect(
                     lambda: self._use_comic_as_folder_cover(comic_id)
                 )
                 cover = comic.cover_path
-                menu.addAction(f"Set as {bg_noun} background").triggered.connect(
+                cover_menu.addAction(f"Set as {bg_noun} background").triggered.connect(
                     lambda checked=False, cid=comic_id, c=cover: self._set_background(
                         c, comic_id=cid
                     )
                 )
             if self._scope_has_own_background():
-                menu.addAction(f"Clear {bg_noun} background").triggered.connect(
+                cover_menu.addAction(f"Clear {bg_noun} background").triggered.connect(
                     lambda: self._clear_background()
                 )
 
@@ -1841,14 +1842,6 @@ class BookshelfView(QWidget):
                         lambda checked, cid=comic_id, s=sid: self._toggle_comic_in_shelf(cid, s, checked)
                     )
                     add_menu.addAction(action)
-
-        if self._current_shelf_id is not None:
-            shelf_obj = next((s for s in shelves if s.id == self._current_shelf_id), None)
-            if shelf_obj and shelf_obj.kind == "manual":
-                menu.addSeparator()
-                menu.addAction("Remove from this shelf").triggered.connect(
-                    lambda: self._remove_comics_from_current_shelf(target_ids)
-                )
 
         # Reading queue
         menu.addSeparator()
