@@ -1818,31 +1818,6 @@ class BookshelfView(QWidget):
                     lambda: self._clear_background()
                 )
 
-        # Shelf actions
-        shelves = self._library.get_shelves()
-        manual_shelves = [s for s in shelves if s.kind == "manual"]
-        if manual_shelves:
-            menu.addSeparator()
-            if is_multi:
-                add_menu = menu.addMenu(f"Add {n} comics to shelf")
-                for shelf in manual_shelves:
-                    sid = shelf.id
-                    add_menu.addAction(shelf.name).triggered.connect(
-                        lambda checked=False, s=sid, ids=target_ids: self._add_comics_to_shelf(ids, s)
-                    )
-            else:
-                comic_shelf_ids = {s.id for s in self._library.get_shelves_for_comic(comic_id)}
-                add_menu = menu.addMenu("Add to shelf")
-                for shelf in manual_shelves:
-                    action = QAction(shelf.name, add_menu)
-                    action.setCheckable(True)
-                    action.setChecked(shelf.id in comic_shelf_ids)
-                    sid = shelf.id
-                    action.triggered.connect(
-                        lambda checked, cid=comic_id, s=sid: self._toggle_comic_in_shelf(cid, s, checked)
-                    )
-                    add_menu.addAction(action)
-
         # Reading queue
         menu.addSeparator()
         if is_multi:
