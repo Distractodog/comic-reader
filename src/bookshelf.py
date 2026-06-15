@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PyQt6.QtCore import (
@@ -32,7 +33,6 @@ from PyQt6.QtGui import (
     QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QComboBox,
     QFileDialog,
     QGraphicsOpacityEffect,
     QHBoxLayout,
@@ -720,14 +720,15 @@ class _HeaderBar(QWidget):
     _SORT_OPTIONS = [
         ("Title A–Z",      "title",      "asc"),
         ("Title Z–A",      "title",      "desc"),
-        ("Chapter order",  "chapter",    "asc"),
         ("Recently Added", "date_added", "desc"),
         ("Last Read",      "last_read",  "desc"),
     ]
 
     _FILTER_OPTIONS = [
-        ("All Comics",   ""),
+        ("Everything",    ""),
+        ("Favorites",     "favorite"),
         ("Recently Read", "recently_read"),
+        ("Recently Added","recently_added"),
         ("Unread",        "unread"),
         ("Finished",      "finished"),
     ]
@@ -764,21 +765,17 @@ class _HeaderBar(QWidget):
         layout.addWidget(self._title)
         layout.addStretch()
 
-        self._sort_combo = QComboBox()
-        for label, _, _ in self._SORT_OPTIONS:
-            self._sort_combo.addItem(label)
-        self._sort_combo.setFixedWidth(150)
-        self._sort_combo.setToolTip("Sort")
-        self._sort_combo.currentIndexChanged.connect(self._emit_sort)
-        layout.addWidget(self._sort_combo)
+        self._sort_idx = 0
+        self._sort_btn = QPushButton(self._SORT_OPTIONS[0][0] + "  ▾")
+        self._sort_btn.setFlat(True)
+        self._sort_btn.clicked.connect(self._show_sort_menu)
+        layout.addWidget(self._sort_btn)
 
-        self._filter_combo = QComboBox()
-        for label, _ in self._FILTER_OPTIONS:
-            self._filter_combo.addItem(label)
-        self._filter_combo.setFixedWidth(140)
-        self._filter_combo.setToolTip("Filter by read status")
-        self._filter_combo.currentIndexChanged.connect(self._emit_filter)
-        layout.addWidget(self._filter_combo)
+        self._filter_idx = 0
+        self._filter_btn = QPushButton(self._FILTER_OPTIONS[0][0] + "  ▾")
+        self._filter_btn.setFlat(True)
+        self._filter_btn.clicked.connect(self._show_filter_menu)
+        layout.addWidget(self._filter_btn)
 
         self._options_btn = QPushButton("⋮")
         self._options_btn.setFlat(True)
@@ -789,12 +786,42 @@ class _HeaderBar(QWidget):
 
         self._apply_btn_styles({})
 
-    def _emit_sort(self, idx: int):
-        _, sort_by, order = self._SORT_OPTIONS[idx]
+    def _show_sort_menu(self):
+        menu = themes.make_menu(self)
+        for idx, (label, _, _) in enumerate(self._SORT_OPTIONS):
+            action = QAction(label, menu)
+            action.setCheckable(True)
+            action.setChecked(idx == self._sort_idx)
+            action.triggered.connect(lambda checked, i=idx: self._select_sort(i))
+            menu.addAction(action)
+        pos = self._sort_btn.mapToGlobal(QPoint(0, self._sort_btn.height()))
+        menu.exec(pos)
+
+    def _select_sort(self, idx: int):
+        self._sort_idx = idx
+        label, sort_by, order = self._SORT_OPTIONS[idx]
+        self._sort_btn.setText(label + "  ▾")
         self.sort_changed.emit(sort_by, order)
 
-    def _emit_filter(self, idx: int):
-        _, key = self._FILTER_OPTIONS[idx]
+    def set_sort_index(self, idx: int):
+        self._sort_idx = idx
+        self._sort_btn.setText(self._SORT_OPTIONS[idx][0] + "  ▾")
+
+    def _show_filter_menu(self):
+        menu = themes.make_menu(self)
+        for idx, (label, _) in enumerate(self._FILTER_OPTIONS):
+            action = QAction(label, menu)
+            action.setCheckable(True)
+            action.setChecked(idx == self._filter_idx)
+            action.triggered.connect(lambda checked, i=idx: self._select_filter(i))
+            menu.addAction(action)
+        pos = self._filter_btn.mapToGlobal(QPoint(0, self._filter_btn.height()))
+        menu.exec(pos)
+
+    def _select_filter(self, idx: int):
+        self._filter_idx = idx
+        label, key = self._FILTER_OPTIONS[idx]
+        self._filter_btn.setText(label + "  ▾")
         self.filter_changed.emit(key)
 
     def _emit_options(self):
@@ -802,14 +829,13 @@ class _HeaderBar(QWidget):
         self.options_menu_requested.emit(pos.x(), pos.y())
 
     def current_filter_key(self) -> str:
-        return self._FILTER_OPTIONS[self._filter_combo.currentIndex()][1]
+        return self._FILTER_OPTIONS[self._filter_idx][1]
 
     def set_filter_key(self, key: str) -> None:
-        for idx, (_, k) in enumerate(self._FILTER_OPTIONS):
+        for idx, (label, k) in enumerate(self._FILTER_OPTIONS):
             if k == key:
-                self._filter_combo.blockSignals(True)
-                self._filter_combo.setCurrentIndex(idx)
-                self._filter_combo.blockSignals(False)
+                self._filter_idx = idx
+                self._filter_btn.setText(label + "  ▾")
                 break
 
     # The title just reflects the current view; sort + filter are always available.
@@ -830,19 +856,22 @@ class _HeaderBar(QWidget):
         self._back_btn.show()
 
     def _apply_btn_styles(self, c: dict) -> None:
-        accent = c.get("accent", "#8b2a2a")
         text = c.get("text", "#2a1818")
         text_sec = c.get("text_secondary", "#7a5858")
-        btn_css = (
+        flat_css = (
+            "QPushButton { color: rgba(255,255,255,180); border: none; font-size: 18px;"
+            " font-family: 'Libre Baskerville'; font-weight: 600; background: transparent;"
+            " padding: 4px 10px; }"
+            "QPushButton:hover { color: #ffffff; }"
+        )
+        self._sort_btn.setStyleSheet(flat_css)
+        self._filter_btn.setStyleSheet(flat_css)
+        self._options_btn.setStyleSheet(
             f"QPushButton {{ color: {text_sec}; border: none; font-size: 20px;"
             f" font-family: 'Libre Baskerville'; background: transparent; }}"
             f"QPushButton:hover {{ color: {text}; }}"
         )
-        self._options_btn.setStyleSheet(btn_css)
         self._back_btn.set_colors("#ffffff", "#ffffff")
-        combo_css = "QComboBox::drop-down { border: none; width: 20px; }"
-        self._sort_combo.setStyleSheet(combo_css)
-        self._filter_combo.setStyleSheet(combo_css)
 
     def apply_theme(self, c: dict):
         bg = _hex_to_rgba(c["header_bg"], 218)
@@ -873,7 +902,7 @@ class BookshelfView(QWidget):
         self._show_hidden_mode: bool = False
         self._queue_mode: bool = False
         self._currently_reading_mode: bool = False
-        self._status_filter: str = ""   # '' | recently_read | unread | finished
+        self._status_filter: str = ""   # '' | favorite | recently_read | recently_added | unread | finished
         self._last_n_cols = 0
         self._top_row_color = QColor("#171212")
 
@@ -1183,6 +1212,14 @@ class BookshelfView(QWidget):
 
     # ----- Read-status filter (applies on the home grid and inside shelves) -----
 
+    def _sort_tile_items(self, items: list) -> list:
+        """Sort shelf or folder tiles by the current sort setting.
+
+        Tile items only have a name, so date-based sorts fall back to A–Z.
+        """
+        reverse = self._sort_order == "desc"
+        return sorted(items, key=lambda x: (x.name or "").lower(), reverse=reverse)
+
     def _passes_filter(self, comic: Comic) -> bool:
         f = self._status_filter
         if not f:
@@ -1193,6 +1230,17 @@ class BookshelfView(QWidget):
             return comic.read_status == "read"
         if f == "recently_read":
             return comic.read_status in ("in_progress", "read") and bool(comic.last_read)
+        if f == "recently_added":
+            if not comic.date_added:
+                return False
+            try:
+                added = datetime.fromisoformat(comic.date_added.replace("Z", "+00:00"))
+                cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+                return added >= cutoff
+            except Exception:
+                return False
+        if f == "favorite":
+            return comic.favorite
         return True
 
     def _filter_comics(self, comics: list[Comic]) -> list[Comic]:
@@ -1545,7 +1593,16 @@ class BookshelfView(QWidget):
             empty_msg = f'No results for "{self._search_query}"'
         elif self._current_shelf_id is not None and self._current_folder is None:
             # Shelf top level — show folder tiles for folders with comics on this shelf.
-            items = self._library.get_shelf_folders(self._current_shelf_id)
+            shelf_folders = self._library.get_shelf_folders(self._current_shelf_id)
+            if self._status_filter:
+                passing = {
+                    str(Path(c.file_path).parent)
+                    for c in self._filter_comics(
+                        self._library.get_comics_in_shelf(self._current_shelf_id)
+                    )
+                }
+                shelf_folders = [f for f in shelf_folders if f.path in passing]
+            items = self._sort_tile_items(shelf_folders)
             empty_msg = "This shelf is empty."
         elif self._current_folder is not None:
             items, empty_msg = self._folder_grid_items()
@@ -1556,7 +1613,7 @@ class BookshelfView(QWidget):
             if self._status_filter:
                 shelves = [s for s in shelves if self._shelf_matches_filter(s.id)]
             folders = self._home_folder_items()
-            items = list(shelves) + list(folders)
+            items = self._sort_tile_items(shelves) + self._sort_tile_items(folders)
             empty_msg = (
                 "No bookshelves or comics yet.\n"
                 "Use the ⋮ menu → New bookshelf, or Refresh library to add comics."
@@ -1706,6 +1763,23 @@ class BookshelfView(QWidget):
                     lambda: self._remove_comics_from_series(target_ids)
                 )
 
+        # Favorite toggle
+        menu.addSeparator()
+        if is_multi:
+            menu.addAction("★  Mark all as favorite").triggered.connect(
+                lambda: [self._set_favorite(cid, True) for cid in target_ids]
+            )
+            menu.addAction("☆  Remove from favorites").triggered.connect(
+                lambda: [self._set_favorite(cid, False) for cid in target_ids]
+            )
+        else:
+            is_fav = self._library.get_comic_by_id(comic_id)
+            is_fav = is_fav.favorite if is_fav else False
+            fav_label = "☆  Remove from favorites" if is_fav else "★  Add to favorites"
+            menu.addAction(fav_label).triggered.connect(
+                lambda: self._toggle_favorite(comic_id)
+            )
+
         menu.addSeparator()
         batch_menu = menu.addMenu("Batch")
         batch_menu.addAction("Convert to CBZ…").triggered.connect(
@@ -1811,6 +1885,16 @@ class BookshelfView(QWidget):
         )
 
         menu.exec(QPoint(gx, gy))
+
+    def _toggle_favorite(self, comic_id: int):
+        self._library.toggle_favorite(comic_id)
+        self._repopulate()
+
+    def _set_favorite(self, comic_id: int, state: bool):
+        comic = self._library.get_comic_by_id(comic_id)
+        if comic and comic.favorite != state:
+            self._library.toggle_favorite(comic_id)
+        self._repopulate()
 
     def _toggle_selection(self, comic_id: int):
         if comic_id in self._selected_ids:
@@ -2503,9 +2587,7 @@ class BookshelfView(QWidget):
         self._sort_order = order
         for idx, (_, key, ord_) in enumerate(self._header._SORT_OPTIONS):
             if key == sort_by and ord_ == order:
-                self._header._sort_combo.blockSignals(True)
-                self._header._sort_combo.setCurrentIndex(idx)
-                self._header._sort_combo.blockSignals(False)
+                self._header.set_sort_index(idx)
                 break
 
     def _scan_series_in_folder(self, folder_path: str) -> None:

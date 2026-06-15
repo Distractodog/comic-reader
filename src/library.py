@@ -87,6 +87,7 @@ class Comic:
     fit_mode: str = "page"        # 'actual' | 'width' | 'page'
     zoom: float = 1.0
     cover_override: bool = False  # cover set manually; skip auto-regeneration
+    favorite: bool = False
 
 
 def _default_db_path() -> Path:
@@ -130,6 +131,7 @@ def _row_to_comic(row: sqlite3.Row) -> Comic:
         fit_mode=row["fit_mode"],
         zoom=float(row["zoom"]),
         cover_override=bool(row["cover_override"]),
+        favorite=bool(row["favorite"]),
     )
 
 
@@ -396,7 +398,11 @@ CREATE TABLE IF NOT EXISTS series_reading_settings (
 );
 """
 
-_CURRENT_VERSION = 14
+_SCHEMA_V15_FAVORITES = """
+ALTER TABLE comics ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
+"""
+
+_CURRENT_VERSION = 15
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 _CLIENT_SORT_MODES = _VALID_SORT_COLUMNS | {"chapter"}
@@ -552,6 +558,12 @@ class Library:
             self._conn.execute("PRAGMA user_version = 14")
             self._conn.commit()
             version = 14
+        if version < 15:
+            # Favorites flag on comics.
+            self._conn.execute(_SCHEMA_V15_FAVORITES.strip())
+            self._conn.execute("PRAGMA user_version = 15")
+            self._conn.commit()
+            version = 15
 
     def _seed_smart_shelves(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -762,6 +774,17 @@ class Library:
                 "UPDATE comics SET hidden = ? WHERE id = ?",
                 (1 if hidden else 0, comic_id),
             )
+
+    def toggle_favorite(self, comic_id: int) -> bool:
+        """Flip the favorite flag and return the new state."""
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE comics SET favorite = 1 - favorite WHERE id = ?", (comic_id,)
+            )
+            row = cur.execute(
+                "SELECT favorite FROM comics WHERE id = ?", (comic_id,)
+            ).fetchone()
+            return bool(row["favorite"]) if row else False
 
     def hide_folder(self, folder_path: str) -> None:
         """Hide every comic currently in a folder. Files are left on disk."""
