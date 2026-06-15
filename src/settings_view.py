@@ -8,7 +8,7 @@ win over these. The view emits signals so the main window can apply changes live
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -17,9 +17,8 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QVBoxLayout,
@@ -60,7 +59,7 @@ class _SettingsPanel(QWidget):
 
         self._heading = QLabel(title)
         head_font = QFont("Libre Baskerville")
-        head_font.setPixelSize(26)
+        head_font.setPixelSize(20)
         self._heading.setFont(head_font)
 
         self._blurb = QLabel(blurb)
@@ -457,7 +456,7 @@ class AboutPanel(_SettingsPanel):
 
 
 class SettingsView(QWidget):
-    """Settings page: category list on the left, panel stack on the right."""
+    """Settings page: horizontal tab bar at the top, swipeable panel below."""
 
     back_requested = pyqtSignal()
     theme_changed = pyqtSignal(str)
@@ -485,49 +484,47 @@ class SettingsView(QWidget):
         self._bg_label.setScaledContents(False)
         self._bg_label.hide()
 
-        root = QHBoxLayout(self)
+        root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ----- left category nav -----
-        self._nav = QListWidget()
-        self._nav.setFixedWidth(220)
-        self._nav.setFrameShape(QListWidget.Shape.NoFrame)
-        for title, _ in SECTIONS:
-            self._nav.addItem(QListWidgetItem(title))
-        self._nav.currentRowChanged.connect(self._on_row_changed)
-
-        # ----- right side: header + panel stack -----
-        right = QWidget()
-        right.setObjectName("SettingsRight")
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(0)
-
+        # ----- header -----
         header = QWidget()
         header.setObjectName("SettingsHeader")
-        header.setFixedHeight(52)
+        header.setFixedHeight(60)
+        header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(16, 0, 16, 0)
+        header_layout.setContentsMargins(30, 0, 16, 0)
         header_layout.setSpacing(10)
-
-        self._back_btn = QPushButton("‹ Library")
-        self._back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._back_btn.clicked.connect(self.back_requested.emit)
 
         self._title = QLabel("Settings")
         title_font = QFont("Libre Baskerville")
         title_font.setPixelSize(20)
         self._title.setFont(title_font)
 
-        header_layout.addWidget(self._back_btn)
-        header_layout.addSpacing(6)
         header_layout.addWidget(self._title)
         header_layout.addStretch(1)
         self._header = header
 
-        from PyQt6.QtWidgets import QScrollArea
+        # ----- horizontal tab bar -----
+        self._tab_bar = QWidget()
+        self._tab_bar.setObjectName("SettingsTabBar")
+        self._tab_bar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._tab_bar.setFixedHeight(60)
+        tab_layout = QHBoxLayout(self._tab_bar)
+        tab_layout.setContentsMargins(16, 0, 16, 0)
+        tab_layout.setSpacing(2)
+        self._tab_btns: list[QPushButton] = []
+        for i, (title, _) in enumerate(SECTIONS):
+            btn = QPushButton(title)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _, idx=i: self._go_to_section(idx))
+            tab_layout.addWidget(btn)
+            self._tab_btns.append(btn)
+        tab_layout.addStretch(1)
 
+        # ----- panel stack -----
         self._panels = QStackedWidget()
         self._panels.setObjectName("SettingsStack")
         self._panel_widgets = [
@@ -539,45 +536,74 @@ class SettingsView(QWidget):
             SidebarPanel(self),
             AboutPanel(self),
         ]
+        self._scroll_viewports: set = set()
         for panel in self._panel_widgets:
             panel.setObjectName("SettingsPanel")
+            panel.setMaximumWidth(720)
+
+            # Center the fixed-width panel inside the full-width scroll area.
+            wrapper = QWidget()
+            wrapper.setObjectName("SettingsPanelWrapper")
+            wl = QHBoxLayout(wrapper)
+            wl.setContentsMargins(0, 0, 0, 0)
+            wl.setSpacing(0)
+            wl.addWidget(panel, 0, Qt.AlignmentFlag.AlignTop)
+            wl.addStretch(1)
+
             scroll = QScrollArea()
             scroll.setObjectName("SettingsScroll")
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.setWidget(panel)
+            scroll.setWidget(wrapper)
             scroll.viewport().setAutoFillBackground(False)
             self._panels.addWidget(scroll)
+            # Install on both scroll area and viewport to catch wheel events
+            scroll.installEventFilter(self)
+            scroll.viewport().installEventFilter(self)
+            self._scroll_viewports.add(scroll.viewport())
+            self._scroll_viewports.add(scroll)
 
-        right_layout.addWidget(header)
-        right_layout.addWidget(self._panels, 1)
+        root.addWidget(header)
+        root.addWidget(self._tab_bar)
+        root.addWidget(self._panels, 1)
 
-        root.addWidget(self._nav)
-        root.addWidget(right, 1)
-
-        self._nav.setCurrentRow(0)
+        self._current_section = 0
+        self._swipe_start: QPoint | None = None
+        self._swiping = False
+        # Accumulate horizontal trackpad delta for swipe-between-sections
+        self._swipe_dx: float = 0.0
+        self._swipe_reset = QTimer(self)
+        self._swipe_reset.setSingleShot(True)
+        self._swipe_reset.setInterval(180)
+        self._swipe_reset.timeout.connect(lambda: setattr(self, "_swipe_dx", 0.0))
+        self._go_to_section(0)
 
     # ----- navigation -----
 
-    def _on_row_changed(self, row: int) -> None:
-        if 0 <= row < self._panels.count():
-            self._panels.setCurrentIndex(row)
+    def _go_to_section(self, idx: int) -> None:
+        idx = max(0, min(idx, len(self._panel_widgets) - 1))
+        self._current_section = idx
+        self._panels.setCurrentIndex(idx)
+        for i, btn in enumerate(self._tab_btns):
+            btn.setChecked(i == idx)
+
+    def _go_next(self) -> None:
+        self._go_to_section(self._current_section + 1)
+
+    def _go_prev(self) -> None:
+        self._go_to_section(self._current_section - 1)
 
     def reset(self) -> None:
         """Return to the first section — called each time the page is opened."""
-        self._nav.setCurrentRow(0)
+        self._go_to_section(0)
 
     # ----- theming -----
 
     def apply_theme(self, c: dict) -> None:
         self._theme = c
-        # Root paints the solid fallback (shown when no background image is set).
-        # The content containers on the right are transparent so the dimmed
-        # backdrop shows through; the nav and header stay solid. Controls keep an
-        # explicit solid fill so they read clearly over the image.
         self.setStyleSheet(
             f"#SettingsRoot {{ background: {c['app_bg']}; }}"
-            f"#SettingsRight, #SettingsStack, #SettingsScroll, #SettingsPanel"
+            f"#SettingsStack, #SettingsScroll, #SettingsPanelWrapper, #SettingsPanel"
             f" {{ background: transparent; }}"
             f"#SettingsScroll > QWidget {{ background: transparent; }}"
             f"#SettingsPanel .QWidget {{ background: transparent; }}"
@@ -587,24 +613,22 @@ class SettingsView(QWidget):
             f" border-radius: 4px; padding: 4px 8px; }}"
         )
         self._render_background()
-        self._nav.setStyleSheet(
-            f"QListWidget {{ background: {c['sidebar_bg']}; border: none;"
-            f" outline: none; padding: 8px 0; }}"
-            f"QListWidget::item {{ color: {c['text']}; padding: 11px 18px;"
-            f" border: none; }}"
-            f"QListWidget::item:hover {{ background: rgba(255,255,255,0.06); }}"
-            f"QListWidget::item:selected {{ background: rgba(255,255,255,0.13);"
-            f" color: {c['text']}; }}"
-        )
+        hbg = QColor(c["header_bg"])
+        header_semi = f"rgba({hbg.red()},{hbg.green()},{hbg.blue()},180)"
         self._header.setStyleSheet(
-            f"background: {c['header_bg']}; border-bottom: 1px solid {c['border']};"
+            f"#SettingsHeader {{ background: {header_semi};"
+            f" border-bottom: 1px solid {c['border']}; }}"
         )
         self._title.setStyleSheet(f"color: {c['text']}; background: transparent;")
-        self._back_btn.setStyleSheet(
-            f"QPushButton {{ color: {c['text']}; background: transparent;"
-            f" border: 1px solid {c['border']}; border-radius: 6px;"
-            f" padding: 5px 12px; font-size: 14px; }}"
-            f"QPushButton:hover {{ background: rgba(255,255,255,0.08); }}"
+        self._tab_bar.setStyleSheet(
+            f"#SettingsTabBar {{ background: {header_semi}; }}"
+            f"QPushButton {{ color: {c['text_secondary']}; background: transparent;"
+            f" border: none; border-bottom: 2px solid transparent;"
+            f" border-radius: 0; padding: 10px 14px; font-size: 13px; }}"
+            f"QPushButton:checked {{ color: {c['text']};"
+            f" border-bottom: 2px solid {c['accent']}; }}"
+            f"QPushButton:hover:!checked {{ color: {c['text']};"
+            f" background: rgba(255,255,255,0.06); }}"
         )
         for panel in self._panel_widgets:
             panel.apply_theme(c)
@@ -661,3 +685,50 @@ class SettingsView(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         self._render_background()
+
+    # ----- swipe to navigate -----
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj not in self._scroll_viewports:
+            return super().eventFilter(obj, event)
+        t = event.type()
+
+        # Trackpad two-finger horizontal swipe → navigate sections.
+        # Accumulate pixel delta; once it crosses the threshold, switch once and reset.
+        if t == QEvent.Type.Wheel:
+            dx = event.pixelDelta().x()
+            dy = event.pixelDelta().y()
+            if abs(dx) > abs(dy):
+                self._swipe_reset.start()
+                self._swipe_dx += dx
+                if self._swipe_dx < -80:
+                    self._swipe_dx = 0.0
+                    self._go_next()
+                elif self._swipe_dx > 80:
+                    self._swipe_dx = 0.0
+                    self._go_prev()
+                return True  # consume so the scroll area doesn't scroll horizontally
+
+        # Mouse-drag swipe (click-and-drag left/right on the panel).
+        if t == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            self._swipe_start = QPoint(int(event.position().x()), int(event.position().y()))
+            self._swiping = False
+            return False
+        if t == QEvent.Type.MouseMove and self._swipe_start is not None:
+            dx = abs(int(event.position().x()) - self._swipe_start.x())
+            dy = abs(int(event.position().y()) - self._swipe_start.y())
+            if not self._swiping and dx > dy and dx > 20:
+                self._swiping = True
+            return self._swiping
+        if t == QEvent.Type.MouseButtonRelease and self._swipe_start is not None:
+            was_swiping = self._swiping
+            dx = int(event.position().x()) - self._swipe_start.x()
+            self._swipe_start = None
+            self._swiping = False
+            if was_swiping:
+                if dx < -60:
+                    self._go_next()
+                elif dx > 60:
+                    self._go_prev()
+                return True
+        return False

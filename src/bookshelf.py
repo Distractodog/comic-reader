@@ -51,6 +51,7 @@ from PyQt6.QtWidgets import (
 from batch_tools import BatchPlan, BatchWorker, plan_convert_to_cbz, plan_rename_from_metadata
 from app_info import app_settings
 from library import Comic, Folder, Library, Shelf
+import themes
 
 
 def _hex_to_rgba(hex_color: str, alpha: int) -> str:
@@ -144,6 +145,15 @@ def _fit_two_lines(text: str) -> str:
     return best
 
 
+def _title_block(text: str) -> tuple[str, int]:
+    """Return the displayed title and its rendered pixel height (1 or 2 lines)."""
+    fm = QFontMetrics(_title_font())
+    width = TILE_W - 8
+    display = _fit_two_lines(text)
+    flags = int(Qt.AlignmentFlag.AlignLeft | Qt.TextFlag.TextWordWrap)
+    return display, fm.boundingRect(0, 0, width, 10000, flags, display).height()
+
+
 class _CoverLoader(QThread):
     """Decodes and scales cover images off the UI thread, emitting each as it's ready.
 
@@ -226,24 +236,28 @@ class _Tile(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRoundedRect(1, 1, TILE_W - 2, self._tile_h - 2, 8, 8)
 
-    def _draw_title(self, painter: QPainter, text: str) -> None:
+    def _draw_title(self, painter: QPainter, text: str) -> int:
+        """Draw the title; return the Y coordinate for the status line below it."""
         painter.setPen(_TITLE_FG)
         painter.setFont(_title_font())
+        display, text_h = _title_block(text)
+        title_y = COVER_H + 2
         painter.drawText(
-            QRect(4, COVER_H + 2, TILE_W - 8, self._title_h - 4),
+            QRect(4, title_y, TILE_W - 8, text_h),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap),
-            _fit_two_lines(text),
+            display,
         )
+        return title_y + text_h + 2
 
-    def _draw_status(self, painter: QPainter, text: str) -> None:
+    def _draw_status(self, painter: QPainter, text: str, y: int) -> None:
         painter.setPen(_STATUS_FG)
         font = painter.font()
         font.setPixelSize(12)
         font.setWeight(QFont.Weight.Normal)
         painter.setFont(font)
         painter.drawText(
-            QRect(4, COVER_H + self._title_h + 2, TILE_W - 8, STATUS_H - 4),
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            QRect(4, y, TILE_W - 8, STATUS_H - 4),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
             text,
         )
 
@@ -275,9 +289,9 @@ class FolderTile(_Tile):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self._draw_cover(painter)
-        self._draw_title(painter, self._folder.name)
+        status_y = self._draw_title(painter, self._folder.name)
         n = self._folder.comic_count
-        self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}")
+        self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}", status_y)
         self._draw_hover_outline(painter)
 
     def contextMenuEvent(self, event):
@@ -469,8 +483,8 @@ class ComicTile(_Tile):
         if self._selected:
             self._draw_selection(painter)
         title = self._comic.title or Path(self._comic.file_path).stem
-        self._draw_title(painter, title)
-        self._draw_status(painter, self._status_text())
+        status_y = self._draw_title(painter, title)
+        self._draw_status(painter, self._status_text(), status_y)
         self._draw_hover_outline(painter)
 
     def _status_text(self) -> str:
@@ -527,9 +541,9 @@ class ShelfTile(_Tile):
             painter.setPen(pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(1, 1, TILE_W - 2, self._tile_h - 2, 8, 8)
-        self._draw_title(painter, self._shelf.name)
+        status_y = self._draw_title(painter, self._shelf.name)
         n = self._comic_count
-        self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}")
+        self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}", status_y)
         self._draw_hover_outline(painter)
 
     def contextMenuEvent(self, event):
@@ -1038,7 +1052,7 @@ class BookshelfView(QWidget):
 
     def _on_options_menu(self, gx: int, gy: int):
         """The top-bar ⋮ menu: refresh actions + bookshelf management for the view."""
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
         is_home = (
             not self._queue_mode and not self._show_hidden_mode
             and not self._currently_reading_mode and not self._search_query
@@ -1103,7 +1117,7 @@ class BookshelfView(QWidget):
         shelf = next((s for s in self._library.get_shelves() if s.id == shelf_id), None)
         if shelf is None:
             return
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
         menu.addAction("Open").triggered.connect(
             lambda: self.show_shelf(shelf_id, shelf.name)
         )
@@ -1646,7 +1660,7 @@ class BookshelfView(QWidget):
         target_ids = list(self._selected_ids) if is_multi else [comic_id]
         n = len(target_ids)
 
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
 
         # Hidden view — restore or permanently delete
         if self._show_hidden_mode:
@@ -2129,7 +2143,7 @@ class BookshelfView(QWidget):
         return self._library.get_comics_in_folder(folder_path)
 
     def _show_folder_menu(self, folder_path: str, gx: int, gy: int) -> None:
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
         menu.addAction("Rescan folder").triggered.connect(
             lambda: self.folder_rescan_requested.emit(folder_path)
         )

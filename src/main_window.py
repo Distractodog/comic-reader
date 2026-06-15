@@ -262,7 +262,7 @@ class _ReaderBar(QWidget):
             btn = QPushButton(glyph)
             btn.setFlat(True)
             btn.setFixedSize(47, 47)
-            btn.setToolTip(tooltip)
+            btn.setToolTip("")
             btn.setStyleSheet(
                 "color: #8b2a2a; border: none; font-size: 26px; padding: 0;"
             )
@@ -757,7 +757,7 @@ class _Sidebar(QWidget):
         top_layout.setSpacing(0)
 
         self._btn_hamburger = self._make_item("", "", kind="hamburger")
-        self._btn_hamburger.setToolTip("Show/hide labels")
+        self._btn_hamburger.setToolTip("")
         self._btn_hamburger.clicked.connect(self.toggle_expanded)
         top_layout.addWidget(self._btn_hamburger)
 
@@ -819,8 +819,7 @@ class _Sidebar(QWidget):
 
     def _make_item(self, icon: str, label: str, kind: str = "glyph") -> _RailButton:
         btn = _RailButton(icon, label, kind=kind)
-        if label:
-            btn.setToolTip(label)
+        btn.setToolTip("")
         btn.setFixedHeight(self.CELL)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         return btn
@@ -1064,7 +1063,7 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self.viewer)           # index 1
         self._stack.addWidget(self._webtoon_viewer)  # index 2
         self._stack.addWidget(self._ebook_viewer)    # index 3 — text ebooks
-        self._stack.addWidget(self._settings_view)   # index 4 — settings page
+        # _settings_view is a floating overlay on _content, not a stack page.
 
         # Instant loading screen + background archive opening.
         self._loading_overlay = _LoadingOverlay(self._stack)
@@ -1142,6 +1141,8 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(0)
         self._stack.setStyleSheet("background: transparent;")
         content_layout.addWidget(self._stack)
+        self._settings_view.setParent(content)
+        self._settings_view.hide()
         self._reader_bar.setParent(content)
         self._thumb_strip.setParent(content)
         self._reader_footer.setParent(content)
@@ -1267,6 +1268,14 @@ class MainWindow(QMainWindow):
         self._sidebar.setGeometry(0, 0, self._sidebar.width(), host.height())
         self._sidebar.raise_()
 
+    def _position_settings_overlay(self) -> None:
+        """Size the floating settings panel to fill the content area."""
+        content = getattr(self, "_content", None)
+        if content is None:
+            return
+        self._settings_view.setGeometry(0, 0, content.width(), content.height())
+        self._settings_view.raise_()
+
     def _position_reader_overlays(self) -> None:
         """Pin reader chrome over the page without reserving layout space."""
         content = getattr(self, "_content", None)
@@ -1351,6 +1360,9 @@ class MainWindow(QMainWindow):
             return False
         if obj is getattr(self, "_content", None) and event.type() == QEvent.Type.Resize:
             self._position_reader_overlays()
+            sv = getattr(self, "_settings_view", None)
+            if sv is not None and sv.isVisible():
+                self._position_settings_overlay()
             return False
         if obj is getattr(self, "_reader_footer", None) and event.type() in (
             QEvent.Type.Show, QEvent.Type.Hide,
@@ -1642,7 +1654,7 @@ class MainWindow(QMainWindow):
             self._show_ebook_menu()
             return
 
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
 
         apply_folder_act = menu.addAction("Apply settings to folder")
         apply_folder_act.triggered.connect(self._apply_reading_settings_to_folder)
@@ -1677,7 +1689,7 @@ class MainWindow(QMainWindow):
         menu.exec(self._reader_bar.menu_btn_global_pos())
 
     def _show_ebook_menu(self) -> None:
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
 
         spread_act = menu.addAction("Spread mode (two pages)")
         spread_act.setCheckable(True)
@@ -1708,7 +1720,7 @@ class MainWindow(QMainWindow):
     def _show_bookmark_menu(self) -> None:
         if self._current_comic_id is None or not self._reader:
             return
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
 
         is_bm = self._current_page_is_bookmarked()
         toggle = menu.addAction(
@@ -1733,7 +1745,7 @@ class MainWindow(QMainWindow):
     def _show_fit_menu(self) -> None:
         if not self._reader:
             return
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
         current = self.viewer.fit_mode
         options = [
             ("Fit width", FitMode.FIT_WIDTH),
@@ -1750,7 +1762,7 @@ class MainWindow(QMainWindow):
     def _show_page_mode_menu(self) -> None:
         if not self._reader:
             return
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
         if self._webtoon_mode:
             current = "webtoon"
         elif self._spread_mode:
@@ -1772,7 +1784,7 @@ class MainWindow(QMainWindow):
     def _show_manga_menu(self) -> None:
         if not self._reader:
             return
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
 
         rtl_act = menu.addAction("Right-to-left (manga)")
         rtl_act.setCheckable(True)
@@ -1987,7 +1999,7 @@ class MainWindow(QMainWindow):
             self._build_menus()
 
     def _on_escape(self):
-        if self._stack.currentIndex() == 4:
+        if self._settings_view.isVisible():
             self._close_settings()
             return
         if self.isFullScreen():
@@ -2016,6 +2028,7 @@ class MainWindow(QMainWindow):
     def apply_theme(self, c: dict):
         from PyQt6.QtWidgets import QApplication
         self._theme = c
+        themes.set_active(c)
         QApplication.instance().setStyleSheet(themes.app_stylesheet(c))
         chrome = getattr(self, "_top_chrome", None)
         if chrome is not None:
@@ -2755,7 +2768,7 @@ class MainWindow(QMainWindow):
 
     def _show_app_menu(self) -> None:
         """Popup File/View/Navigate/Library menus — used on Windows/Linux."""
-        menu = QMenu(self)
+        menu = themes.make_menu(self)
         menu.addMenu(self._file_menu)
         menu.addMenu(self._view_menu)
         menu.addMenu(self._nav_menu)
@@ -2763,30 +2776,27 @@ class MainWindow(QMainWindow):
         menu.exec(self._sidebar.mapToGlobal(QPoint(0, 56)))
 
     def _open_settings(self) -> None:
-        """Switch to the full-page settings view (stack index 4)."""
-        if self._stack.currentIndex() == 4:
+        """Float the settings overlay over the content area."""
+        if self._settings_view.isVisible():
             return
-        # Settings shares the bookshelf chrome rules: no reader/seek/thumb bars.
         self._chrome_hidden = False
         self._hide_reader_bar(animated=False)
         self._reader_footer.setVisible(False)
         self._thumb_strip.setVisible(False)
         self._settings_view.reset()
-        # Pick a fresh random bookshelf background each time settings is opened.
         self._settings_view.set_background_image(
             self._bookshelf.random_background_image()
         )
         self._sidebar.set_active("")
-        self._stack.setCurrentIndex(4)
-        self._show_sidebar()
+        self._position_settings_overlay()
+        self._settings_view.show()
 
     def _close_settings(self) -> None:
-        """Leave the settings page and return to the bookshelf."""
-        if self._stack.currentIndex() != 4:
+        """Hide the settings overlay and return to whatever is behind it."""
+        if not self._settings_view.isVisible():
             return
+        self._settings_view.hide()
         self._bookshelf.refresh()
-        self._stack.setCurrentIndex(0)
-        self._show_sidebar()
         self._on_folder_level_changed(self._bookshelf._current_folder is not None)
 
     # ----- settings handlers -----
@@ -2871,13 +2881,13 @@ class MainWindow(QMainWindow):
 
     def _go_home(self) -> None:
         """Sidebar Library button: leave settings if open, then go to root."""
-        if self._stack.currentIndex() == 4:
+        if self._settings_view.isVisible():
             self._close_settings()
         self._bookshelf.go_to_root()
 
     def _show_currently_reading(self) -> None:
         """Sidebar Currently Reading: leave settings if open first."""
-        if self._stack.currentIndex() == 4:
+        if self._settings_view.isVisible():
             self._close_settings()
         self._bookshelf.show_currently_reading()
 

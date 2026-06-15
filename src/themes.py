@@ -1,6 +1,10 @@
 """Light and dark palettes and the shared app-level stylesheet generator."""
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtWidgets import QMenu
+
 LIGHT: dict = {
     "app_bg":           "#faf4f4",  # content area — near white with warmth
     "sidebar_bg":       "#b89898",  # sidebar — distinctly darker rose-grey
@@ -61,6 +65,73 @@ DARK: dict = {
     "selection_bg":     "#c06060",
 }
 
+_active: dict = DARK
+
+
+def set_active(c: dict) -> None:
+    """Remember the palette used for per-widget styling (e.g. popup menus)."""
+    global _active
+    _active = c
+
+
+def _menu_stylesheet(c: dict) -> str:
+    return (
+        f"QMenu {{ background-color: {c['input_bg']}; color: {c['text']};"
+        f" border: 1px solid {c['border']}; padding: 6px 0; }}"
+        f"QMenu::item {{ padding: 7px 30px 7px 24px; border: none;"
+        f" background-color: transparent; }}"
+        f"QMenu::item:selected {{ background-color: {c['hover_bg']}; color: {c['text']}; }}"
+        f"QMenu::item:disabled {{ color: {c['text_secondary']}; }}"
+        f"QMenu::separator {{ height: 1px; background: {c['border']}; margin: 6px 12px; }}"
+        f"QMenu::indicator {{ width: 14px; height: 14px; left: 6px; }}"
+        f"QMenu::right-arrow {{ width: 8px; height: 8px; padding-right: 8px; }}"
+    )
+
+
+class OpaqueMenu(QMenu):
+    """QMenu that stays solid on macOS even over bookshelf background images."""
+
+    def __init__(self, title: str = "", parent=None):
+        super().__init__(title, parent)
+        self._apply_opaque()
+        self.aboutToShow.connect(self._ensure_popup_opaque)
+
+    def _apply_opaque(self) -> None:
+        c = _active
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        bg = QColor(c["input_bg"])
+        palette.setColor(QPalette.ColorRole.Window, bg)
+        palette.setColor(QPalette.ColorRole.Base, bg)
+        self.setPalette(palette)
+        self.setStyleSheet(_menu_stylesheet(c))
+
+    def _ensure_popup_opaque(self) -> None:
+        for widget in (self, self.window()):
+            if widget is None:
+                continue
+            widget.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+            widget.setAutoFillBackground(True)
+
+    def addMenu(self, menu):  # type: ignore[override]
+        if isinstance(menu, str):
+            submenu = OpaqueMenu(menu, self)
+            self.addAction(submenu.menuAction())
+            return submenu
+        if isinstance(menu, OpaqueMenu):
+            self.addAction(menu.menuAction())
+            return menu
+        self._apply_opaque_to(menu)
+        self.addAction(menu.menuAction())
+        return menu
+
+    @staticmethod
+    def _apply_opaque_to(menu: QMenu) -> None:
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        menu.setAutoFillBackground(True)
+        menu.setStyleSheet(_menu_stylesheet(_active))
+
 
 def app_stylesheet(c: dict) -> str:
     return (
@@ -104,3 +175,8 @@ def app_stylesheet(c: dict) -> str:
         f"QProgressDialog QLabel {{ color: {c['text']}; }}"
         f"QMessageBox QLabel {{ color: {c['text']}; }}"
     )
+
+
+def make_menu(parent=None) -> OpaqueMenu:
+    """Create a context/popup menu with a solid background."""
+    return OpaqueMenu(parent=parent)
