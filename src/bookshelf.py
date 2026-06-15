@@ -33,7 +33,11 @@ from PyQt6.QtGui import (
     QPixmap,
 )
 from PyQt6.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QInputDialog,
@@ -50,7 +54,7 @@ from PyQt6.QtWidgets import (
 
 from batch_tools import BatchPlan, BatchWorker, plan_convert_to_cbz, plan_rename_from_metadata
 from app_info import app_settings
-from library import Comic, Folder, Library, Shelf
+from library import Comic, Folder, Library, ReadingSettings, Shelf
 import themes
 
 
@@ -1090,13 +1094,14 @@ class BookshelfView(QWidget):
         if is_home:
             menu.addAction("New bookshelf…").triggered.connect(self._create_shelf)
             menu.addSeparator()
-        menu.addAction("Refresh library").triggered.connect(
-            self.rescan_all_requested.emit
-        )
         if self._current_folder is not None:
             folder = self._current_folder
-            menu.addAction("Refresh this folder").triggered.connect(
+            menu.addAction("Rescan this folder").triggered.connect(
                 lambda: self.folder_rescan_requested.emit(folder)
+            )
+        else:
+            menu.addAction("Rescan library").triggered.connect(
+                self.rescan_all_requested.emit
             )
         menu.addSeparator()
         menu.addAction("Reading Queue").triggered.connect(self.show_queue)
@@ -2221,57 +2226,46 @@ class BookshelfView(QWidget):
 
     def _show_folder_menu(self, folder_path: str, gx: int, gy: int) -> None:
         menu = themes.make_menu(self)
-        menu.addAction("Rescan folder").triggered.connect(
-            lambda: self.folder_rescan_requested.emit(folder_path)
+        folder_comics = (
+            [] if self._show_hidden_mode
+            else self._comics_for_folder_grouping(folder_path)
         )
-        menu.addAction("Scan for series").triggered.connect(
+
+        # Series submenu
+        series_menu = menu.addMenu("Series")
+        series_menu.addAction("Scan for series").triggered.connect(
             lambda: self._scan_series_in_folder(folder_path)
         )
-        if self._show_hidden_mode:
-            menu.exec(QPoint(gx, gy))
-            return
-
-        folder_comics = self._comics_for_folder_grouping(folder_path)
         if len(folder_comics) >= 2:
-            menu.addAction("Set chapter order").triggered.connect(
+            series_menu.addAction("Set chapter order").triggered.connect(
                 lambda: self._set_chapter_order([c.id for c in folder_comics])
             )
             series_names = {c.series for c in folder_comics if c.series}
             if len(series_names) == 1 and all(c.series for c in folder_comics):
                 series_name = next(iter(series_names))
-                menu.addAction("Remove series link").triggered.connect(
+                series_menu.addAction("Ungroup series").triggered.connect(
                     lambda: self._remove_series_link(folder_path, series_name)
                 )
             else:
-                menu.addAction("Link all comics as reading series…").triggered.connect(
+                series_menu.addAction("Link as reading series…").triggered.connect(
                     lambda: self._group_as_series([c.id for c in folder_comics])
                 )
-
-        menu.addAction("Rename folder…").triggered.connect(
-            lambda: self._rename_folder(folder_path)
+        series_menu.addSeparator()
+        series_menu.addAction("Series reading settings…").triggered.connect(
+            lambda: self._show_series_reading_settings(folder_path, folder_comics)
         )
 
-        manual_shelves = [
-            s for s in self._library.get_shelves() if s.kind == "manual"
-        ]
+        if self._show_hidden_mode:
+            menu.exec(QPoint(gx, gy))
+            return
+
+        manual_shelves = [s for s in self._library.get_shelves() if s.kind == "manual"]
         if manual_shelves:
-            menu.addSeparator()
-            add_menu = menu.addMenu("Add folder to shelf")
+            move_menu = menu.addMenu("Move folder to shelf")
             for shelf in manual_shelves:
                 sid = shelf.id
-                add_menu.addAction(shelf.name).triggered.connect(
+                move_menu.addAction(shelf.name).triggered.connect(
                     lambda checked=False, fp=folder_path, s=sid: self._add_folder_to_shelf(fp, s)
-                )
-
-        if self._current_shelf_id is not None:
-            shelf_obj = next(
-                (s for s in self._library.get_shelves() if s.id == self._current_shelf_id),
-                None,
-            )
-            if shelf_obj and shelf_obj.kind == "manual":
-                menu.addSeparator()
-                menu.addAction("Remove folder from this shelf").triggered.connect(
-                    lambda: self._remove_folder_from_shelf(folder_path)
                 )
 
         menu.addSeparator()
@@ -2301,19 +2295,73 @@ class BookshelfView(QWidget):
         )
         menu.exec(QPoint(gx, gy))
 
-    def _remove_folder_from_shelf(self, folder_path: str) -> None:
-        if self._current_shelf_id is None:
+    def _show_series_reading_settings(self, folder_path: str, folder_comics: list) -> None:
+        series_names = {c.series for c in folder_comics if c.series}
+        if not series_names:
+            QMessageBox.information(
+                self, "Series Settings",
+                "No series found in this folder. Use Series → Scan for series first."
+            )
             return
-        comics = self._library.get_comics_in_shelf_for_folder(
-            self._current_shelf_id, folder_path
+        series_name = next(iter(series_names))
+        current = self._library.get_series_reading_settings(folder_path, series_name)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Series settings — {series_name}")
+        layout = QFormLayout(dlg)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        fit_options = [("Inherit", None), ("Fit page", "page"), ("Fit width", "width"),
+                       ("Fit height", "height"), ("Actual size", "actual")]
+        fit_combo = QComboBox()
+        for label, _ in fit_options:
+            fit_combo.addItem(label)
+        fit_combo.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(fit_options) if v == current.fit_mode), 0)
         )
-        for comic in comics:
-            self._library.remove_comic_from_shelf(comic.id, self._current_shelf_id)
+        layout.addRow("Fit mode:", fit_combo)
+
+        mode_options = [("Inherit", None), ("Single page", "single"), ("Webtoon scroll", "webtoon")]
+        mode_combo = QComboBox()
+        for label, _ in mode_options:
+            mode_combo.addItem(label)
+        mode_combo.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(mode_options) if v == current.reading_mode), 0)
+        )
+        layout.addRow("Reading mode:", mode_combo)
+
+        spread_options = [("Inherit", None), ("On", True), ("Off", False)]
+        spread_combo = QComboBox()
+        for label, _ in spread_options:
+            spread_combo.addItem(label)
+        spread_combo.setCurrentIndex(
+            next((i for i, (_, v) in enumerate(spread_options) if v == current.spread), 0)
+        )
+        layout.addRow("Spread mode:", spread_combo)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addRow(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self._library.set_series_reading_settings(
+            folder_path,
+            series_name,
+            ReadingSettings(
+                fit_mode=fit_options[fit_combo.currentIndex()][1],
+                reading_mode=mode_options[mode_combo.currentIndex()][1],
+                spread=spread_options[spread_combo.currentIndex()][1],
+            ),
+        )
         self.window().statusBar().showMessage(
-            f"Removed “{Path(folder_path).name}” from {self._current_shelf_name}",
-            4000,
+            f"Series settings saved for “{series_name}”", 4000
         )
-        self.shelf_changed.emit()
 
     def _rename_folder(self, folder_path: str) -> None:
         current_name = Path(folder_path).name
