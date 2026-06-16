@@ -400,9 +400,9 @@ class ComicViewer(QGraphicsView):
             self.scale(self._zoom_factor, self._zoom_factor)
 
 
-_BAR_TRACK = QColor("#4a3535")        # matches dark theme progress_track
-_BAR_FILL = QColor("#c06060")         # matches dark theme progress_fill
-_BAR_HANDLE_HOVER = QColor("#f5e6e6") # matches dark theme text (handle :hover)
+_BAR_TRACK = QColor("#2a2a2a")        # matches dark theme progress_track
+_BAR_FILL = QColor("#e01b1b")         # matches dark theme progress_fill
+_BAR_HANDLE_HOVER = QColor("#ffffff") # bright handle on hover
 _BAR_BOOKMARK = QColor("#ffffff")
 _BAR_NOTE = QColor("#f0c76a")
 _BOOKMARK_SNAP_PX = 5  # pixels either side of a tick that triggers tooltip
@@ -809,7 +809,7 @@ class _ThumbCell(QLabel):
     def _refresh_style(self) -> None:
         if self._selected:
             self.setStyleSheet(
-                "border: 2px solid #4a9eff; background: #0a0a0a;"
+                "border: 2px solid #e01b1b; background: #0a0a0a;"
             )
         else:
             self.setStyleSheet(

@@ -234,10 +234,13 @@ class _Tile(QWidget):
         """Outline the whole tile on hover (replaces the old cover-only tint)."""
         if not self._hovered:
             return
-        pen = QPen(_HOVER_OUTLINE, 2)
+        # Release the rounded cover clip so the square outline's corners
+        # aren't trimmed by the rounded mask.
+        painter.setClipping(False)
+        pen = QPen(_HOVER_OUTLINE, 1)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(1, 1, TILE_W - 2, self._tile_h - 2, 8, 8)
+        painter.drawRect(1, 1, TILE_W - 2, self._tile_h - 2)
 
     def _draw_title(self, painter: QPainter, text: str) -> int:
         """Draw the title; return the Y coordinate for the status line below it."""
@@ -793,7 +796,7 @@ class _HeaderBar(QWidget):
         self._back_btn.set_colors("#ffffff", "#ffffff")
 
     def apply_theme(self, c: dict):
-        bg = _hex_to_rgba(c["header_bg"], 218)
+        bg = _hex_to_rgba(c["header_bg"], 165)
         self.setStyleSheet(
             f"#HeaderBar {{ background: {bg}; border: none; }}"
         )
@@ -1256,7 +1259,7 @@ class BookshelfView(QWidget):
         _STATUS_FG = QColor(c["text_secondary"])
         r, g, b, a = c["hover_overlay"]
         _HOVER_OVERLAY = QColor(r, g, b, a)
-        _HOVER_OUTLINE = QColor(c["accent"])
+        _HOVER_OUTLINE = QColor("#b0b0b0")
         _PROGRESS_TRACK = QColor(c["progress_track"])
         _PROGRESS_FILL = QColor(c["progress_fill"])
         _PLACEHOLDER_FG = QColor(c["placeholder_fg"])

@@ -14,12 +14,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import themes
 from library import Library
 
-# Dark mode is locked on, so the chart pulls fixed palette colours.
-_BAR = QColor("#c06060")
-_BAR_EMPTY = QColor("#4a3535")
-_AXIS = QColor("#9a7878")
+# Dark mode is locked on, so the chart pulls the active palette colours.
+_BAR = QColor(themes.DARK["accent"])
+_BAR_EMPTY = QColor(themes.DARK["progress_track"])
+_AXIS = QColor(themes.DARK["text_secondary"])
+_SECONDARY = themes.DARK["text_secondary"]
 
 
 class _PagesPerDayChart(QWidget):
@@ -91,7 +93,7 @@ class StatsDialog(QDialog):
             vf.setBold(True)
             v.setFont(vf)
             l = QLabel(label)
-            l.setStyleSheet("color: #9a7878;")
+            l.setStyleSheet(f"color: {_SECONDARY};")
             grid.addWidget(v, row * 2, col)
             grid.addWidget(l, row * 2 + 1, col)
 
@@ -105,7 +107,7 @@ class StatsDialog(QDialog):
         outer.addLayout(grid)
 
         chart_label = QLabel("Pages per day — last 30 days")
-        chart_label.setStyleSheet("color: #9a7878; margin-top: 8px;")
+        chart_label.setStyleSheet(f"color: {_SECONDARY}; margin-top: 8px;")
         outer.addWidget(chart_label)
         outer.addWidget(_PagesPerDayChart(stats["pages_per_day"]), 1)
 

@@ -36,33 +36,33 @@ LIGHT: dict = {
 }
 
 DARK: dict = {
-    "app_bg":           "#2e2626",  # content area — medium dark warm
-    "sidebar_bg":       "#171212",  # sidebar — distinctly darker
-    "header_bg":        "#171212",  # header bar — matches sidebar
-    "border":           "#3e2e2e",
-    "accent":           "#c06060",
-    "text":             "#e8dede",
-    "text_secondary":   "#9a7878",
-    "tile_bg":          "#2e2626",
-    "cover_bg":         "#3c2e2e",
-    "hover_overlay":    (220, 150, 150, 22),
-    "progress_track":   "#4a3535",
-    "progress_fill":    "#c06060",
-    "placeholder_fg":   "#5a4545",
-    "hover_bg":         "#3c2e2e",
-    "btn_color":        "#a08080",
-    "btn_hover_bg":     "#2e2626",
-    "btn_hover_color":  "#e8dede",
-    "btn_pressed":      "#c06060",
-    "btn_disabled":     "#3e3030",
-    "logo_bg":          "#7a2020",
+    "app_bg":           "#0d0d0d",  # content area — near black
+    "sidebar_bg":       "#000000",  # sidebar — pure black chrome
+    "header_bg":        "#000000",  # header bar — matches sidebar
+    "border":           "#2a2a2a",  # neutral dark hairline
+    "accent":           "#e01b1b",  # vivid red
+    "text":             "#f0f0f0",  # near white
+    "text_secondary":   "#9a9a9a",  # neutral grey
+    "tile_bg":          "#0d0d0d",
+    "cover_bg":         "#161616",  # neutral dark behind covers
+    "hover_overlay":    (255, 255, 255, 22),  # subtle white glow on hover
+    "progress_track":   "#2a2a2a",  # neutral track
+    "progress_fill":    "#e01b1b",  # red fill
+    "placeholder_fg":   "#555555",
+    "hover_bg":         "#1c1c1c",
+    "btn_color":        "#b0b0b0",  # neutral rail glyphs
+    "btn_hover_bg":     "#1c1c1c",
+    "btn_hover_color":  "#ffffff",
+    "btn_pressed":      "#e01b1b",
+    "btn_disabled":     "#3a3a3a",
+    "logo_bg":          "#c00000",
     "logo_color":       "#ffffff",
-    "reader_bar_bg":    "#171212",
-    "scrollbar_bg":     "#171212",
-    "scrollbar_handle": "#3e2e2e",
-    "scrollbar_hover":  "#4e3e3e",
-    "input_bg":         "#201a1a",
-    "selection_bg":     "#c06060",
+    "reader_bar_bg":    "#000000",
+    "scrollbar_bg":     "#000000",
+    "scrollbar_handle": "#3a3a3a",
+    "scrollbar_hover":  "#5a5a5a",
+    "input_bg":         "#141414",
+    "selection_bg":     "#e01b1b",
 }
 
 _active: dict = DARK

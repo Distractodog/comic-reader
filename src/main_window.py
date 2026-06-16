@@ -1863,6 +1863,10 @@ class MainWindow(QMainWindow):
         self._webtoon_viewer.set_width_fraction(pct / 100)
 
     def _toggle_thumb_strip(self) -> None:
+        # Only meaningful inside the reader — without a comic the strip is an
+        # empty black bar, so ignore the shortcut on the bookshelf/elsewhere.
+        if not self._reader:
+            return
         if self._thumb_strip.isVisible():
             self._thumb_strip.hide()
         else:
