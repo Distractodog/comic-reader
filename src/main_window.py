@@ -2002,14 +2002,18 @@ class MainWindow(QMainWindow):
         if self._settings_view.isVisible():
             self._close_settings()
             return
-        if self.isFullScreen():
-            self._exit_window_fullscreen()
-            return
+        # In the reader, Escape reveals the chrome (top bar + progress bar)
+        # rather than leaving fullscreen. Only once the chrome is already
+        # showing does another Escape return to the library. Fullscreen is
+        # left untouched here.
         if self._is_reading_view():
             if self._chrome_hidden:
                 self._show_reading_chrome()
-                return
-            self._back_to_library()
+            else:
+                self._back_to_library()
+            return
+        if self.isFullScreen():
+            self._exit_window_fullscreen()
 
     def _on_folder_level_changed(self, in_folder: bool):
         # Keep the sidebar highlight in sync with the active view.
