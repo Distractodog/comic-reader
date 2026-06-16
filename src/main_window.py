@@ -587,6 +587,7 @@ class _RailButton(QPushButton):
             "hamburger": self._draw_hamburger,
             "home": self._draw_home,
             "book": self._draw_book,
+            "bookmark": self._draw_bookmark,
             "search": self._draw_search,
             "menu": self._draw_menu,
             "settings": self._draw_settings,
@@ -632,6 +633,19 @@ class _RailButton(QPushButton):
         path.lineTo(cx, bot_c)
         path.moveTo(cx, top_c)
         path.lineTo(cx, bot_c)
+        painter.setPen(self._icon_pen(1.3))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+    def _draw_bookmark(self, painter: QPainter, cx: float, cy: float) -> None:
+        r = self._icon_rect(cx, cy)
+        path = QPainterPath()
+        path.moveTo(r.left() + 4, r.top() + 1)
+        path.lineTo(r.right() - 4, r.top() + 1)
+        path.lineTo(r.right() - 4, r.bottom() - 1)
+        path.lineTo(cx, r.bottom() - 5)
+        path.lineTo(r.left() + 4, r.bottom() - 1)
+        path.closeSubpath()
         painter.setPen(self._icon_pen(1.3))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
@@ -709,6 +723,7 @@ class _Sidebar(QWidget):
 
     home_clicked = pyqtSignal()
     currently_reading_clicked = pyqtSignal()
+    bookmarks_clicked = pyqtSignal()
     search_changed = pyqtSignal(str)
     search_closed = pyqtSignal()
     app_menu_requested = pyqtSignal()
@@ -770,6 +785,10 @@ class _Sidebar(QWidget):
         self._btn_reading.clicked.connect(self._on_reading)
         panel_layout.addWidget(self._btn_reading)
 
+        self._btn_bookmarks = self._make_item("", "Bookmarks", kind="bookmark")
+        self._btn_bookmarks.clicked.connect(self._on_bookmarks)
+        panel_layout.addWidget(self._btn_bookmarks)
+
         self._btn_search = self._make_item("", "Search", kind="search")
         self._btn_search.clicked.connect(self._on_search)
         panel_layout.addWidget(self._btn_search)
@@ -798,7 +817,9 @@ class _Sidebar(QWidget):
         panel_layout.addWidget(self._btn_settings)
 
         self._top_buttons = [self._btn_hamburger]
-        self._panel_buttons = [self._btn_home, self._btn_reading, self._btn_search]
+        self._panel_buttons = [
+            self._btn_home, self._btn_reading, self._btn_bookmarks, self._btn_search
+        ]
         if self._btn_menu is not None:
             self._panel_buttons.append(self._btn_menu)
         self._panel_buttons.append(self._btn_settings)
@@ -876,6 +897,11 @@ class _Sidebar(QWidget):
         self.set_active("currently_reading")
         self.currently_reading_clicked.emit()
 
+    def _on_bookmarks(self):
+        self._close_search_input()
+        self.set_active("bookmarks")
+        self.bookmarks_clicked.emit()
+
     def _on_search(self):
         self._search_active = True
         self.set_expanded(True)
@@ -927,6 +953,7 @@ class _Sidebar(QWidget):
         active_map = {
             id(self._btn_home): "library",
             id(self._btn_reading): "currently_reading",
+            id(self._btn_bookmarks): "bookmarks",
         }
         for btn in self._all_buttons:
             key = active_map.get(id(btn))
@@ -1052,6 +1079,7 @@ class MainWindow(QMainWindow):
         )
         self._settings_view.library_action.connect(self._on_library_action)
         self._settings_view.shortcuts_requested.connect(self._open_shortcuts_dialog)
+        self._settings_view.shortcut_changed.connect(self._reload_shortcuts)
         self._animations_enabled = prefs.get_bool(prefs.ANIMATIONS)
         self._stack.addWidget(self._bookshelf)      # index 0
         self._stack.addWidget(self.viewer)           # index 1
@@ -1065,6 +1093,7 @@ class MainWindow(QMainWindow):
         self._open_worker: _ComicOpenWorker | None = None
         self._opening_path: str | None = None
         self._opening_start_at_top: bool = False
+        self._opening_target_page: int | None = None
         self._open_started: float = 0.0
         self._open_min_elapsed = False
         self._open_page_ready = False
@@ -1150,6 +1179,7 @@ class MainWindow(QMainWindow):
         self._sidebar.currently_reading_clicked.connect(
             self._show_currently_reading
         )
+        self._sidebar.bookmarks_clicked.connect(self._show_bookmarks)
         self._sidebar.search_changed.connect(self._bookshelf.search)
         self._sidebar.search_closed.connect(self._bookshelf.clear_search)
         self._sidebar.settings_clicked.connect(self._open_settings)
@@ -1215,6 +1245,7 @@ class MainWindow(QMainWindow):
         self._trans_anim.finished.connect(self._trans_overlay.hide)
 
         self._bookshelf.comic_opened.connect(self._open_comic_from_bookshelf)
+        self._bookshelf.bookmark_opened.connect(self._open_bookmark_from_bookshelf)
         self._bookshelf.folder_entered.connect(self._on_folder_level_changed)
         self._bookshelf.rescan_all_requested.connect(self.rescan_all_folders)
         self._bookshelf.export_shelf_requested.connect(self.export_shelf)
@@ -1438,6 +1469,11 @@ class MainWindow(QMainWindow):
     def _build_menus(self):
         kb = self._kb
         menubar = self.menuBar()
+        old_thumb_action = getattr(self, "_thumb_shortcut_action", None)
+        if old_thumb_action is not None:
+            self.removeAction(old_thumb_action)
+            old_thumb_action.deleteLater()
+            self._thumb_shortcut_action = None
 
         file_menu = menubar.addMenu("&File")
 
@@ -1600,6 +1636,7 @@ class MainWindow(QMainWindow):
         thumb_action.setShortcuts(_shortcuts("thumbnail_strip"))
         thumb_action.triggered.connect(self._toggle_thumb_strip)
         self.addAction(thumb_action)
+        self._thumb_shortcut_action = thumb_action
 
 
     def _fade_switch(self, switch_fn):
@@ -1622,6 +1659,9 @@ class MainWindow(QMainWindow):
 
     def _open_comic_from_bookshelf(self, path: str):
         self.load_file(path)
+
+    def _open_bookmark_from_bookshelf(self, path: str, page_index: int):
+        self.load_file(path, target_page=page_index)
 
     def _prepare_comics_for_deletion(self, comic_ids: list[int]) -> None:
         """Release open file handles before the bookshelf deletes comics from disk."""
@@ -2031,9 +2071,12 @@ class MainWindow(QMainWindow):
     def _open_shortcuts_dialog(self) -> None:
         dlg = KeybindingDialog(self._kb, self)
         if dlg.exec():
-            # Rebuild menus so new shortcuts take effect immediately
-            self.menuBar().clear()
-            self._build_menus()
+            self._reload_shortcuts()
+
+    def _reload_shortcuts(self) -> None:
+        self._kb = KeybindingManager()
+        self.menuBar().clear()
+        self._build_menus()
 
     def _on_escape(self):
         if self._settings_view.isVisible():
@@ -2056,6 +2099,8 @@ class MainWindow(QMainWindow):
         # Keep the sidebar highlight in sync with the active view.
         if self._bookshelf._currently_reading_mode:
             self._sidebar.set_active("currently_reading")
+        elif self._bookshelf._bookmarks_mode:
+            self._sidebar.set_active("bookmarks")
         elif (
             not in_folder
             and self._bookshelf._current_shelf_id is None
@@ -2101,7 +2146,9 @@ class MainWindow(QMainWindow):
         if path:
             self.load_file(path)
 
-    def load_file(self, path: str, start_at_top: bool = False):
+    def load_file(
+        self, path: str, start_at_top: bool = False, target_page: int | None = None
+    ):
         if not Path(path).exists():
             QMessageBox.warning(
                 self,
@@ -2144,7 +2191,10 @@ class MainWindow(QMainWindow):
         if comic is not None:
             # Advancing forward to the next comic starts at the top, not wherever
             # that comic was last left (resume only applies to opening directly).
-            start_page = 0 if start_at_top else max(0, comic.current_page)
+            if target_page is not None:
+                start_page = max(0, target_page)
+            else:
+                start_page = 0 if start_at_top else max(0, comic.current_page)
             rs = self._library.resolve_reading_settings(
                 comic, self._global_reading_defaults()
             )
@@ -2156,6 +2206,7 @@ class MainWindow(QMainWindow):
         self._open_gen += 1
         self._opening_path = path
         self._opening_start_at_top = start_at_top
+        self._opening_target_page = target_page
         self._open_started = time.monotonic()
         self._loading_overlay.start(cover)
         worker = _ComicOpenWorker(self._open_gen, path, start_page, spread, webtoon, self)
@@ -2216,7 +2267,10 @@ class MainWindow(QMainWindow):
         default_rtl = prefs.get_bool(prefs.DEFAULT_RTL)
         if comic is not None:
             self._current_comic_id = comic.id
-            if self._opening_start_at_top:
+            if self._opening_target_page is not None:
+                limit = max(0, self._reader.page_count() - 1)
+                self._current_page = max(0, min(self._opening_target_page, limit))
+            elif self._opening_start_at_top:
                 self._current_page = 0
             else:
                 self._current_page = comic.current_page if 0 < comic.current_page < self._reader.page_count() else 0
@@ -2906,6 +2960,12 @@ class MainWindow(QMainWindow):
         if self._settings_view.isVisible():
             self._close_settings()
         self._bookshelf.show_currently_reading()
+
+    def _show_bookmarks(self) -> None:
+        """Sidebar Bookmarks: leave settings if open first."""
+        if self._settings_view.isVisible():
+            self._close_settings()
+        self._bookshelf.show_bookmarks()
 
     def _exit_window_fullscreen(self) -> None:
         if not self.isFullScreen():

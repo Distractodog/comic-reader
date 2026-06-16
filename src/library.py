@@ -53,6 +53,21 @@ class Bookmark:
 
 
 @dataclass
+class BookmarkEntry:
+    id: int
+    comic_id: int
+    page_index: int
+    label: str | None
+    created_at: str
+    file_path: str
+    title: str | None
+    series: str | None
+    series_number: float | None
+    page_count: int
+    cover_path: str | None
+
+
+@dataclass
 class Annotation:
     id: int
     comic_id: int
@@ -1624,6 +1639,33 @@ class Library:
                 page_index=r["page_index"],
                 label=r["label"],
                 created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def get_all_bookmarks(self) -> list[BookmarkEntry]:
+        rows = self._conn.execute(
+            "SELECT b.id, b.comic_id, b.page_index, b.label, b.created_at,"
+            " c.file_path, c.title, c.series, c.series_number, c.page_count,"
+            " c.cover_path"
+            " FROM bookmarks b"
+            " JOIN comics c ON c.id = b.comic_id"
+            " WHERE c.hidden = 0"
+            " ORDER BY b.created_at DESC, c.title COLLATE NOCASE, b.page_index"
+        ).fetchall()
+        return [
+            BookmarkEntry(
+                id=r["id"],
+                comic_id=r["comic_id"],
+                page_index=r["page_index"],
+                label=r["label"],
+                created_at=r["created_at"],
+                file_path=r["file_path"],
+                title=r["title"],
+                series=r["series"],
+                series_number=r["series_number"],
+                page_count=r["page_count"],
+                cover_path=r["cover_path"],
             )
             for r in rows
         ]

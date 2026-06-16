@@ -19,6 +19,10 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+
+def _qt_value(value) -> int:
+    return int(getattr(value, "value", value))
+
 # action_id → {label, default primary shortcut, fixed secondary shortcuts}
 ACTIONS: dict[str, dict] = {
     "next_page":        {"label": "Next Page",            "default": "Right",   "extras": ["Space", "PgDown"]},
@@ -153,7 +157,9 @@ class KeybindingDialog(QDialog):
             return
 
         # Build the key sequence string
-        seq = QKeySequence(int(mods) | key).toString(QKeySequence.SequenceFormat.PortableText)
+        seq = QKeySequence(_qt_value(mods) | _qt_value(key)).toString(
+            QKeySequence.SequenceFormat.PortableText
+        )
         if not seq:
             return
 

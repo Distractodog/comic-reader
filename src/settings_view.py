@@ -9,7 +9,7 @@ win over these. The view emits signals so the main window can apply changes live
 from __future__ import annotations
 
 from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
+from PyQt6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -28,6 +29,7 @@ from PyQt6.QtWidgets import (
 import prefs
 import themes
 from app_info import APP_DISPLAY_NAME, APP_REPO_URL, APP_VERSION
+from keybindings import ACTIONS, KeybindingManager
 
 SECTIONS: list[tuple[str, str]] = [
     ("Appearance", "Theme, animations, tile size, and sidebar defaults."),
@@ -38,6 +40,16 @@ SECTIONS: list[tuple[str, str]] = [
     ("Sidebar", "Choose which views and shelves appear in the rail."),
     ("About", "App version and project info."),
 ]
+
+_CONTENT_FONT_SCALE = 1.125
+
+
+def _scaled_px(px: int) -> int:
+    return round(px * _CONTENT_FONT_SCALE)
+
+
+def _qt_value(value) -> int:
+    return int(getattr(value, "value", value))
 
 
 class _SettingsPanel(QWidget):
@@ -55,22 +67,25 @@ class _SettingsPanel(QWidget):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(36, 30, 36, 30)
-        outer.setSpacing(14)
+        outer.setSpacing(18)
 
         self._heading = QLabel(title)
         head_font = QFont("Libre Baskerville")
-        head_font.setPixelSize(20)
+        head_font.setPixelSize(_scaled_px(20))
         self._heading.setFont(head_font)
 
         self._blurb = QLabel(blurb)
         self._blurb.setWordWrap(True)
+        blurb_font = QFont()
+        blurb_font.setPixelSize(_scaled_px(13))
+        self._blurb.setFont(blurb_font)
 
         outer.addWidget(self._heading)
         outer.addWidget(self._blurb)
         outer.addSpacing(4)
 
         self.body = QVBoxLayout()
-        self.body.setSpacing(14)
+        self.body.setSpacing(28)
         outer.addLayout(self.body)
         outer.addStretch(1)
 
@@ -86,13 +101,16 @@ class _SettingsPanel(QWidget):
         left.setSpacing(2)
         lbl = QLabel(label_text)
         lbl.setFont(QFont("Libre Baskerville", -1))
+        lbl_font = QFont("Libre Baskerville")
+        lbl_font.setPixelSize(_scaled_px(13))
+        lbl.setFont(lbl_font)
         self._labels.append(lbl)
         left.addWidget(lbl)
         if hint:
             hint_lbl = QLabel(hint)
             hint_lbl.setWordWrap(True)
             hint_font = QFont()
-            hint_font.setPixelSize(11)
+            hint_font.setPixelSize(_scaled_px(11))
             hint_lbl.setFont(hint_font)
             hint_lbl.setObjectName("hint")
             self._labels.append(hint_lbl)
@@ -101,8 +119,14 @@ class _SettingsPanel(QWidget):
 
         if isinstance(control, QCheckBox):
             self._checks.append(control)
+            font = control.font()
+            font.setPixelSize(_scaled_px(13))
+            control.setFont(font)
         control.setMinimumWidth(180)
         if isinstance(control, (QComboBox, QFontComboBox, QSpinBox)):
+            font = control.font()
+            font.setPixelSize(_scaled_px(13))
+            control.setFont(font)
             control.setFixedWidth(220)
         h.addWidget(control, 0, Qt.AlignmentFlag.AlignTop)
         self.body.addWidget(row)
@@ -120,7 +144,7 @@ class _SettingsPanel(QWidget):
     def _subheading(self, text: str) -> QLabel:
         lbl = QLabel(text)
         f = QFont("Libre Baskerville")
-        f.setPixelSize(16)
+        f.setPixelSize(_scaled_px(16))
         lbl.setFont(f)
         self._labels.append(lbl)
         self.body.addWidget(lbl)
@@ -378,6 +402,9 @@ class LibraryPanel(_SettingsPanel):
 
     def _btn(self, label: str, action: str) -> QPushButton:
         b = QPushButton(label)
+        font = b.font()
+        font.setPixelSize(_scaled_px(13))
+        b.setFont(font)
         b.setCursor(Qt.CursorShape.PointingHandCursor)
         b.clicked.connect(lambda: self._owner.library_action.emit(action))
         return b
@@ -386,14 +413,98 @@ class LibraryPanel(_SettingsPanel):
 # ----------------------------------------------------------------------------
 # Shortcuts
 # ----------------------------------------------------------------------------
+class _ShortcutButton(QPushButton):
+    captured = pyqtSignal(str)
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._capturing = False
+        self.clicked.connect(self._begin_capture)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def _begin_capture(self) -> None:
+        self._capturing = True
+        self.setText("Press a key...")
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+
+    def keyPressEvent(self, event) -> None:
+        if not self._capturing:
+            super().keyPressEvent(event)
+            return
+        key = event.key()
+        if key in (
+            Qt.Key.Key_Control,
+            Qt.Key.Key_Shift,
+            Qt.Key.Key_Alt,
+            Qt.Key.Key_Meta,
+        ):
+            return
+        seq = QKeySequence(
+            _qt_value(event.modifiers()) | _qt_value(key)
+        ).toString(QKeySequence.SequenceFormat.PortableText)
+        if not seq:
+            return
+        self._capturing = False
+        self.captured.emit(seq)
+
+
 class ShortcutsPanel(_SettingsPanel):
     def __init__(self, owner: "SettingsView", parent=None):
         super().__init__(*SECTIONS[4], parent)
         self._owner = owner
-        btn = QPushButton("Customize keyboard shortcuts…")
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.clicked.connect(self._owner.shortcuts_requested.emit)
-        self._full(btn)
+        self._manager = KeybindingManager()
+        self._buttons: dict[str, _ShortcutButton] = {}
+
+        for action_id, meta in ACTIONS.items():
+            btn = _ShortcutButton(self._manager.get(action_id))
+            font = btn.font()
+            font.setPixelSize(_scaled_px(13))
+            btn.setFont(font)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.captured.connect(lambda seq, aid=action_id: self._set_shortcut(aid, seq))
+            self._buttons[action_id] = btn
+            extras = meta.get("extras", [])
+            hint = f"Also: {', '.join(extras)}" if extras else ""
+            self._row(meta["label"], btn, hint=hint)
+
+        self._divider()
+        reset = QPushButton("Reset all to defaults")
+        font = reset.font()
+        font.setPixelSize(_scaled_px(13))
+        reset.setFont(font)
+        reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset.clicked.connect(self._reset_all)
+        self._full(reset)
+
+    def _set_shortcut(self, action_id: str, seq: str) -> None:
+        current = self._manager.all_shortcuts()
+        for other_id, other_seq in current.items():
+            if other_id == action_id or other_seq != seq:
+                continue
+            result = QMessageBox.question(
+                self,
+                "Shortcut conflict",
+                f'"{seq}" is already used by "{ACTIONS[other_id]["label"]}".\n\nReplace it?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                self._buttons[action_id].setText(current[action_id])
+                return
+            default = ACTIONS[other_id]["default"]
+            self._manager.set(other_id, default)
+            self._buttons[other_id].setText(default)
+            break
+
+        self._manager.set(action_id, seq)
+        self._buttons[action_id].setText(seq)
+        self._owner.shortcut_changed.emit()
+
+    def _reset_all(self) -> None:
+        for action_id, meta in ACTIONS.items():
+            shortcut = meta["default"]
+            self._manager.set(action_id, shortcut)
+            self._buttons[action_id].setText(shortcut)
+        self._owner.shortcut_changed.emit()
 
 
 # ----------------------------------------------------------------------------
@@ -422,18 +533,24 @@ class AboutPanel(_SettingsPanel):
 
         self._name = QLabel(APP_DISPLAY_NAME)
         nf = QFont("Libre Baskerville")
-        nf.setPixelSize(22)
+        nf.setPixelSize(_scaled_px(22))
         self._name.setFont(nf)
         self._labels.append(self._name)
         self._full(self._name)
 
         self._version = QLabel(f"Version {APP_VERSION}")
+        version_font = QFont()
+        version_font.setPixelSize(_scaled_px(13))
+        self._version.setFont(version_font)
         self._labels.append(self._version)
         self._full(self._version)
 
         self._link = QLabel(
             f'<a href="{APP_REPO_URL}">{APP_REPO_URL}</a>'
         )
+        link_font = QFont()
+        link_font.setPixelSize(_scaled_px(13))
+        self._link.setFont(link_font)
         self._link.setOpenExternalLinks(True)
         self._link.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
@@ -468,6 +585,7 @@ class SettingsView(QWidget):
     ebook_defaults_changed = pyqtSignal()
     library_action = pyqtSignal(str)
     shortcuts_requested = pyqtSignal()
+    shortcut_changed = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -608,10 +726,12 @@ class SettingsView(QWidget):
             f" {{ background: transparent; }}"
             f"#SettingsScroll > QWidget {{ background: transparent; }}"
             f"#SettingsPanel .QWidget {{ background: transparent; }}"
-            f"#SettingsRoot QComboBox, #SettingsRoot QFontComboBox,"
-            f" #SettingsRoot QSpinBox {{ background: {c['input_bg']};"
+            f"#SettingsPanel QComboBox, #SettingsPanel QFontComboBox,"
+            f" #SettingsPanel QSpinBox {{ background: {c['input_bg']};"
             f" color: {c['text']}; border: 1px solid {c['border']};"
-            f" border-radius: 4px; padding: 4px 8px; }}"
+            f" border-radius: 4px; padding: 4px 8px;"
+            f" font-size: {_scaled_px(13)}px; }}"
+            f"#SettingsPanel QPushButton {{ font-size: {_scaled_px(13)}px; }}"
         )
         self._render_background()
         hbg = QColor(c["header_bg"])

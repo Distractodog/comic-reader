@@ -54,7 +54,7 @@ from PyQt6.QtWidgets import (
 
 from batch_tools import BatchPlan, BatchWorker, plan_convert_to_cbz, plan_rename_from_metadata
 from app_info import app_settings
-from library import Comic, Folder, Library, ReadingSettings, Shelf
+from library import BookmarkEntry, Comic, Folder, Library, ReadingSettings, Shelf
 import themes
 
 
@@ -436,6 +436,93 @@ class ComicTile(_Tile):
         self.opened.emit(self._comic.file_path)
 
 
+class BookmarkRow(QPushButton):
+    opened = pyqtSignal(str, int)
+
+    def __init__(self, entry: BookmarkEntry, parent=None):
+        super().__init__(parent)
+        self._entry = entry
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(96)
+        self.setFlat(True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(14)
+
+        cover = QLabel()
+        cover.setFixedSize(52, 76)
+        cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        cover.setStyleSheet(f"background: {_COVER_BG.name()}; border: none;")
+        if entry.cover_path and Path(entry.cover_path).exists():
+            pix = QPixmap(entry.cover_path)
+            if not pix.isNull():
+                cover.setPixmap(
+                    pix.scaled(
+                        cover.size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+        layout.addWidget(cover)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(5)
+        title = entry.title or Path(entry.file_path).stem
+        bookmark_label = entry.label or f"Page {entry.page_index + 1}"
+        series_bits = []
+        if entry.series:
+            series_bits.append(entry.series)
+        if entry.series_number is not None:
+            series_bits.append(f"#{entry.series_number:g}")
+        page_total = f"Page {entry.page_index + 1}"
+        if entry.page_count > 0:
+            page_total += f" of {entry.page_count}"
+        meta = " ".join(series_bits)
+
+        self._title = QLabel(title)
+        self._title.setFont(QFont("Libre Baskerville", 13))
+        self._label = QLabel(bookmark_label)
+        self._page = QLabel(page_total if not meta else f"{page_total}  ·  {meta}")
+        for lbl in (self._title, self._label, self._page):
+            lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        text_col.addWidget(self._title)
+        text_col.addWidget(self._label)
+        text_col.addWidget(self._page)
+        layout.addLayout(text_col, 1)
+        self._apply_colors()
+
+    def _apply_colors(self) -> None:
+        self.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,0.045);"
+            f" border: 1px solid {_PROGRESS_TRACK.name()};"
+            " border-radius: 0; text-align: left; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.08); }"
+        )
+        self._title.setStyleSheet(f"color: {_TITLE_FG.name()}; background: transparent;")
+        self._label.setStyleSheet(f"color: {_TITLE_FG.name()}; background: transparent;")
+        self._page.setStyleSheet(f"color: {_STATUS_FG.name()}; background: transparent;")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.opened.emit(self._entry.file_path, self._entry.page_index)
+        super().mousePressEvent(event)
+
+
+def _bookmark_group_title(entry: BookmarkEntry) -> str:
+    series = (entry.series or "").strip()
+    return series if series else "Other Bookmarks"
+
+
+def _bookmark_sort_key(entry: BookmarkEntry) -> tuple:
+    return (
+        entry.series_number is None,
+        entry.series_number if entry.series_number is not None else 0,
+        (entry.title or Path(entry.file_path).stem).lower(),
+        entry.page_index,
+    )
+
+
 class ShelfTile(_Tile):
     """A bookshelf shown as a tile on the home grid.
 
@@ -806,6 +893,7 @@ class _HeaderBar(QWidget):
 
 class BookshelfView(QWidget):
     comic_opened = pyqtSignal(str)
+    bookmark_opened = pyqtSignal(str, int)
     folder_entered = pyqtSignal(bool)
     shelf_changed = pyqtSignal()            # emitted when shelf membership changes
     folder_rescan_requested = pyqtSignal(str)  # folder_path
@@ -822,6 +910,7 @@ class BookshelfView(QWidget):
         self._current_shelf_name: str = ""
         self._show_hidden_mode: bool = False
         self._currently_reading_mode: bool = False
+        self._bookmarks_mode: bool = False
         self._status_filter: str = ""   # '' | favorite | recently_read | recently_added | unread | finished
         self._last_n_cols = 0
         self._top_row_color = QColor("#171212")
@@ -1004,7 +1093,9 @@ class BookshelfView(QWidget):
         menu = themes.make_menu(self)
         is_home = (
             not self._show_hidden_mode
-            and not self._currently_reading_mode and not self._search_query
+            and not self._currently_reading_mode
+            and not self._bookmarks_mode
+            and not self._search_query
             and self._current_shelf_id is None and self._current_folder is None
         )
         if is_home:
@@ -1293,6 +1384,7 @@ class BookshelfView(QWidget):
             self._comic_tiles.clear()
             self._show_hidden_mode = False
             self._currently_reading_mode = False
+            self._bookmarks_mode = False
             self._header.set_folder_mode()
             self._last_n_cols = 0
             self._repopulate()
@@ -1306,6 +1398,7 @@ class BookshelfView(QWidget):
             self._current_shelf_name = ""
             self._show_hidden_mode = False
             self._currently_reading_mode = False
+            self._bookmarks_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
@@ -1324,6 +1417,7 @@ class BookshelfView(QWidget):
             self._comic_tiles.clear()
             self._show_hidden_mode = False
             self._currently_reading_mode = False
+            self._bookmarks_mode = False
             self._header.set_shelf_mode(shelf_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -1338,6 +1432,7 @@ class BookshelfView(QWidget):
             self._comic_tiles.clear()
             self._show_hidden_mode = False
             self._currently_reading_mode = False
+            self._bookmarks_mode = False
             self._header.set_shelf_mode(self._current_shelf_name)
             self._last_n_cols = 0
             self._repopulate()
@@ -1350,6 +1445,7 @@ class BookshelfView(QWidget):
             self._current_folder = folder_path
             self._show_hidden_mode = False
             self._currently_reading_mode = False
+            self._bookmarks_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
@@ -1367,6 +1463,7 @@ class BookshelfView(QWidget):
             self._current_shelf_name = ""
             self._show_hidden_mode = True
             self._currently_reading_mode = False
+            self._bookmarks_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_shelf_mode("Hidden")
@@ -1383,9 +1480,27 @@ class BookshelfView(QWidget):
             self._current_shelf_name = ""
             self._show_hidden_mode = False
             self._currently_reading_mode = True
+            self._bookmarks_mode = False
             self._selected_ids.clear()
             self._comic_tiles.clear()
             self._header.set_shelf_mode("Currently Reading")
+            self._last_n_cols = 0
+            self._repopulate()
+            self.folder_entered.emit(False)
+        self._nav_transition(do)
+
+    def show_bookmarks(self):
+        """Show every bookmarked page across the library."""
+        def do():
+            self._current_folder = None
+            self._current_shelf_id = None
+            self._current_shelf_name = ""
+            self._show_hidden_mode = False
+            self._currently_reading_mode = False
+            self._bookmarks_mode = True
+            self._selected_ids.clear()
+            self._comic_tiles.clear()
+            self._header.set_shelf_mode("Bookmarks")
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(False)
@@ -1473,6 +1588,10 @@ class BookshelfView(QWidget):
             ))
             empty_msg = ("Nothing in progress.\n"
                          "Comics you're partway through show up here.")
+        elif self._bookmarks_mode:
+            items = self._library.get_all_bookmarks()
+            empty_msg = ("No bookmarks yet.\n"
+                         "Use the reader bookmark button to save pages here.")
         elif self._search_query:
             folders, comics = self._library.search_library(
                 self._search_query, self._sort_by, self._sort_order
@@ -1515,6 +1634,30 @@ class BookshelfView(QWidget):
             layout.addStretch()
             return
 
+        if self._bookmarks_mode:
+            groups: dict[str, list[BookmarkEntry]] = {}
+            for entry in items:
+                groups.setdefault(_bookmark_group_title(entry), []).append(entry)
+            for group_title in sorted(
+                groups, key=lambda name: (name == "Other Bookmarks", name.lower())
+            ):
+                entries = sorted(groups[group_title], key=_bookmark_sort_key)
+                header = QLabel(f"{group_title} ({len(entries)})")
+                header_font = QFont("Libre Baskerville")
+                header_font.setPixelSize(18)
+                header.setFont(header_font)
+                header.setStyleSheet(
+                    f"color: {_TITLE_FG.name()}; background: transparent;"
+                )
+                layout.addWidget(header)
+                for entry in entries:
+                    row = BookmarkRow(entry)
+                    row.opened.connect(self.bookmark_opened)
+                    layout.addWidget(row)
+                layout.addSpacing(TILE_SPACING)
+            layout.addStretch()
+            return
+
         row_widget: QWidget | None = None
         row_layout: QHBoxLayout | None = None
 
@@ -1531,7 +1674,9 @@ class BookshelfView(QWidget):
 
             is_home = (
                 not self._show_hidden_mode
-                and not self._currently_reading_mode and not self._search_query
+                and not self._currently_reading_mode
+                and not self._bookmarks_mode
+                and not self._search_query
                 and self._current_shelf_id is None and self._current_folder is None
             )
             if isinstance(item, Shelf):
@@ -2639,6 +2784,8 @@ class BookshelfView(QWidget):
         """Identify the bookshelf view the user is looking at right now."""
         if self._currently_reading_mode:
             return ["currently_reading"]
+        if self._bookmarks_mode:
+            return ["bookmarks"]
         if self._show_hidden_mode:
             return ["hidden"]
         if self._current_shelf_id is not None:
@@ -2664,6 +2811,8 @@ class BookshelfView(QWidget):
             return "library"
         if parts[0] == "currently_reading":
             return "currently_reading"
+        if parts[0] == "bookmarks":
+            return "bookmarks"
         if parts[0] == "hidden":
             return "hidden"
         if parts[0] == "folder":
@@ -2682,6 +2831,7 @@ class BookshelfView(QWidget):
             "library": "library",
             "shelf": "shelf",
             "currently_reading": "currently reading",
+            "bookmarks": "bookmarks",
             "hidden": "hidden",
         }.get(parts[0], "view")
 
@@ -2690,6 +2840,8 @@ class BookshelfView(QWidget):
             return "Library"
         if parts[0] == "currently_reading":
             return "Currently Reading"
+        if parts[0] == "bookmarks":
+            return "Bookmarks"
         if parts[0] == "hidden":
             return "Hidden"
         if parts[0] == "folder":
@@ -2778,6 +2930,20 @@ class BookshelfView(QWidget):
                 return img
         return None
 
+    def _random_background_spec(self) -> dict | None:
+        """A random valid saved background spec, used for special list pages."""
+        import random
+        specs = []
+        for raw in self._load_background_map().values():
+            spec = self._parse_bg_entry(raw)
+            if spec is not None:
+                specs.append(spec)
+        random.shuffle(specs)
+        for spec in specs:
+            if self._source_image_from_spec(spec) is not None:
+                return spec
+        return None
+
     def _scope_has_own_background(self, parts: list | None = None) -> bool:
         parts = parts if parts is not None else self._current_scope_parts()
         return self._read_background_spec_for_parts(parts) is not None
@@ -2856,7 +3022,11 @@ class BookshelfView(QWidget):
     def _switch_background(self) -> None:
         """Load the background saved for the current shelf/folder/library view."""
         try:
-            self._bg_spec = self._read_background_for_scope(self._current_scope_parts())
+            parts = self._current_scope_parts()
+            if parts[0] == "bookmarks":
+                self._bg_spec = self._random_background_spec()
+            else:
+                self._bg_spec = self._read_background_for_scope(parts)
         except Exception:
             self._bg_spec = None
         self._apply_background()
