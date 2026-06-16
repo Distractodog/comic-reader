@@ -1280,6 +1280,9 @@ class BookshelfView(QWidget):
     def _restore_folder_sort(self, folder_path: str) -> None:
         """Apply this folder's saved sort, else the last sort chosen anywhere."""
         valid = {(key, ord_) for _, key, ord_ in self._header._SORT_OPTIONS}
+        # "Set chapter order" persists "chapter/asc" but it isn't a dropdown
+        # option — allow it through so the chapter order survives a reboot.
+        valid.add(("chapter", "asc"))
 
         def _try(val) -> bool:
             if not isinstance(val, str) or "/" not in val:
