@@ -401,7 +401,7 @@ class ComicViewer(QGraphicsView):
 
 
 _BAR_TRACK = QColor("#2a2a2a")        # matches dark theme progress_track
-_BAR_FILL = QColor("#e01b1b")         # matches dark theme progress_fill
+_BAR_FILL = QColor("#ffffff")
 _BAR_HANDLE_HOVER = QColor("#ffffff") # bright handle on hover
 _BAR_BOOKMARK = QColor("#ffffff")
 _BAR_NOTE = QColor("#f0c76a")
@@ -730,7 +730,7 @@ class ReaderFooter(QWidget):
         self._next_btn.setEnabled(next)
 
     def apply_theme(self, c: dict) -> None:
-        bg = _hex_to_rgba(c["reader_bar_bg"], 218)
+        bg = _hex_to_rgba(c["accent"], 218)
         border = _hex_to_rgba(c["border"], 190)
         self.setStyleSheet(
             f"#ReaderFooter {{ background: {bg};"
@@ -798,6 +798,13 @@ class _ThumbCell(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._selected = False
+        self._accent = "#e01b1b"
+        self._bg = "rgba(0, 0, 0, 96)"
+        self._refresh_style()
+
+    def apply_theme(self, c: dict) -> None:
+        self._accent = c.get("accent", "#e01b1b")
+        self._bg = _hex_to_rgba(c.get("reader_bar_bg", "#000000"), 96)
         self._refresh_style()
 
     def set_selected(self, selected: bool) -> None:
@@ -809,11 +816,11 @@ class _ThumbCell(QLabel):
     def _refresh_style(self) -> None:
         if self._selected:
             self.setStyleSheet(
-                "border: 2px solid #e01b1b; background: #0a0a0a;"
+                f"border: 2px solid {self._accent}; background: {self._bg};"
             )
         else:
             self.setStyleSheet(
-                "border: 2px solid transparent; background: #1a1a1a;"
+                f"border: 2px solid transparent; background: {self._bg};"
             )
 
     def mousePressEvent(self, event):
@@ -831,10 +838,14 @@ class ThumbnailStrip(QScrollArea):
         self.setFixedHeight(_STRIP_H)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setStyleSheet("background: #0d0d0d; border: none;")
+        self.setObjectName("ThumbnailStrip")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._theme: dict | None = None
+        self._selected_index: int = -1
+        self._apply_style()
 
         self._content = QWidget()
-        self._content.setStyleSheet("background: #0d0d0d;")
+        self._content.setStyleSheet("background: transparent;")
         self._row = QHBoxLayout(self._content)
         self._row.setSpacing(_THUMB_SPACING)
         self._row.setContentsMargins(8, 8, 8, 8)
@@ -857,6 +868,22 @@ class ThumbnailStrip(QScrollArea):
         self._load_timer.timeout.connect(self._load_visible)
         self.horizontalScrollBar().valueChanged.connect(self._load_timer.start)
 
+    def apply_theme(self, c: dict) -> None:
+        self._theme = c
+        self._apply_style()
+        for cell in self._cells:
+            cell.apply_theme(c)
+
+    def _apply_style(self) -> None:
+        c = self._theme or {}
+        bg = _hex_to_rgba(c.get("reader_bar_bg", "#000000"), 218)
+        border = _hex_to_rgba(c.get("border", "#2a2a2a"), 190)
+        self.setStyleSheet(
+            f"#ThumbnailStrip {{ background: {bg}; border: none;"
+            f" border-top: 2px solid {border}; }}"
+            " #ThumbnailStrip > QWidget { background: transparent; }"
+        )
+
     def load_comic(self, reader) -> None:
         self.stop()
         self._reader = reader
@@ -869,10 +896,13 @@ class ThumbnailStrip(QScrollArea):
                 item.widget().deleteLater()
         self._cells.clear()
         self._current = -1
+        self._selected_index = -1
 
         page_count = reader.page_count()
         for i in range(page_count):
             cell = _ThumbCell(i)
+            if self._theme:
+                cell.apply_theme(self._theme)
             cell.clicked.connect(self.page_selected)
             self._row.insertWidget(i, cell)
             self._cells.append(cell)
@@ -881,15 +911,24 @@ class ThumbnailStrip(QScrollArea):
         QTimer.singleShot(50, self._load_visible)
 
     def set_current(self, page_index: int) -> None:
-        if self._current == page_index:
-            return
-        if 0 <= self._current < len(self._cells):
-            self._cells[self._current].set_selected(False)
         self._current = page_index
+        self._select_index(page_index, ensure_visible=True)
+
+    def set_preview(self, page_index: int) -> None:
+        """Temporarily highlight a target page while the footer seek bar is dragged."""
+        self._select_index(page_index, ensure_visible=True)
+
+    def _select_index(self, page_index: int, *, ensure_visible: bool) -> None:
+        if self._selected_index == page_index:
+            return
+        if 0 <= self._selected_index < len(self._cells):
+            self._cells[self._selected_index].set_selected(False)
+        self._selected_index = page_index
         if 0 <= page_index < len(self._cells):
             self._cells[page_index].set_selected(True)
-            self.ensureWidgetVisible(self._cells[page_index])
-            self._load_timer.start()
+            if ensure_visible:
+                self.ensureWidgetVisible(self._cells[page_index])
+                self._load_timer.start()
 
     def _load_visible(self) -> None:
         if not self._reader or not self._cells:

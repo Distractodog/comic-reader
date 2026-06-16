@@ -1248,7 +1248,13 @@ class BookshelfView(QWidget):
         self._nav_anim.start()
 
     def go_to_root(self):
-        self._on_back_clicked()
+        self._search_timer.stop()
+        self._search_query = ""
+        self._in_search = False
+        self._pre_search_folder = None
+        self._pre_search_shelf_id = None
+        self._pre_search_shelf_name = ""
+        self._show_folders()
 
     def apply_theme(self, c: dict):
         global _BG, _COVER_BG, _TITLE_FG, _STATUS_FG, _HOVER_OVERLAY, _HOVER_OUTLINE

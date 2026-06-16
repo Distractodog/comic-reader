@@ -1024,6 +1024,7 @@ class MainWindow(QMainWindow):
 
         # Thumb strip load-once guard
         self._thumb_strip_loaded: bool = False
+        self._thumb_strip_enabled: bool = False
 
         self._kb = KeybindingManager()
         self._last_right_key_ms: int | None = None
@@ -1098,6 +1099,9 @@ class MainWindow(QMainWindow):
 
         self._thumb_strip = ThumbnailStrip()
         self._thumb_strip.setVisible(False)
+        self._thumb_strip_opacity = QGraphicsOpacityEffect(self._thumb_strip)
+        self._thumb_strip.setGraphicsEffect(self._thumb_strip_opacity)
+        self._thumb_strip_opacity.setOpacity(1.0)
 
         self._reader_bar = _ReaderBar()
         self._reader_bar.back_clicked.connect(self._back_to_library)
@@ -1122,7 +1126,6 @@ class MainWindow(QMainWindow):
         self._reader_bar_should_hide = False
         self._reader_bar_target_visible = False
         self._chrome_hidden = False
-        self._thumb_strip_before_chrome = False
         self._window_fullscreen = False
 
         content = QWidget()
@@ -1280,11 +1283,44 @@ class MainWindow(QMainWindow):
         h = content.height()
         self._reader_bar.setGeometry(0, 0, w, _ReaderBar.HEIGHT)
         self._reader_footer.setGeometry(0, h - ReaderFooter.HEIGHT, w, ReaderFooter.HEIGHT)
-        strip_h = self._thumb_strip.sizeHint().height()
+        strip_h = max(
+            self._thumb_strip.minimumHeight(),
+            self._thumb_strip.height(),
+            self._thumb_strip.sizeHint().height(),
+        )
         if strip_h <= 0:
-            strip_h = self._thumb_strip.height() or 110
-        self._thumb_strip.setGeometry(0, max(0, h - ReaderFooter.HEIGHT - strip_h), w, strip_h)
+            strip_h = 110
+        footer_top = self._reader_footer.y()
+        visible_strip_h = min(strip_h, max(0, footer_top))
+        self._thumb_strip.setGeometry(
+            0,
+            max(0, footer_top - visible_strip_h),
+            w,
+            visible_strip_h,
+        )
+        if self._thumb_strip.isVisible():
+            self._thumb_strip.raise_()
+        self._reader_footer.raise_()
         self._position_footer_thumbs()
+
+    def _sync_thumb_strip_visibility(self) -> None:
+        """Show page thumbnails only as part of the bottom reader chrome."""
+        visible = (
+            self._thumb_strip_enabled
+            and self._reader is not None
+            and not self._ebook_mode
+            and self._reader_footer_target_visible
+            and self._reader_footer.isVisible()
+            and not self._reader_footer_should_hide
+        )
+        self._thumb_strip.setVisible(visible)
+        if visible:
+            if not self._thumb_strip_loaded:
+                self._thumb_strip.load_comic(self._reader)
+                self._thumb_strip_loaded = True
+            self._thumb_strip.set_current(self._current_page)
+            self._thumb_strip.raise_()
+            self._reader_footer.raise_()
 
     def _position_footer_thumbs(self) -> None:
         """Float the prev/next covers over the top edge of the footer bar.
@@ -1318,6 +1354,8 @@ class MainWindow(QMainWindow):
             return
         self._prev_thumb_opacity.setOpacity(opacity)
         self._next_thumb_opacity.setOpacity(opacity)
+        if getattr(self, "_thumb_strip_opacity", None) is not None:
+            self._thumb_strip_opacity.setOpacity(opacity)
 
     def _set_gutter(self, on: bool) -> None:
         """Reserve (or release) the left gutter the floating sidebar sits in.
@@ -1669,10 +1707,11 @@ class MainWindow(QMainWindow):
 
         menu.addSeparator()
 
-        thumb_act = menu.addAction("Thumbnails")
-        thumb_act.setCheckable(True)
-        thumb_act.setChecked(self._thumb_strip.isVisible())
-        thumb_act.triggered.connect(self._toggle_thumb_strip)
+        if not self._webtoon_mode:
+            thumb_act = menu.addAction("Thumbnails")
+            thumb_act.setCheckable(True)
+            thumb_act.setChecked(self._thumb_strip_enabled)
+            thumb_act.triggered.connect(self._toggle_thumb_strip)
 
         if self._webtoon_mode:
             menu.addSeparator()
@@ -1837,6 +1876,8 @@ class MainWindow(QMainWindow):
             return
         self._webtoon_mode = not self._webtoon_mode
         if self._webtoon_mode:
+            self._thumb_strip_enabled = False
+            self._thumb_strip.setVisible(False)
             self._spread_mode = False
             self._stop_preloader()
             self._seek_bar.set_page_count(self._reader.page_count())
@@ -1869,16 +1910,10 @@ class MainWindow(QMainWindow):
     def _toggle_thumb_strip(self) -> None:
         # Only meaningful inside the reader — without a comic the strip is an
         # empty black bar, so ignore the shortcut on the bookshelf/elsewhere.
-        if not self._reader:
+        if not self._reader or self._webtoon_mode:
             return
-        if self._thumb_strip.isVisible():
-            self._thumb_strip.hide()
-        else:
-            if self._reader and not self._thumb_strip_loaded:
-                self._thumb_strip.load_comic(self._reader)
-                self._thumb_strip_loaded = True
-                self._thumb_strip.set_current(self._current_page)
-            self._thumb_strip.show()
+        self._thumb_strip_enabled = not self._thumb_strip_enabled
+        self._sync_thumb_strip_visibility()
 
     # ----- Bookmarks -----
 
@@ -2043,6 +2078,7 @@ class MainWindow(QMainWindow):
         self._sidebar.apply_theme(c)
         self._reader_bar.apply_theme(c)
         self._reader_footer.apply_theme(c)
+        self._thumb_strip.apply_theme(c)
         self._bookshelf.apply_theme(c)
         self._ebook_viewer.apply_theme(c)
         self._settings_view.apply_theme(c)
@@ -2242,6 +2278,8 @@ class MainWindow(QMainWindow):
         self._reader_footer.set_current(self._current_page + 1)
         self._update_footer_neighbors()
         if self._webtoon_mode:
+            self._thumb_strip_enabled = False
+            self._thumb_strip.setVisible(False)
             self._seek_bar.set_page_count(page_count)
             self._webtoon_viewer.set_width_fraction(self._webtoon_width_pct / 100)
             self._webtoon_viewer.load_comic(self._reader, self._current_page)
@@ -2551,6 +2589,8 @@ class MainWindow(QMainWindow):
         """
         page = value * 2 if self._spread_mode else value
         self._reader_footer.set_current(page + 1)
+        if self._thumb_strip.isVisible():
+            self._thumb_strip.set_preview(page)
 
     def _update_footer_neighbors(self) -> None:
         """Refresh the floating prev/next covers and nav arrows for the open comic."""
@@ -2702,7 +2742,6 @@ class MainWindow(QMainWindow):
 
         hidden = self._chrome_hidden
         if hidden:
-            self._thumb_strip_before_chrome = self._thumb_strip.isVisible()
             self._hide_reader_bar(animated=animated)
         else:
             self._show_reader_bar(animated=animated)
@@ -2710,16 +2749,12 @@ class MainWindow(QMainWindow):
         if self._ebook_mode:
             self._ebook_viewer.set_reader_chrome_visible(not hidden)
             self._hide_reader_footer(animated=False)
-            self._thumb_strip.setVisible(False)
         else:
             if hidden:
                 self._hide_reader_footer(animated=animated)
             else:
                 self._show_reader_footer(animated=animated)
-            if hidden:
-                self._thumb_strip.hide()
-            elif self._thumb_strip_before_chrome:
-                self._thumb_strip.show()
+        self._sync_thumb_strip_visibility()
 
     def _toggle_reading_chrome(self) -> None:
         """Hide/show reader bars only — window size and mode stay the same."""
@@ -2956,6 +2991,7 @@ class MainWindow(QMainWindow):
         self._reader_footer.show()
         self._reader_footer.raise_()
         self._position_reader_overlays()
+        self._sync_thumb_strip_visibility()
         if not animated:
             self._reader_footer.setMinimumHeight(ReaderFooter.HEIGHT)
             self._reader_footer.setMaximumHeight(ReaderFooter.HEIGHT)
@@ -2975,6 +3011,7 @@ class MainWindow(QMainWindow):
         self._reader_footer_target_visible = False
         self._reader_footer_should_hide = True
         self._reader_footer_anim.stop()
+        self._sync_thumb_strip_visibility()
         if not animated:
             self._reader_footer.setMinimumHeight(0)
             self._reader_footer.setMaximumHeight(0)
@@ -3000,11 +3037,13 @@ class MainWindow(QMainWindow):
         if self._reader_footer_should_hide:
             self._reader_footer.setMinimumHeight(0)
             self._reader_footer.hide()
+            self._sync_thumb_strip_visibility()
             self._position_footer_thumbs()
         else:
             self._reader_footer.setMinimumHeight(ReaderFooter.HEIGHT)
             self._reader_footer.setMaximumHeight(ReaderFooter.HEIGHT)
             self._set_footer_thumb_opacity(1.0)
+            self._sync_thumb_strip_visibility()
             self._position_footer_thumbs()
 
     def _restore_window_state(self):
