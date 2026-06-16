@@ -794,9 +794,8 @@ class _HeaderBar(QWidget):
 
     def apply_theme(self, c: dict):
         bg = _hex_to_rgba(c["header_bg"], 218)
-        border = _hex_to_rgba(c["border"], 190)
         self.setStyleSheet(
-            f"#HeaderBar {{ background: {bg}; border-bottom: 2px solid {border}; }}"
+            f"#HeaderBar {{ background: {bg}; border: none; }}"
         )
         self._title.set_color(c["text"])
         self._apply_btn_styles(c)
@@ -1502,7 +1501,7 @@ class BookshelfView(QWidget):
         if not items:
             lbl = QLabel(empty_msg)
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("color: #7a5858;")
+            lbl.setStyleSheet(f"color: {_STATUS_FG.name()};")
             layout.addWidget(lbl)
             layout.addStretch()
             return
