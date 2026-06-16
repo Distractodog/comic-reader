@@ -387,14 +387,6 @@ class _AnnotationDialog(QDialog):
         )
 
 
-# Sidebar nav ids: negative = library views, positive = shelf ids.
-_SIDEBAR_LIBRARY_NAV = (
-    (-1, "Folders"),
-    (-3, "Reading Queue"),
-    (-2, "Hidden"),
-)
-
-
 class _HideSidebarDialog(QDialog):
     """Pick which library views and shelves to hide from the sidebar."""
 
@@ -1236,7 +1228,7 @@ class MainWindow(QMainWindow):
         self._webtoon_viewer.start_page_rendered.connect(self._on_webtoon_start_page_rendered)
         self._ebook_viewer.chapter_changed.connect(self._on_ebook_chapter_changed)
         self._ebook_viewer.exit_requested.connect(self._back_to_library)
-        self._ebook_viewer.end_reached.connect(self._prompt_continue_after_book)
+        self._ebook_viewer.end_reached.connect(self._on_ebook_end)
 
         self._build_menus()
         if sys.platform != "darwin":
@@ -1379,8 +1371,9 @@ class MainWindow(QMainWindow):
                     and self._is_at_last_page()
                 ):
                     self._last_right_key_ms = None
-                    if self._advance_to_next_comic(prompt=False):
-                        return True
+                    if not self._advance_to_next_comic():
+                        self._open_neighbor_comic(forward=True)
+                    return True
                 if (
                     event.key() == Qt.Key.Key_Right
                     and event.modifiers() == Qt.KeyboardModifier.NoModifier
@@ -1392,8 +1385,9 @@ class MainWindow(QMainWindow):
                         and self._is_at_last_page()
                     ):
                         self._last_right_key_ms = None
-                        if self._advance_to_next_comic(prompt=False):
-                            return True
+                        if not self._advance_to_next_comic():
+                            self._open_neighbor_comic(forward=True)
+                        return True
                     else:
                         self._last_right_key_ms = now
                 else:
@@ -2023,7 +2017,6 @@ class MainWindow(QMainWindow):
             not in_folder
             and self._bookshelf._current_shelf_id is None
             and not self._bookshelf._show_hidden_mode
-            and not self._bookshelf.is_showing_queue()
         ):
             self._sidebar.set_active("library")
         else:
@@ -2456,7 +2449,8 @@ class MainWindow(QMainWindow):
             last_spread = self._last_spread_start(page_count)
             if self._current_page >= last_spread:
                 self._save_progress()
-                self._prompt_continue_after_book()
+                if not self._advance_to_next_comic():
+                    self._open_neighbor_comic(forward=True)
                 return
             self._current_page = min(self._current_page + 2, last_spread)
             self._show_current_page(direction=1)
@@ -2470,83 +2464,23 @@ class MainWindow(QMainWindow):
             self._advance_preloader()
             self._save_progress()
         else:
-            self._prompt_continue_after_book()
+            if not self._advance_to_next_comic():
+                self._open_neighbor_comic(forward=True)
 
-    def _next_queued_comic(self):
-        queue = self._library.get_queue()
-        if not queue:
-            return None
-        if self._current_comic_id is None:
-            return queue[0]
-        ids = [comic.id for comic in queue]
-        if self._current_comic_id not in ids:
-            return queue[0]
-        next_index = ids.index(self._current_comic_id) + 1
-        if next_index >= len(queue):
-            return None
-        return queue[next_index]
-
-    def _prompt_continue_after_book(self) -> None:
-        """At end of book: offer the next series issue, otherwise the reading queue."""
-        self._advance_to_next_comic(prompt=True)
-
-    def _advance_to_next_comic(self, *, prompt: bool) -> bool:
-        """Open the next series issue, otherwise the next queued book."""
+    def _advance_to_next_comic(self) -> bool:
+        """Open the next series issue if one exists."""
         if self._current_comic_id is not None:
             next_in_series = self._library.get_next_in_series(self._current_comic_id)
             if next_in_series is not None:
                 title = next_in_series.title or Path(next_in_series.file_path).stem
-                if prompt:
-                    reply = QMessageBox.question(
-                        self,
-                        "Open next in series?",
-                        f"You reached the end. Open the next issue in this series?\n\n{title}",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.Yes,
-                    )
-                    if reply != QMessageBox.StandardButton.Yes:
-                        return False
                 self.load_file(next_in_series.file_path)
                 self.statusBar().showMessage(f"Opened next in series: {title}", 3500)
                 return True
+        return False
 
-        if prompt:
-            self._prompt_open_next_queued_book()
-            return False
-
-        next_comic = self._next_queued_comic()
-        if next_comic is None:
-            return False
-        title = next_comic.title or Path(next_comic.file_path).stem
-        current_id = self._current_comic_id
-        if current_id is not None and self._library.is_in_queue(current_id):
-            self._library.remove_from_queue(current_id)
-        self.load_file(next_comic.file_path)
-        self.statusBar().showMessage(f"Opened next queued book: {title}", 3500)
-        return True
-
-    def _prompt_open_next_queued_book(self) -> None:
-        """Offer to continue into the next queued book at the end of the current one."""
-        next_comic = self._next_queued_comic()
-        if next_comic is None:
-            return
-
-        title = next_comic.title or Path(next_comic.file_path).stem
-        reply = QMessageBox.question(
-            self,
-            "Open next queued book?",
-            f"You reached the end. Open the next book in your Reading Queue?\n\n{title}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        current_id = self._current_comic_id
-        if current_id is not None and self._library.is_in_queue(current_id):
-            self._library.remove_from_queue(current_id)
-        self.load_file(next_comic.file_path)
-        self.statusBar().showMessage(f"Opened next queued book: {title}", 3500)
+    def _on_ebook_end(self) -> None:
+        if not self._advance_to_next_comic():
+            self._open_neighbor_comic(forward=True)
 
     def prev_page(self):
         if self._ebook_mode:

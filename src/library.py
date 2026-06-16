@@ -1549,101 +1549,6 @@ class Library:
         ).fetchone()
         return row["id"] if row else None
 
-    # ----- Reading queue ("read next") -----
-
-    def add_to_queue(self, comic_id: int) -> None:
-        """Append a comic to the end of the reading queue (no-op if already in it)."""
-        now = datetime.now(timezone.utc).isoformat()
-        with self.transaction() as cur:
-            row = cur.execute(
-                "SELECT MAX(position) AS m FROM reading_queue"
-            ).fetchone()
-            next_pos = (row["m"] + 1) if row["m"] is not None else 0
-            cur.execute(
-                "INSERT OR IGNORE INTO reading_queue (comic_id, position, added_at)"
-                " VALUES (?, ?, ?)",
-                (comic_id, next_pos, now),
-            )
-
-    def remove_from_queue(self, comic_id: int) -> None:
-        """Remove a comic from the queue and renumber so positions stay contiguous."""
-        with self.transaction() as cur:
-            cur.execute("DELETE FROM reading_queue WHERE comic_id = ?", (comic_id,))
-            self._renumber_queue(cur)
-
-    def is_in_queue(self, comic_id: int) -> bool:
-        row = self._conn.execute(
-            "SELECT 1 FROM reading_queue WHERE comic_id = ?", (comic_id,)
-        ).fetchone()
-        return row is not None
-
-    def get_queue(self) -> list[Comic]:
-        """Return queued comics in manual order (hidden comics excluded)."""
-        rows = self._conn.execute(
-            "SELECT c.* FROM comics c"
-            " JOIN reading_queue q ON c.id = q.comic_id"
-            " WHERE c.hidden = 0"
-            " ORDER BY q.position"
-        ).fetchall()
-        return [_row_to_comic(r) for r in rows]
-
-    def move_up(self, comic_id: int) -> None:
-        """Swap this comic with the one above it in the queue."""
-        self._swap_with_neighbor(comic_id, -1)
-
-    def move_down(self, comic_id: int) -> None:
-        """Swap this comic with the one below it in the queue."""
-        self._swap_with_neighbor(comic_id, +1)
-
-    def reorder_queue(self, comic_id: int, insert_before_comic_id: int) -> None:
-        """Move a queued comic so it sits immediately before another queued comic."""
-        rows = self._conn.execute(
-            "SELECT comic_id FROM reading_queue ORDER BY position"
-        ).fetchall()
-        order = [r["comic_id"] for r in rows]
-        if comic_id not in order or insert_before_comic_id not in order:
-            return
-        if comic_id == insert_before_comic_id:
-            return
-        order.remove(comic_id)
-        order.insert(order.index(insert_before_comic_id), comic_id)
-        with self.transaction() as cur:
-            for pos, cid in enumerate(order):
-                cur.execute(
-                    "UPDATE reading_queue SET position = ? WHERE comic_id = ?",
-                    (pos, cid),
-                )
-
-    def _swap_with_neighbor(self, comic_id: int, direction: int) -> None:
-        rows = self._conn.execute(
-            "SELECT comic_id, position FROM reading_queue ORDER BY position"
-        ).fetchall()
-        order = [r["comic_id"] for r in rows]
-        if comic_id not in order:
-            return
-        i = order.index(comic_id)
-        j = i + direction
-        if j < 0 or j >= len(order):
-            return
-        order[i], order[j] = order[j], order[i]
-        with self.transaction() as cur:
-            for pos, cid in enumerate(order):
-                cur.execute(
-                    "UPDATE reading_queue SET position = ? WHERE comic_id = ?",
-                    (pos, cid),
-                )
-
-    def _renumber_queue(self, cur) -> None:
-        """Rewrite positions to 0,1,2… preserving current order."""
-        rows = cur.execute(
-            "SELECT comic_id FROM reading_queue ORDER BY position"
-        ).fetchall()
-        for pos, r in enumerate(rows):
-            cur.execute(
-                "UPDATE reading_queue SET position = ? WHERE comic_id = ?",
-                (pos, r["comic_id"]),
-            )
-
     # ----- Tag CRUD -----
 
     def get_all_tags(self) -> list[str]:
@@ -2552,36 +2457,6 @@ if __name__ == "__main__":
         imported_shelf = next(s for s in recipient.get_shelves() if s.name == "Shared Picks")
         assert [c.id for c in recipient.get_comics_in_shelf(imported_shelf.id)] == [rid]
         recipient.close()
-
-    # Reading queue tests (Item 35)
-    q1 = lib.add_comic("/comics/q1.cbz", page_count=10, file_size=1_000, title="Queue 1")
-    q2 = lib.add_comic("/comics/q2.cbz", page_count=10, file_size=2_000, title="Queue 2")
-    q3 = lib.add_comic("/comics/q3.cbz", page_count=10, file_size=3_000, title="Queue 3")
-    lib.add_to_queue(q1)
-    lib.add_to_queue(q2)
-    lib.add_to_queue(q3)
-    assert [c.id for c in lib.get_queue()] == [q1, q2, q3]   # append order
-    assert lib.is_in_queue(q2) is True
-    lib.add_to_queue(q2)                                      # duplicate is a no-op
-    assert [c.id for c in lib.get_queue()] == [q1, q2, q3]
-    lib.move_up(q3)                                           # q3 swaps above q2
-    assert [c.id for c in lib.get_queue()] == [q1, q3, q2]
-    lib.move_down(q1)                                         # q1 swaps below q3
-    assert [c.id for c in lib.get_queue()] == [q3, q1, q2]
-    lib.move_up(q3)                                           # already top — no change
-    assert [c.id for c in lib.get_queue()] == [q3, q1, q2]
-    lib.reorder_queue(q2, q3)                                 # drag q2 before q3 → q2, q3, q1
-    assert [c.id for c in lib.get_queue()] == [q2, q3, q1]
-    lib.remove_from_queue(q1)                                 # positions stay contiguous
-    assert [c.id for c in lib.get_queue()] == [q2, q3]
-    assert lib.is_in_queue(q1) is False
-    qpos = lib._conn.execute(
-        "SELECT position FROM reading_queue ORDER BY position"
-    ).fetchall()
-    assert [r["position"] for r in qpos] == [0, 1]
-    lib.set_hidden(q2, True)                                  # hidden comics drop out of the queue view
-    assert [c.id for c in lib.get_queue()] == [q3]
-    lib.set_hidden(q2, False)
 
     lib.delete_annotation(note_id)
     assert lib.get_annotation_for_page(id1, 4) is None
