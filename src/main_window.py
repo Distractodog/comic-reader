@@ -744,7 +744,7 @@ class _Sidebar(QWidget):
 
         # Smoothly slide the panel open/closed instead of snapping.
         self._panel_anim = QVariantAnimation(self)
-        self._panel_anim.setDuration(190)
+        self._panel_anim.setDuration(150)
         self._panel_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._panel_anim.valueChanged.connect(self._on_panel_anim)
 
@@ -774,7 +774,7 @@ class _Sidebar(QWidget):
         self._panel.setObjectName("SidebarPanel")
         self._panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         panel_layout = QVBoxLayout(self._panel)
-        panel_layout.setContentsMargins(0, 0, 0, 8)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
         panel_layout.setSpacing(0)
 
         self._btn_home = self._make_item("", "Library", kind="home")
@@ -812,6 +812,11 @@ class _Sidebar(QWidget):
             panel_layout.addWidget(self._btn_menu)
 
         # Settings sits at the very bottom of the panel.
+        self._settings_separator = QFrame()
+        self._settings_separator.setFrameShape(QFrame.Shape.HLine)
+        self._settings_separator.setFixedHeight(1)
+        panel_layout.addWidget(self._settings_separator)
+
         self._btn_settings = self._make_item("", "Settings", kind="settings")
         self._btn_settings.clicked.connect(self._on_settings)
         panel_layout.addWidget(self._btn_settings)
@@ -863,6 +868,7 @@ class _Sidebar(QWidget):
         if self._panel_w == target:
             self._relayout()
             return
+        self._panel_anim.setDuration(95 if target == self.COLLAPSED_W else 150)
         self._panel_anim.setStartValue(self._panel_w)
         self._panel_anim.setEndValue(target)
         self._panel_anim.start()
@@ -884,6 +890,17 @@ class _Sidebar(QWidget):
         self._search_input.setVisible(self._search_active and want)
         self._animate_panel_to(self.EXPANDED_W if want else self.COLLAPSED_W)
         self.expanded_changed.emit()
+
+    def collapse(self) -> None:
+        """Close the expanded sidebar/search panel."""
+        if self._search_active:
+            self._close_search_input()
+            return
+        if self._expanded:
+            self.set_expanded(False)
+
+    def is_open(self) -> bool:
+        return self._expanded or self._search_active
 
     # ----- slots -----
 
@@ -947,6 +964,9 @@ class _Sidebar(QWidget):
         self.setStyleSheet("background: transparent;")
         self._top_box.setStyleSheet("#SidebarTop { background: transparent; }")
         self._panel.setStyleSheet(f"#SidebarPanel {{ background: {c['sidebar_bg']}; }}")
+        self._settings_separator.setStyleSheet(
+            "background: #4a4a4a; border: none;"
+        )
         expanded = self._expanded or self._search_active
         # Icons keep their full collapsed size whether or not the rail is expanded;
         # only the panel labels appear (top group never gets a label).
@@ -1418,6 +1438,8 @@ class MainWindow(QMainWindow):
         self._set_gutter(False)
 
     def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Type.MouseButtonPress:
+            self._collapse_sidebar_if_click_outside(event)
         if obj is getattr(self, "_sidebar_host", None) and event.type() == QEvent.Type.Resize:
             self._position_sidebar_overlay()
             self._position_footer_thumbs()
@@ -1465,6 +1487,19 @@ class MainWindow(QMainWindow):
                 else:
                     self._last_right_key_ms = None
         return super().eventFilter(obj, event)
+
+    def _collapse_sidebar_if_click_outside(self, event) -> None:
+        sidebar = getattr(self, "_sidebar", None)
+        if sidebar is None or not sidebar.isVisible() or not sidebar.is_open():
+            return
+        try:
+            global_pos = event.globalPosition().toPoint()
+        except AttributeError:
+            global_pos = event.globalPos()
+        local_pos = sidebar.mapFromGlobal(global_pos)
+        if sidebar.visibleRegion().contains(local_pos):
+            return
+        sidebar.collapse()
 
     def _build_menus(self):
         kb = self._kb
