@@ -56,7 +56,16 @@ from PyQt6.QtWidgets import (
 
 from batch_tools import BatchPlan, BatchWorker, plan_convert_to_cbz, plan_rename_from_metadata
 from app_info import app_settings
-from library import BookmarkEntry, Comic, Folder, Library, ReadingSettings, Shelf, apply_custom_display_order
+from library import (
+    BookmarkEntry,
+    Comic,
+    DisplayOrder,
+    Folder,
+    Library,
+    ReadingSettings,
+    Shelf,
+    apply_custom_display_order_items,
+)
 import themes
 
 
@@ -95,9 +104,114 @@ _HOVER_OUTLINE = QColor("#8b2a2a")
 _PROGRESS_TRACK = QColor("#c4aeae")
 _PROGRESS_FILL = QColor("#8b2a2a")
 _PLACEHOLDER_FG = QColor("#b0a0a0")
-_DRAG_THRESHOLD = 12
+_REORDER_HINT = QColor("#ababab")
+_REORDER_REFLOW_MS = 220
+_DRAG_THRESHOLD = 8
 _COMIC_FILE_MIME = "application/x-comic-reader-file-id"  # dragging a loose comic onto a shelf
-_COMIC_REORDER_MIME = "application/x-comic-reader-reorder-id"
+_GRID_REORDER_MIME = "application/x-comic-reader-reorder-key"
+
+
+def _grid_reorder_mime_key(event) -> str | None:
+    if not event.mimeData().hasFormat(_GRID_REORDER_MIME):
+        return None
+    try:
+        return bytes(event.mimeData().data(_GRID_REORDER_MIME)).decode()
+    except (TypeError, ValueError):
+        return None
+
+
+def _grid_item_key(item) -> str:
+    if isinstance(item, Comic):
+        return f"comic:{item.id}"
+    if isinstance(item, Shelf):
+        return f"shelf:{item.id}"
+    if isinstance(item, Folder):
+        return f"folder:{item.path}"
+    if isinstance(item, BookmarkEntry):
+        return f"bookmark:{item.id}"
+    raise TypeError(f"Unsupported grid item: {type(item)!r}")
+
+
+def _grid_item_label(item) -> str:
+    if isinstance(item, Comic):
+        return item.title or Path(item.file_path).stem
+    if isinstance(item, Shelf):
+        return item.name or ""
+    if isinstance(item, Folder):
+        return item.name or ""
+    if isinstance(item, BookmarkEntry):
+        return item.title or Path(item.file_path).stem
+    return ""
+
+
+def _reorder_insert_after(event, tile_width: int) -> bool:
+    """True when the cursor is in the right zone — edge bands reduce flip-flop."""
+    x = event.position().x()
+    edge = tile_width * 0.36
+    if x <= edge:
+        return False
+    if x >= tile_width - edge:
+        return True
+    return x >= tile_width * 0.5
+
+
+def _set_reorder_drop_hint(tile: QWidget, side: str | None) -> None:
+    if getattr(tile, "_reorder_drop_hint", None) != side:
+        tile._reorder_drop_hint = side
+        tile.update()
+
+
+def _paint_reorder_drop_hint(painter: QPainter, tile_w: int, tile_h: int, side: str | None) -> None:
+    if side not in ("left", "right"):
+        return
+    pen = QPen(_REORDER_HINT, 3)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(pen)
+    x = 3 if side == "left" else tile_w - 4
+    painter.drawLine(x, 8, x, tile_h - 8)
+
+
+def _make_reorder_ghost(source: QPixmap, scale: float = 0.94) -> QPixmap:
+    """Semi-transparent drag image — slightly smaller than the source tile."""
+    if source.isNull():
+        return source
+    w = max(1, int(source.width() * scale))
+    h = max(1, int(source.height() * scale))
+    scaled = source.scaled(
+        w, h,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    ghost = QPixmap(scaled.size())
+    ghost.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(ghost)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    painter.setOpacity(0.88)
+    painter.drawPixmap(0, 0, scaled)
+    painter.end()
+    return ghost
+
+
+def _start_grid_reorder_drag(tile: QWidget, reorder_key: str) -> None:
+    """Begin a reorder drag with a soft ghost and dimmed source tile."""
+    tile._drag_started = True
+    opacity = QGraphicsOpacityEffect(tile)
+    opacity.setOpacity(0.5)
+    tile.setGraphicsEffect(opacity)
+    drag = QDrag(tile)
+    mime = QMimeData()
+    mime.setData(_GRID_REORDER_MIME, reorder_key.encode())
+    drag.setMimeData(mime)
+    ghost = _make_reorder_ghost(tile.grab())
+    if not ghost.isNull():
+        drag.setPixmap(ghost)
+        drag.setHotSpot(QPoint(ghost.width() // 2, ghost.height() // 2))
+    try:
+        drag.exec(Qt.DropAction.MoveAction)
+    finally:
+        tile.setGraphicsEffect(None)
+        tile._drag_started = False
+        tile._press_pos = None
 
 # Per-view bookshelf backgrounds — stored as one JSON map (paths must not be QSettings keys).
 _BG_MAP_KEY = "bookshelf/background_map"
@@ -301,13 +415,23 @@ class _Tile(QWidget):
 class FolderTile(_Tile):
     menu_requested = pyqtSignal(str, int, int)  # folder_path, global_x, global_y
     folder_select_toggled = pyqtSignal(str)     # folder_path
+    reorder_requested = pyqtSignal(str, str, bool)    # dragged_key, target_key, insert_after
 
     def __init__(self, folder: Folder, selected: bool = False, parent=None):
         super().__init__(folder.name, parent)
         self._folder = folder
         self.cover_path = folder.cover_path
         self._selection_mode = False
+        self._reorder_enabled = False
+        self._reorder_key = f"folder:{folder.path}"
+        self._reorder_drop_hint: str | None = None
+        self._press_pos: QPoint | None = None
+        self._drag_started = False
         self.set_selected(selected)
+
+    def set_reorder_enabled(self, enabled: bool) -> None:
+        self._reorder_enabled = enabled
+        self.setAcceptDrops(enabled)
 
     def set_selection_mode(self, enabled: bool) -> None:
         self._selection_mode = enabled
@@ -321,6 +445,7 @@ class FolderTile(_Tile):
         status_y = self._draw_title(painter, self._folder.name)
         n = self._folder.comic_count
         self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}", status_y)
+        _paint_reorder_drop_hint(painter, TILE_W, self._tile_h, self._reorder_drop_hint)
         self._draw_hover_outline(painter)
 
     def contextMenuEvent(self, event):
@@ -336,7 +461,61 @@ class FolderTile(_Tile):
             ):
                 self.folder_select_toggled.emit(self._folder.path)
                 return
+            if self._reorder_enabled:
+                self._press_pos = event.position().toPoint()
+                self._drag_started = False
+                return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._reorder_enabled
+            and self._press_pos is not None
+            and not self._drag_started
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            delta = event.position().toPoint() - self._press_pos
+            if delta.manhattanLength() >= _DRAG_THRESHOLD:
+                self._start_reorder_drag()
+                return
+        if not self._reorder_enabled:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._press_pos is not None:
+            if not self._drag_started:
+                self._on_click()
+            self._press_pos = None
+            self._drag_started = False
+            return
+        super().mouseReleaseEvent(event)
+
+    def _start_reorder_drag(self) -> None:
+        _start_grid_reorder_drag(self, self._reorder_key)
+
+    def dragEnterEvent(self, event):
+        key = _grid_reorder_mime_key(event)
+        if key is not None and key != self._reorder_key:
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        key = _grid_reorder_mime_key(event)
+        if key is not None and key != self._reorder_key:
+            side = "right" if _reorder_insert_after(event, self.width()) else "left"
+            _set_reorder_drop_hint(self, side)
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        _set_reorder_drop_hint(self, None)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        key = _grid_reorder_mime_key(event)
+        if key is not None and key != self._reorder_key:
+            insert_after = _reorder_insert_after(event, self.width())
+            _set_reorder_drop_hint(self, None)
+            self.reorder_requested.emit(key, self._reorder_key, insert_after)
+            event.acceptProposedAction()
 
     def _on_click(self):
         self.opened.emit(self._folder.path)
@@ -345,7 +524,7 @@ class FolderTile(_Tile):
 class ComicTile(_Tile):
     shelf_action_requested = pyqtSignal(int, int, int)  # comic_id, global_x, global_y
     select_toggled = pyqtSignal(int)                    # comic_id
-    reorder_requested = pyqtSignal(int, int)          # dragged_id, target_id
+    reorder_requested = pyqtSignal(str, str, bool)      # dragged_key, target_key, insert_after
 
     def __init__(self, comic: Comic, selected: bool = False, parent=None):
         title = comic.title or Path(comic.file_path).stem
@@ -355,6 +534,8 @@ class ComicTile(_Tile):
         self.cover_path = comic.cover_path
         self._file_drag_enabled = False
         self._reorder_enabled = False
+        self._reorder_key = f"comic:{comic.id}"
+        self._reorder_drop_hint: str | None = None
         self._selection_mode = False
         self._press_pos: QPoint | None = None
         self._drag_started = False
@@ -433,44 +614,30 @@ class ComicTile(_Tile):
         drag.exec(Qt.DropAction.MoveAction)
 
     def _start_reorder_drag(self) -> None:
-        self._drag_started = True
-        drag = QDrag(self)
-        mime = QMimeData()
-        mime.setData(_COMIC_REORDER_MIME, str(self._comic.id).encode())
-        drag.setMimeData(mime)
-        if self._pixmap and not self._pixmap.isNull():
-            thumb = self._pixmap.scaled(
-                100, 150,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            drag.setPixmap(thumb)
-            drag.setHotSpot(QPoint(thumb.width() // 2, thumb.height() // 2))
-        drag.exec(Qt.DropAction.MoveAction)
-
-    @staticmethod
-    def _reorder_mime_id(event) -> int | None:
-        if not event.mimeData().hasFormat(_COMIC_REORDER_MIME):
-            return None
-        try:
-            return int(bytes(event.mimeData().data(_COMIC_REORDER_MIME)).decode())
-        except (TypeError, ValueError):
-            return None
+        _start_grid_reorder_drag(self, self._reorder_key)
 
     def dragEnterEvent(self, event):
-        cid = self._reorder_mime_id(event)
-        if cid is not None and cid != self._comic.id:
+        key = _grid_reorder_mime_key(event)
+        if key is not None and key != self._reorder_key:
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
-        cid = self._reorder_mime_id(event)
-        if cid is not None and cid != self._comic.id:
+        key = _grid_reorder_mime_key(event)
+        if key is not None and key != self._reorder_key:
+            side = "right" if _reorder_insert_after(event, self.width()) else "left"
+            _set_reorder_drop_hint(self, side)
             event.acceptProposedAction()
 
+    def dragLeaveEvent(self, event):
+        _set_reorder_drop_hint(self, None)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event):
-        cid = self._reorder_mime_id(event)
-        if cid is not None and cid != self._comic.id:
-            self.reorder_requested.emit(cid, self._comic.id)
+        key = _grid_reorder_mime_key(event)
+        if key is not None and key != self._reorder_key:
+            insert_after = _reorder_insert_after(event, self.width())
+            _set_reorder_drop_hint(self, None)
+            self.reorder_requested.emit(key, self._reorder_key, insert_after)
             event.acceptProposedAction()
 
     @staticmethod
@@ -491,6 +658,7 @@ class ComicTile(_Tile):
         title = self._comic.title or Path(self._comic.file_path).stem
         status_y = self._draw_title(painter, title)
         self._draw_status(painter, self._status_text(), status_y)
+        _paint_reorder_drop_hint(painter, TILE_W, self._tile_h, self._reorder_drop_hint)
         self._draw_hover_outline(painter)
 
     def _status_text(self) -> str:
@@ -609,6 +777,8 @@ class ShelfTile(_Tile):
     shelf_opened = pyqtSignal(int, str)             # shelf_id, shelf_name
     menu_requested = pyqtSignal(int, int, int)      # shelf_id, global_x, global_y
     shelf_select_toggled = pyqtSignal(int)        # shelf_id
+    reorder_requested = pyqtSignal(str, str, bool)  # dragged_key, target_key, insert_after
+    file_comic_requested = pyqtSignal(int, int)  # comic_id, shelf_id
 
     def __init__(
         self,
@@ -623,9 +793,21 @@ class ShelfTile(_Tile):
         self.cover_path = cover_path
         self._comic_count = comic_count
         self._selection_mode = False
+        self._reorder_enabled = False
+        self._file_drop_enabled = True
+        self._reorder_key = f"shelf:{shelf.id}"
+        self._reorder_drop_hint: str | None = None
+        self._press_pos: QPoint | None = None
+        self._drag_started = False
         self.set_selected(selected)
         self.setAcceptDrops(True)
         self._drop_highlight = False
+
+    def set_reorder_enabled(self, enabled: bool) -> None:
+        self._reorder_enabled = enabled
+
+    def set_file_drop_enabled(self, enabled: bool) -> None:
+        self._file_drop_enabled = enabled
 
     def set_selection_mode(self, enabled: bool) -> None:
         self._selection_mode = enabled
@@ -645,6 +827,7 @@ class ShelfTile(_Tile):
         status_y = self._draw_title(painter, self._shelf.name)
         n = self._comic_count
         self._draw_status(painter, f"{n} comic{'s' if n != 1 else ''}", status_y)
+        _paint_reorder_drop_hint(painter, TILE_W, self._tile_h, self._reorder_drop_hint)
         self._draw_hover_outline(painter)
 
     def contextMenuEvent(self, event):
@@ -660,7 +843,37 @@ class ShelfTile(_Tile):
             ):
                 self.shelf_select_toggled.emit(self._shelf.id)
                 return
+            if self._reorder_enabled:
+                self._press_pos = event.position().toPoint()
+                self._drag_started = False
+                return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._reorder_enabled
+            and self._press_pos is not None
+            and not self._drag_started
+            and event.buttons() & Qt.MouseButton.LeftButton
+        ):
+            delta = event.position().toPoint() - self._press_pos
+            if delta.manhattanLength() >= _DRAG_THRESHOLD:
+                self._start_reorder_drag()
+                return
+        if not self._reorder_enabled:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._press_pos is not None:
+            if not self._drag_started:
+                self._on_click()
+            self._press_pos = None
+            self._drag_started = False
+            return
+        super().mouseReleaseEvent(event)
+
+    def _start_reorder_drag(self) -> None:
+        _start_grid_reorder_drag(self, self._reorder_key)
 
     # --- accept a loose comic dropped onto the shelf to file it there ---
     def _dropped_comic_id(self, event) -> int | None:
@@ -672,29 +885,46 @@ class ShelfTile(_Tile):
             return None
 
     def dragEnterEvent(self, event):
-        if self._dropped_comic_id(event) is not None:
+        if _grid_reorder_mime_key(event) is not None:
+            event.acceptProposedAction()
+            return
+        if self._file_drop_enabled and self._dropped_comic_id(event) is not None:
             event.acceptProposedAction()
             self._drop_highlight = True
             self.update()
 
     def dragMoveEvent(self, event):
-        if self._dropped_comic_id(event) is not None:
+        reorder_key = _grid_reorder_mime_key(event)
+        if reorder_key is not None:
+            if reorder_key != self._reorder_key:
+                side = "right" if _reorder_insert_after(event, self.width()) else "left"
+                _set_reorder_drop_hint(self, side)
+            event.acceptProposedAction()
+            return
+        if self._file_drop_enabled and self._dropped_comic_id(event) is not None:
             event.acceptProposedAction()
 
     def dragLeaveEvent(self, event):
+        _set_reorder_drop_hint(self, None)
         if self._drop_highlight:
             self._drop_highlight = False
             self.update()
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
+        reorder_key = _grid_reorder_mime_key(event)
+        if reorder_key is not None and reorder_key != self._reorder_key:
+            insert_after = _reorder_insert_after(event, self.width())
+            _set_reorder_drop_hint(self, None)
+            self.reorder_requested.emit(reorder_key, self._reorder_key, insert_after)
+            event.acceptProposedAction()
+            return
         cid = self._dropped_comic_id(event)
         self._drop_highlight = False
         self.update()
-        if cid is not None:
+        if cid is not None and self._file_drop_enabled:
             self.file_comic_requested.emit(cid, self._shelf.id)
             event.acceptProposedAction()
-
-    file_comic_requested = pyqtSignal(int, int)  # comic_id, shelf_id
 
     def _on_click(self):
         self.shelf_opened.emit(self._shelf.id, self._shelf.name)
@@ -946,11 +1176,8 @@ class _HeaderBar(QWidget):
     batch_unfavorite_requested = pyqtSignal()
 
     _SORT_OPTIONS = [
-        ("Title A–Z",      "title",      "asc"),
-        ("Title Z–A",      "title",      "desc"),
-        ("Recently Added", "date_added", "desc"),
-        ("Last Read",      "last_read",  "desc"),
-        ("Custom order",   "custom",     "asc"),
+        ("Title A–Z", "title", "asc"),
+        ("Title Z–A", "title", "desc"),
     ]
 
     _FILTER_OPTIONS = [
@@ -995,6 +1222,9 @@ class _HeaderBar(QWidget):
         layout.addStretch()
 
         self._sort_idx = 0
+        self._custom_sort_active = False
+        self._custom_sort_label = "Custom order"
+        self._custom_sort_menu_builder = None  # callable(menu) populated by BookshelfView
         self._sort_btn = QPushButton(self._SORT_OPTIONS[0][0] + "  ▾")
         self._sort_btn.setFlat(True)
         self._sort_btn.clicked.connect(self._show_sort_menu)
@@ -1076,24 +1306,43 @@ class _HeaderBar(QWidget):
         pos = self._fav_btn.mapToGlobal(QPoint(0, self._fav_btn.height()))
         menu.exec(pos)
 
+    def set_custom_sort_menu_builder(self, builder) -> None:
+        """BookshelfView supplies the Custom order submenu contents."""
+        self._custom_sort_menu_builder = builder
+
+    def set_custom_sort_label(self, label: str, active: bool) -> None:
+        """Update the sort button when a custom order preset is active."""
+        self._custom_sort_active = active
+        self._custom_sort_label = label
+        if active:
+            self._sort_btn.setText(label + "  ▾")
+        elif self._sort_idx < len(self._SORT_OPTIONS):
+            self._sort_btn.setText(self._SORT_OPTIONS[self._sort_idx][0] + "  ▾")
+
     def _show_sort_menu(self):
         menu = themes.make_menu(self)
         for idx, (label, _, _) in enumerate(self._SORT_OPTIONS):
             action = QAction(label, menu)
             action.setCheckable(True)
-            action.setChecked(idx == self._sort_idx)
+            action.setChecked(not self._custom_sort_active and idx == self._sort_idx)
             action.triggered.connect(lambda checked, i=idx: self._select_sort(i))
             menu.addAction(action)
+        if self._custom_sort_menu_builder is not None:
+            menu.addSeparator()
+            custom_menu = menu.addMenu("Custom order")
+            self._custom_sort_menu_builder(custom_menu)
         pos = self._sort_btn.mapToGlobal(QPoint(0, self._sort_btn.height()))
         menu.exec(pos)
 
     def _select_sort(self, idx: int):
+        self._custom_sort_active = False
         self._sort_idx = idx
         label, sort_by, order = self._SORT_OPTIONS[idx]
         self._sort_btn.setText(label + "  ▾")
         self.sort_changed.emit(sort_by, order)
 
     def set_sort_index(self, idx: int):
+        self._custom_sort_active = False
         self._sort_idx = idx
         self._sort_btn.setText(self._SORT_OPTIONS[idx][0] + "  ▾")
 
@@ -1146,8 +1395,6 @@ class _HeaderBar(QWidget):
         self._back_btn.show()
 
     def _apply_btn_styles(self, c: dict) -> None:
-        text = c.get("text", "#2a1818")
-        text_sec = c.get("text_secondary", "#7a5858")
         flat_css = (
             "QPushButton { color: rgba(255,255,255,180); border: none; font-size: 18px;"
             " font-family: 'Libre Baskerville'; font-weight: 600; background: transparent;"
@@ -1170,9 +1417,9 @@ class _HeaderBar(QWidget):
             " padding-right: 4px;"
         )
         self._options_btn.setStyleSheet(
-            f"QPushButton {{ color: {text_sec}; border: none; font-size: 20px;"
-            f" font-family: 'Libre Baskerville'; background: transparent; }}"
-            f"QPushButton:hover {{ color: {text}; }}"
+            "QPushButton { color: rgba(255,255,255,180); border: none; font-size: 20px;"
+            " font-family: 'Libre Baskerville'; background: transparent; }"
+            "QPushButton:hover { color: #ffffff; }"
         )
         self._back_btn.set_colors("#ffffff", "#ffffff")
 
@@ -1217,9 +1464,11 @@ class BookshelfView(QWidget):
         self._folder_tiles: dict[str, FolderTile] = {}
         self._shelf_tiles: dict[int, ShelfTile] = {}
         self._folder_comic_ids: list[int] = []
+        self._grid_item_keys: list[str] = []
 
         # Async cover loading — tiles render placeholders, covers fill in off-thread.
         self._ordered_tiles: list[_Tile] = []
+        self._reflow_anims: list[QPropertyAnimation] = []
         self._cover_loader: _CoverLoader | None = None
         self._cover_gen: int = 0
         self._batch_thread: QThread | None = None
@@ -1228,6 +1477,11 @@ class BookshelfView(QWidget):
 
         self._sort_by = "title"
         self._sort_order = "asc"
+        self._active_display_order_id: int | None = None
+        self._order_editing = False
+        self._edit_order_id: int | None = None
+        self._draft_order_keys: list[str] | None = None
+        self._last_order_scope: str | None = None
         self._search_query = ""
         self._in_search = False
         self._pre_search_folder: str | None = None
@@ -1260,6 +1514,7 @@ class BookshelfView(QWidget):
         self._header.batch_untag_requested.connect(self._batch_remove_tags)
         self._header.batch_favorite_requested.connect(self._batch_add_favorites)
         self._header.batch_unfavorite_requested.connect(self._batch_remove_favorites)
+        self._header.set_custom_sort_menu_builder(self._populate_custom_sort_menu)
         self._header.customContextMenuRequested.connect(self._on_header_folder_menu)
         chrome_layout.addWidget(self._header)
         root.addWidget(self._header_chrome)
@@ -1279,6 +1534,7 @@ class BookshelfView(QWidget):
         # Re-fit the background whenever the viewport resizes — this also catches
         # the scrollbar appearing/disappearing, which doesn't resize the view itself.
         self._scroll.viewport().installEventFilter(self)
+        self._scroll.viewport().setAcceptDrops(True)
         root.addWidget(self._scroll)
 
         # Fixed background image — content area only (never under the header row).
@@ -1384,9 +1640,14 @@ class BookshelfView(QWidget):
         self._show_comics(folder_path)
 
     def _on_sort_changed(self, sort_by: str, order: str):
+        if self._order_editing and sort_by != "custom":
+            self._cancel_order_edit(silent=True, repopulate=False)
         self._sort_by = sort_by
         self._sort_order = order
+        if sort_by != "custom":
+            self._active_display_order_id = None
         self._persist_sort()
+        self._sync_custom_sort_header()
         self._nav_transition(self._repopulate)
 
     def _on_filter_changed(self, key: str):
@@ -1459,6 +1720,12 @@ class BookshelfView(QWidget):
         self.shelf_changed.emit()
 
     def _on_shelf_context_menu(self, shelf_id: int, gx: int, gy: int) -> None:
+        if (
+            self._selection_mode
+            and shelf_id in self._selected_shelf_ids
+        ):
+            self._show_multi_shelf_series_menu(list(self._selected_shelf_ids), gx, gy)
+            return
         shelf = next((s for s in self._library.get_shelves() if s.id == shelf_id), None)
         if shelf is None:
             return
@@ -1587,12 +1854,217 @@ class BookshelfView(QWidget):
         return f"folder_sort/{folder_path}"
 
     _GLOBAL_SORT_KEY = "sort/last"
+    _ACTIVE_ORDER_KEY_PREFIX = "display_order/active/"
 
-    def _restore_folder_sort(self, folder_path: str) -> None:
-        """Apply this folder's saved sort, else the last sort chosen anywhere."""
+    def _active_order_settings_key(self, scope: str) -> str:
+        return f"{self._ACTIVE_ORDER_KEY_PREFIX}{scope}"
+
+    def _load_active_display_order_id(self, scope: str) -> int | None:
+        val = app_settings().value(self._active_order_settings_key(scope))
+        if val is None or val == "":
+            return None
+        try:
+            order_id = int(val)
+        except (TypeError, ValueError):
+            return None
+        order = self._library.get_display_order(order_id)
+        if order is None or order.scope_key != scope:
+            return None
+        return order_id
+
+    def _save_active_display_order_id(self, scope: str, order_id: int | None) -> None:
+        key = self._active_order_settings_key(scope)
+        if order_id is None:
+            app_settings().remove(key)
+        else:
+            app_settings().setValue(key, order_id)
+
+    def _resolve_active_display_order(self) -> DisplayOrder | None:
+        scope = self._display_order_scope()
+        if not scope:
+            return None
+        if self._active_display_order_id is not None:
+            order = self._library.get_display_order(self._active_display_order_id)
+            if order is not None and order.scope_key == scope:
+                return order
+        stored_id = self._load_active_display_order_id(scope)
+        if stored_id is not None:
+            order = self._library.get_display_order(stored_id)
+            if order is not None:
+                self._active_display_order_id = order.id
+                return order
+        return None
+
+    def _is_editing_order(self) -> bool:
+        return self._order_editing
+
+    def _sync_custom_sort_header(self) -> None:
+        if self._order_editing:
+            if self._edit_order_id is not None:
+                order = self._library.get_display_order(self._edit_order_id)
+                name = order.name if order else "Order"
+                label = f"Editing: {name}"
+            else:
+                label = "Creating order…"
+            self._header.set_custom_sort_label(label, active=True)
+            return
+        if self._sort_by != "custom":
+            self._header.set_custom_sort_label("", active=False)
+            return
+        order = self._resolve_active_display_order()
+        if order is None:
+            self._header.set_custom_sort_label("Custom order", active=True)
+            return
+        self._header.set_custom_sort_label(order.name, active=True)
+
+    def _populate_custom_sort_menu(self, menu) -> None:
+        scope = self._display_order_scope()
+        applied = self._resolve_active_display_order()
+        applied_id = applied.id if applied else None
+        orders = self._library.get_display_orders(scope)
+
+        use_menu = menu.addMenu("Use order")
+        if orders:
+            for order in orders:
+                action = QAction(order.name, use_menu)
+                action.setCheckable(True)
+                action.setChecked(
+                    not self._order_editing
+                    and self._sort_by == "custom"
+                    and applied_id == order.id
+                )
+                action.triggered.connect(
+                    lambda checked, oid=order.id: self._use_display_order(oid)
+                )
+                use_menu.addAction(action)
+        else:
+            empty = use_menu.addAction("No saved orders")
+            empty.setEnabled(False)
+
+        menu.addAction("Create order…").triggered.connect(self._start_create_order)
+
+        edit_menu = menu.addMenu("Edit order")
+        if orders:
+            for order in orders:
+                edit_menu.addAction(order.name).triggered.connect(
+                    lambda checked, oid=order.id: self._start_edit_order(oid)
+                )
+        else:
+            empty = edit_menu.addAction("No saved orders")
+            empty.setEnabled(False)
+
+        if self._order_editing:
+            menu.addSeparator()
+            menu.addAction("Save order").triggered.connect(self._save_order_edit)
+            menu.addAction("Cancel editing").triggered.connect(
+                lambda: self._cancel_order_edit()
+            )
+
+    def _use_display_order(self, order_id: int) -> None:
+        if self._order_editing:
+            self._cancel_order_edit(silent=True, repopulate=False)
+        scope = self._display_order_scope()
+        order = self._library.get_display_order(order_id)
+        if order is None or order.scope_key != scope:
+            return
+        self._active_display_order_id = order_id
+        self._save_active_display_order_id(scope, order_id)
+        self._apply_sort("custom", "asc")
+        self._persist_sort()
+        self._sync_custom_sort_header()
+        self._nav_transition(self._repopulate)
+
+    def _start_create_order(self) -> None:
+        if self._order_editing:
+            self._cancel_order_edit(silent=True, repopulate=False)
+        keys = list(self._grid_item_keys)
+        if not keys:
+            keys = self._current_view_item_keys()
+        self._order_editing = True
+        self._edit_order_id = None
+        self._draft_order_keys = keys
+        self._apply_sort("custom", "asc")
+        self._sync_custom_sort_header()
+        self._nav_transition(self._repopulate)
+
+    def _start_edit_order(self, order_id: int) -> None:
+        scope = self._display_order_scope()
+        order = self._library.get_display_order(order_id)
+        if order is None or order.scope_key != scope:
+            return
+        if self._order_editing:
+            self._cancel_order_edit(silent=True, repopulate=False)
+        keys = self._library.get_display_order_keys(order_id)
+        if not keys:
+            keys = self._current_view_item_keys()
+        self._order_editing = True
+        self._edit_order_id = order_id
+        self._draft_order_keys = keys
+        self._apply_sort("custom", "asc")
+        self._sync_custom_sort_header()
+        self._nav_transition(self._repopulate)
+
+    def _save_order_edit(self) -> None:
+        if not self._order_editing or not self._draft_order_keys:
+            return
+        scope = self._display_order_scope()
+        if self._edit_order_id is None:
+            name, ok = QInputDialog.getText(
+                self,
+                "Save Order",
+                "Name for this order:",
+                QLineEdit.EchoMode.Normal,
+                "",
+            )
+            if not ok or not name.strip():
+                return
+            try:
+                order = self._library.create_display_order(
+                    scope, name.strip(), self._draft_order_keys
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "Save Order", str(exc))
+                return
+        else:
+            try:
+                self._library.set_display_order_keys(
+                    self._edit_order_id, self._draft_order_keys
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "Save Order", str(exc))
+                return
+            order = self._library.get_display_order(self._edit_order_id)
+            if order is None:
+                self._cancel_order_edit(silent=True)
+                return
+        self._order_editing = False
+        self._edit_order_id = None
+        self._draft_order_keys = None
+        self._use_display_order(order.id)
+        self.window().statusBar().showMessage(
+            f"Saved order “{order.name}”",
+            3500,
+        )
+
+    def _cancel_order_edit(self, silent: bool = False, repopulate: bool = True) -> None:
+        if not self._order_editing:
+            return
+        self._order_editing = False
+        self._edit_order_id = None
+        self._draft_order_keys = None
+        self._sync_custom_sort_header()
+        if repopulate:
+            self._nav_transition(self._repopulate)
+        if not silent:
+            self.window().statusBar().showMessage("Cancelled editing", 2500)
+
+    def _view_sort_settings_key(self) -> str:
+        return f"sort/{self._display_order_scope()}"
+
+    def _restore_view_sort(self) -> None:
+        """Apply this view's saved sort, else folder/global fallbacks."""
         valid = {(key, ord_) for _, key, ord_ in self._header._SORT_OPTIONS}
-        # "Set chapter order" persists "chapter/asc" but it isn't a dropdown
-        # option — allow it through so the chapter order survives a reboot.
+        # "Set chapter order" / series linking persist chapter/asc — not a dropdown option.
         valid.add(("chapter", "asc"))
         valid.add(("custom", "asc"))
 
@@ -1605,9 +2077,27 @@ class BookshelfView(QWidget):
                 return True
             return False
 
-        if _try(app_settings().value(self._folder_sort_settings_key(folder_path))):
+        if _try(app_settings().value(self._view_sort_settings_key())):
+            self._restore_active_display_order()
             return
-        _try(app_settings().value(self._GLOBAL_SORT_KEY))
+        if self._current_folder:
+            if _try(app_settings().value(self._folder_sort_settings_key(self._current_folder))):
+                self._restore_active_display_order()
+                return
+        if _try(app_settings().value(self._GLOBAL_SORT_KEY)):
+            self._restore_active_display_order()
+            return
+        self._sync_custom_sort_header()
+
+    def _restore_active_display_order(self) -> None:
+        if self._sort_by == "custom":
+            scope = self._display_order_scope()
+            self._active_display_order_id = self._load_active_display_order_id(scope)
+        self._sync_custom_sort_header()
+
+    def _restore_folder_sort(self, folder_path: str) -> None:
+        """Legacy wrapper — folder drill-down restores sort for the current view."""
+        self._restore_view_sort()
 
     def _save_folder_sort(self, folder_path: str) -> None:
         app_settings().setValue(
@@ -1616,14 +2106,10 @@ class BookshelfView(QWidget):
         )
 
     def _persist_sort(self) -> None:
-        """Remember the chosen sort globally, and per-folder when inside one.
-
-        The global key is the fallback so the sort sticks across launches even
-        for folders/views that never had their own saved preference.
-        """
-        app_settings().setValue(
-            self._GLOBAL_SORT_KEY, f"{self._sort_by}/{self._sort_order}"
-        )
+        """Remember the chosen sort for this view, globally, and per-folder."""
+        val = f"{self._sort_by}/{self._sort_order}"
+        app_settings().setValue(self._view_sort_settings_key(), val)
+        app_settings().setValue(self._GLOBAL_SORT_KEY, val)
         if self._current_folder and not self._show_hidden_mode:
             self._save_folder_sort(self._current_folder)
 
@@ -1692,6 +2178,7 @@ class BookshelfView(QWidget):
             self._currently_reading_mode = False
             self._bookmarks_mode = False
             self._header.set_folder_mode()
+            self._restore_view_sort()
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(False)
@@ -1708,7 +2195,7 @@ class BookshelfView(QWidget):
             self._exit_selection_mode()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
-            self._restore_folder_sort(folder_path)
+            self._restore_view_sort()
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(True)
@@ -1725,6 +2212,7 @@ class BookshelfView(QWidget):
             self._currently_reading_mode = False
             self._bookmarks_mode = False
             self._header.set_shelf_mode(shelf_name)
+            self._restore_view_sort()
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(False)
@@ -1740,6 +2228,7 @@ class BookshelfView(QWidget):
             self._currently_reading_mode = False
             self._bookmarks_mode = False
             self._header.set_shelf_mode(self._current_shelf_name)
+            self._restore_view_sort()
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(False)
@@ -1755,7 +2244,7 @@ class BookshelfView(QWidget):
             self._exit_selection_mode()
             self._comic_tiles.clear()
             self._header.set_comic_mode(Path(folder_path).name)
-            self._restore_folder_sort(folder_path)
+            self._restore_view_sort()
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(True)
@@ -1773,6 +2262,7 @@ class BookshelfView(QWidget):
             self._exit_selection_mode()
             self._comic_tiles.clear()
             self._header.set_shelf_mode("Hidden")
+            self._restore_view_sort()
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(False)
@@ -1790,6 +2280,7 @@ class BookshelfView(QWidget):
             self._exit_selection_mode()
             self._comic_tiles.clear()
             self._header.set_shelf_mode("Currently Reading")
+            self._restore_view_sort()
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(False)
@@ -1807,6 +2298,7 @@ class BookshelfView(QWidget):
             self._exit_selection_mode()
             self._comic_tiles.clear()
             self._header.set_shelf_mode("Bookmarks")
+            self._restore_view_sort()
             self._last_n_cols = 0
             self._repopulate()
             self.folder_entered.emit(False)
@@ -1849,8 +2341,82 @@ class BookshelfView(QWidget):
             and not self._search_query
         )
 
-    def _is_comic_grid_view(self) -> bool:
-        return self._is_selectable_view() and self._current_folder is not None
+    def _can_reorder_grid(self) -> bool:
+        return (
+            not self._selection_mode
+            and self._order_editing
+            and not self._reflow_anims
+        )
+
+    def _display_order_scope(self) -> str:
+        if self._bookmarks_mode:
+            return "view:bookmarks"
+        if self._show_hidden_mode:
+            return "view:hidden"
+        if self._currently_reading_mode:
+            return "view:currently_reading"
+        if self._search_query:
+            return "view:search"
+        if self._current_shelf_id is not None and self._current_folder is not None:
+            return f"shelf:{self._current_shelf_id}/folder:{self._current_folder}"
+        if self._current_folder is not None:
+            return f"folder:{self._current_folder}"
+        if self._current_shelf_id is not None:
+            return f"shelf:{self._current_shelf_id}"
+        return "library:home"
+
+    def _apply_custom_sort_items(self, items: list) -> list:
+        if self._order_editing and self._draft_order_keys:
+            order_keys = self._draft_order_keys
+        elif self._sort_by != "custom":
+            return items
+        else:
+            order = self._resolve_active_display_order()
+            if order is None:
+                return items
+            order_keys = self._library.get_display_order_keys(order.id)
+        if not order_keys:
+            return items
+        return apply_custom_display_order_items(
+            items,
+            order_keys,
+            key_fn=_grid_item_key,
+            label_fn=_grid_item_label,
+        )
+
+    def _current_view_item_keys(self) -> list[str]:
+        """Fallback item keys for create-new-order when the grid hasn't populated yet."""
+        if self._show_hidden_mode:
+            comics = self._filter_comics(
+                self._library.get_hidden_comics(
+                    sort_by=self._sort_by, order=self._sort_order
+                )
+            )
+            return [_grid_item_key(c) for c in comics]
+        if self._currently_reading_mode:
+            comics = self._filter_comics(
+                self._library.get_currently_reading(
+                    sort_by=self._sort_by, order=self._sort_order
+                )
+            )
+            return [_grid_item_key(c) for c in comics]
+        if self._bookmarks_mode:
+            return [_grid_item_key(e) for e in self._library.get_all_bookmarks()]
+        if self._search_query:
+            folders, comics = self._library.search_library(
+                self._search_query, self._sort_by, self._sort_order
+            )
+            items = folders + self._filter_comics(comics)
+            return [_grid_item_key(i) for i in items]
+        if self._current_shelf_id is not None and self._current_folder is None:
+            folders = self._library.get_shelf_folders(self._current_shelf_id)
+            return [_grid_item_key(f) for f in folders]
+        if self._current_folder is not None:
+            items, _ = self._folder_grid_items()
+            return [_grid_item_key(c) for c in self._filter_comics(items)]
+        shelves = [s for s in self._library.get_shelves() if s.kind == "manual"]
+        folders = self._home_folder_items()
+        return [_grid_item_key(i) for i in shelves + folders]
 
     def _resolve_batch_comic_ids(self) -> list[int]:
         """Expand comic, folder, and bookshelf selections into comic ids."""
@@ -1896,22 +2462,6 @@ class BookshelfView(QWidget):
             )
         else:
             self._header.set_selection_mode(False)
-
-    def _display_order_scope(self) -> str | None:
-        if not self._current_folder:
-            return None
-        if self._current_shelf_id is not None:
-            return f"shelf:{self._current_shelf_id}/folder:{self._current_folder}"
-        return f"folder:{self._current_folder}"
-
-    def _apply_custom_sort(self, comics: list[Comic]) -> list[Comic]:
-        scope = self._display_order_scope()
-        if not scope:
-            return comics
-        order_ids = self._library.get_display_order_ids(scope)
-        if not order_ids:
-            return comics
-        return apply_custom_display_order(comics, order_ids)
 
     def _toggle_selection_mode(self):
         if self._selection_mode:
@@ -2029,21 +2579,188 @@ class BookshelfView(QWidget):
             4000,
         )
 
-    def _reorder_comics(self, dragged_id: int, target_id: int):
-        scope = self._display_order_scope()
-        if not scope:
+    def _reorder_grid_items(self, dragged_key: str, target_key: str, insert_after: bool):
+        keys = list(self._grid_item_keys)
+        if dragged_key not in keys or target_key not in keys:
             return
-        ids = list(self._folder_comic_ids)
-        if dragged_id not in ids or target_id not in ids:
+        from_idx = keys.index(dragged_key)
+        target_idx = keys.index(target_key)
+        insert_idx = target_idx + (1 if insert_after else 0)
+        keys.pop(from_idx)
+        if from_idx < insert_idx:
+            insert_idx -= 1
+        insert_idx = max(0, min(insert_idx, len(keys)))
+        keys.insert(insert_idx, dragged_key)
+        self._commit_grid_reorder(keys)
+
+    def _commit_grid_reorder(self, keys: list[str]) -> None:
+        if not self._order_editing:
             return
-        ids.remove(dragged_id)
-        target_idx = ids.index(target_id)
-        ids.insert(target_idx, dragged_id)
-        self._library.set_display_order(scope, ids)
-        self._folder_comic_ids = ids
-        self._apply_sort("custom", "asc")
-        self._persist_sort()
-        self._repopulate()
+        self._draft_order_keys = keys
+        self._grid_item_keys = keys
+        self._folder_comic_ids = [
+            int(k.split(":", 1)[1]) for k in keys if k.startswith("comic:")
+        ]
+        self._clear_reorder_drop_hints()
+        self._reflow_grid_tiles(keys)
+
+    def _clear_reorder_drop_hints(self) -> None:
+        for tile in self._ordered_tiles:
+            _set_reorder_drop_hint(tile, None)
+
+    def _tile_for_key(self, key: str) -> _Tile | None:
+        if key.startswith("comic:"):
+            try:
+                return self._comic_tiles.get(int(key.split(":", 1)[1]))
+            except ValueError:
+                return None
+        if key.startswith("shelf:"):
+            try:
+                return self._shelf_tiles.get(int(key.split(":", 1)[1]))
+            except ValueError:
+                return None
+        if key.startswith("folder:"):
+            return self._folder_tiles.get(key.split(":", 1)[1])
+        return None
+
+    def _cancel_reflow_anims(self) -> None:
+        for anim in self._reflow_anims:
+            anim.stop()
+        self._reflow_anims.clear()
+
+    def _detach_grid_tile(self, tile: QWidget) -> None:
+        parent = tile.parentWidget()
+        if parent is not None:
+            layout = parent.layout()
+            if layout is not None:
+                layout.removeWidget(tile)
+        tile.setParent(self._grid_widget)
+
+    def _layout_grid_rows(self, keys: list[str], tiles: list[_Tile]) -> None:
+        """Place tiles into row layouts (no animation)."""
+        n_cols = self._n_cols()
+        layout = self._grid_widget.layout()
+        if layout is None:
+            return
+
+        for tile in self._ordered_tiles:
+            tile.setParent(self._grid_widget)
+
+        while layout.count():
+            item = layout.takeAt(0)
+            row = item.widget()
+            if row is not None:
+                row.deleteLater()
+
+        self._ordered_tiles = tiles
+        row_layout: QHBoxLayout | None = None
+        for i, tile in enumerate(tiles):
+            if i % n_cols == 0:
+                if row_layout is not None:
+                    row_layout.addStretch()
+                row_widget = QWidget()
+                _transparent(row_widget)
+                row_layout = QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(0, 0, 0, TILE_SPACING)
+                row_layout.setSpacing(TILE_SPACING)
+                layout.addWidget(row_widget)
+            tile.show()
+            row_layout.addWidget(tile)
+        if row_layout is not None:
+            row_layout.addStretch()
+        layout.addStretch()
+
+    def _reflow_grid_tiles(self, keys: list[str]) -> None:
+        """Repack tiles into rows, sliding moved tiles into place."""
+        tiles = [t for k in keys if (t := self._tile_for_key(k)) is not None]
+        if not tiles:
+            return
+
+        old_positions = {
+            tile: tile.mapTo(self._grid_widget, QPoint(0, 0))
+            for tile in self._ordered_tiles
+        }
+        self._cancel_reflow_anims()
+        self._layout_grid_rows(keys, tiles)
+        self._grid_widget.layout().activate()
+
+        movers: list[tuple[_Tile, QPoint, QPoint]] = []
+        for tile in tiles:
+            new_p = tile.mapTo(self._grid_widget, QPoint(0, 0))
+            old_p = old_positions.get(tile)
+            if old_p is None:
+                continue
+            if (old_p - new_p).manhattanLength() < 4:
+                continue
+            movers.append((tile, old_p, new_p))
+
+        if not movers:
+            return
+
+        for tile, old_p, _ in movers:
+            self._detach_grid_tile(tile)
+            tile.move(old_p)
+            tile.raise_()
+
+        finished = [0]
+
+        def on_tile_done():
+            finished[0] += 1
+            if finished[0] >= len(movers):
+                self._reflow_anims.clear()
+                self._layout_grid_rows(keys, tiles)
+
+        for tile, old_p, new_p in movers:
+            anim = QPropertyAnimation(tile, b"pos", self)
+            anim.setStartValue(old_p)
+            anim.setEndValue(new_p)
+            anim.setDuration(_REORDER_REFLOW_MS)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            anim.finished.connect(on_tile_done)
+            self._reflow_anims.append(anim)
+            anim.start()
+
+    def _hit_test_reorder_insert(self, global_pos: QPoint) -> tuple[int, bool] | None:
+        """Map a screen position to (target_tile_index, insert_after)."""
+        if not self._ordered_tiles:
+            return None
+        pad_x = TILE_SPACING // 2 + 4
+        pad_y = TILE_SPACING // 2
+        for i, tile in enumerate(self._ordered_tiles):
+            top_left = tile.mapToGlobal(QPoint(0, 0))
+            gr = QRect(top_left, tile.size())
+            hit = gr.adjusted(-pad_x, -pad_y, pad_x, pad_y)
+            if not hit.contains(global_pos):
+                continue
+            mid_x = gr.center().x()
+            edge = gr.width() * 0.36
+            if global_pos.x() <= gr.left() + edge:
+                return i, False
+            if global_pos.x() >= gr.right() - edge:
+                return i, True
+            return i, global_pos.x() >= mid_x
+        last = self._ordered_tiles[-1]
+        last_rect = QRect(last.mapToGlobal(QPoint(0, 0)), last.size())
+        if global_pos.y() >= last_rect.top() - pad_y:
+            return len(self._ordered_tiles) - 1, True
+        return None
+
+    def _reorder_at_global_pos(self, dragged_key: str, global_pos: QPoint) -> None:
+        hit = self._hit_test_reorder_insert(global_pos)
+        if hit is None:
+            return
+        target_idx, insert_after = hit
+        keys = list(self._grid_item_keys)
+        if dragged_key not in keys:
+            return
+        from_idx = keys.index(dragged_key)
+        insert_idx = target_idx + (1 if insert_after else 0)
+        keys.pop(from_idx)
+        if from_idx < insert_idx:
+            insert_idx -= 1
+        insert_idx = max(0, min(insert_idx, len(keys)))
+        keys.insert(insert_idx, dragged_key)
+        self._commit_grid_reorder(keys)
 
     def _n_cols(self) -> int:
         w = self._scroll.viewport().width() - 2 * TILE_SPACING
@@ -2071,7 +2788,7 @@ class BookshelfView(QWidget):
             )
 
         if self._sort_by == "custom":
-            comics = self._apply_custom_sort(comics)
+            comics = self._apply_custom_sort_items(comics)
 
         self._folder_comic_ids = [c.id for c in comics]
         return comics, "No comics found in this folder."
@@ -2089,6 +2806,10 @@ class BookshelfView(QWidget):
         )
 
     def _repopulate(self):
+        scope = self._display_order_scope()
+        if self._last_order_scope is not None and scope != self._last_order_scope:
+            self._cancel_order_edit(silent=True, repopulate=False)
+        self._last_order_scope = scope
         self._sync_header_folder_menu()
         self._sync_selection_header()
         n_cols = self._n_cols()
@@ -2112,6 +2833,7 @@ class BookshelfView(QWidget):
         self._folder_tiles.clear()
         self._shelf_tiles.clear()
         self._folder_comic_ids = []
+        self._grid_item_keys = []
         self._stop_cover_loader()
         self._ordered_tiles = []
 
@@ -2119,16 +2841,22 @@ class BookshelfView(QWidget):
             items = self._filter_comics(self._library.get_hidden_comics(
                 sort_by=self._sort_by, order=self._sort_order
             ))
+            if self._sort_by == "custom":
+                items = self._apply_custom_sort_items(items)
             empty_msg = ("Nothing hidden.\n"
                          "Comics you remove from the library appear here.")
         elif self._currently_reading_mode:
             items = self._filter_comics(self._library.get_currently_reading(
                 sort_by=self._sort_by, order=self._sort_order
             ))
+            if self._sort_by == "custom":
+                items = self._apply_custom_sort_items(items)
             empty_msg = ("Nothing in progress.\n"
                          "Comics you're partway through show up here.")
         elif self._bookmarks_mode:
             items = self._library.get_all_bookmarks()
+            if self._sort_by == "custom":
+                items = self._apply_custom_sort_items(items)
             empty_msg = ("No bookmarks yet.\n"
                          "Use the reader bookmark button to save pages here.")
         elif self._search_query:
@@ -2136,6 +2864,8 @@ class BookshelfView(QWidget):
                 self._search_query, self._sort_by, self._sort_order
             )
             items = folders + self._filter_comics(comics)
+            if self._sort_by == "custom":
+                items = self._apply_custom_sort_items(items)
             empty_msg = f'No results for "{self._search_query}"'
         elif self._current_shelf_id is not None and self._current_folder is None:
             # Shelf top level — show folder tiles for folders with comics on this shelf.
@@ -2148,7 +2878,11 @@ class BookshelfView(QWidget):
                     )
                 }
                 shelf_folders = [f for f in shelf_folders if f.path in passing]
-            items = self._sort_tile_items(shelf_folders)
+            items = (
+                self._apply_custom_sort_items(shelf_folders)
+                if self._sort_by == "custom"
+                else self._sort_tile_items(shelf_folders)
+            )
             empty_msg = "This shelf is empty."
         elif self._current_folder is not None:
             items, empty_msg = self._folder_grid_items()
@@ -2159,11 +2893,16 @@ class BookshelfView(QWidget):
             if self._status_filter:
                 shelves = [s for s in shelves if self._shelf_matches_filter(s.id)]
             folders = self._home_folder_items()
-            items = self._sort_tile_items(shelves) + self._sort_tile_items(folders)
+            if self._sort_by == "custom":
+                items = self._apply_custom_sort_items(shelves + folders)
+            else:
+                items = self._sort_tile_items(shelves) + self._sort_tile_items(folders)
             empty_msg = (
                 "No bookshelves or comics yet.\n"
                 "Use the ⋮ menu → New bookshelf, or Refresh library to add comics."
             )
+
+        self._grid_item_keys = [_grid_item_key(item) for item in items]
 
         if not items:
             lbl = QLabel(empty_msg)
@@ -2174,6 +2913,13 @@ class BookshelfView(QWidget):
             return
 
         if self._bookmarks_mode:
+            if self._sort_by == "custom":
+                for entry in items:
+                    row = BookmarkRow(entry)
+                    row.opened.connect(self.bookmark_opened)
+                    layout.addWidget(row)
+                layout.addStretch()
+                return
             groups: dict[str, list[BookmarkEntry]] = {}
             for entry in items:
                 groups.setdefault(_bookmark_group_title(entry), []).append(entry)
@@ -2218,6 +2964,7 @@ class BookshelfView(QWidget):
                 and not self._search_query
                 and self._current_shelf_id is None and self._current_folder is None
             )
+            reorder_ok = self._can_reorder_grid()
             if isinstance(item, Shelf):
                 shelf_comics = self._library.get_comics_in_shelf(item.id)
                 if self._status_filter:
@@ -2229,6 +2976,10 @@ class BookshelfView(QWidget):
                 tile.file_comic_requested.connect(self._file_comic_into_shelf)
                 tile.set_selection_mode(self._selection_mode)
                 tile.shelf_select_toggled.connect(self._toggle_shelf_selection)
+                tile.set_file_drop_enabled(is_home and not self._selection_mode)
+                tile.set_reorder_enabled(reorder_ok)
+                if reorder_ok:
+                    tile.reorder_requested.connect(self._reorder_grid_items)
                 self._shelf_tiles[item.id] = tile
             elif isinstance(item, Folder):
                 tile = FolderTile(item, selected=item.path in self._selected_folder_paths)
@@ -2241,6 +2992,9 @@ class BookshelfView(QWidget):
                 tile.menu_requested.connect(self._on_folder_context_menu)
                 tile.set_selection_mode(self._selection_mode)
                 tile.folder_select_toggled.connect(self._toggle_folder_selection)
+                tile.set_reorder_enabled(reorder_ok)
+                if reorder_ok:
+                    tile.reorder_requested.connect(self._reorder_grid_items)
                 self._folder_tiles[item.path] = tile
             else:
                 tile = ComicTile(item, selected=item.id in self._selected_ids)
@@ -2248,16 +3002,12 @@ class BookshelfView(QWidget):
                 tile.select_toggled.connect(self._toggle_selection)
                 tile.shelf_action_requested.connect(self._on_comic_context_menu)
                 tile.set_selection_mode(self._selection_mode)
-                reorder_ok = (
-                    self._is_comic_grid_view()
-                    and not self._selection_mode
-                )
                 tile.set_reorder_enabled(reorder_ok)
                 if reorder_ok:
-                    tile.reorder_requested.connect(self._reorder_comics)
+                    tile.reorder_requested.connect(self._reorder_grid_items)
                 if is_home:
                     # Loose comic on the home grid — drag it onto a shelf to file it.
-                    tile.set_file_drag_enabled(True)
+                    tile.set_file_drag_enabled(not reorder_ok)
                 self._comic_tiles[item.id] = tile
 
             self._ordered_tiles.append(tile)
@@ -2655,15 +3405,213 @@ class BookshelfView(QWidget):
         self._show_folder_menu(self._current_folder, gp.x(), gp.y())
 
     def _on_folder_context_menu(self, folder_path: str, gx: int, gy: int):
+        if (
+            self._selection_mode
+            and folder_path in self._selected_folder_paths
+        ):
+            self._show_multi_folder_series_menu(list(self._selected_folder_paths), gx, gy)
+            return
         self._show_folder_menu(folder_path, gx, gy)
 
-    def _comics_for_folder_grouping(self, folder_path: str) -> list[Comic]:
-        """Comics visible in folder_path — shelf-filtered when drilling into a shelf."""
-        if self._current_shelf_id is not None and folder_path == self._current_folder:
+    def _comics_for_folder_menu(self, folder_path: str) -> list[Comic]:
+        """Comics in a folder tile — shelf-filtered on shelf grids, unsorted on home."""
+        if self._show_hidden_mode:
+            return []
+        if self._current_shelf_id is not None:
             return self._library.get_comics_in_shelf_for_folder(
                 self._current_shelf_id, folder_path
             )
+        if self._current_folder is None:
+            return self._library.get_unsorted_comics_in_folder(folder_path)
         return self._library.get_comics_in_folder(folder_path)
+
+    def _known_folder_paths(self, shelf_ids: list[int] | None = None) -> set[str]:
+        """Distinct parent_dir paths visible for the current batch context."""
+        if shelf_ids:
+            paths: set[str] = set()
+            for shelf_id in shelf_ids:
+                for comic in self._library.get_comics_in_shelf(shelf_id):
+                    paths.add(str(Path(comic.file_path).parent))
+            return paths
+        if self._current_shelf_id is not None:
+            return {
+                str(Path(c.file_path).parent)
+                for c in self._library.get_comics_in_shelf(self._current_shelf_id)
+            }
+        return {
+            str(Path(c.file_path).parent)
+            for c in self._library.get_unsorted_comics()
+        }
+
+    def _expand_folder_paths_to_subfolders(
+        self, root_paths: list[str], shelf_ids: list[int] | None = None
+    ) -> list[str]:
+        """Include every nested subfolder under the selected folder roots."""
+        known = self._known_folder_paths(shelf_ids)
+        expanded: set[str] = set()
+        for root in root_paths:
+            root_norm = root.rstrip("/") or root
+            for path in known:
+                if path == root_norm or path.startswith(root_norm + "/"):
+                    expanded.add(path)
+        return sorted(expanded)
+
+    def _comics_for_batch_folder(
+        self, folder_path: str, shelf_ids: list[int] | None = None
+    ) -> list[Comic]:
+        if shelf_ids:
+            by_id: dict[int, Comic] = {}
+            for shelf_id in shelf_ids:
+                for comic in self._library.get_comics_in_shelf_for_folder(
+                    shelf_id, folder_path
+                ):
+                    by_id[comic.id] = comic
+            return list(by_id.values())
+        return self._comics_for_folder_menu(folder_path)
+
+    def _show_multi_shelf_series_menu(
+        self, shelf_ids: list[int], gx: int, gy: int
+    ) -> None:
+        folder_paths = sorted(self._known_folder_paths(shelf_ids))
+        n = len(shelf_ids)
+        label = f"{n} bookshelf" if n == 1 else f"{n} bookshelves"
+        self._show_multi_folder_series_menu(
+            folder_paths, gx, gy, shelf_ids=shelf_ids, selection_label=label
+        )
+
+    def _show_multi_folder_series_menu(
+        self,
+        folder_paths: list[str],
+        gx: int,
+        gy: int,
+        *,
+        shelf_ids: list[int] | None = None,
+        selection_label: str | None = None,
+    ) -> None:
+        expanded = self._expand_folder_paths_to_subfolders(folder_paths, shelf_ids)
+        menu = themes.make_menu(self)
+        series_menu = menu.addMenu("Series")
+        eligible = [
+            fp
+            for fp in expanded
+            if len(self._comics_for_batch_folder(fp, shelf_ids)) >= 2
+        ]
+        if eligible:
+            if selection_label:
+                scope = selection_label
+            else:
+                n_roots = len(folder_paths)
+                n_all = len(expanded)
+                scope = f"{n_roots} folder{'s' if n_roots != 1 else ''}"
+                if n_all > n_roots:
+                    scope += f", {n_all} subfolders"
+            series_menu.addAction(
+                f"Set chapter order ({scope})"
+            ).triggered.connect(
+                lambda: self._set_chapter_order_for_folders(
+                    folder_paths, shelf_ids=shelf_ids
+                )
+            )
+            series_menu.addAction(
+                f"Link as reading series… ({scope})"
+            ).triggered.connect(
+                lambda: self._group_as_series_for_folders(
+                    folder_paths, shelf_ids=shelf_ids
+                )
+            )
+        else:
+            empty = series_menu.addAction("Need 2+ comics per folder")
+            empty.setEnabled(False)
+        menu.exec(QPoint(gx, gy))
+
+    def _persist_folder_chapter_sort(self, folder_paths: list[str]) -> None:
+        val = "chapter/asc"
+        for folder_path in folder_paths:
+            app_settings().setValue(self._folder_sort_settings_key(folder_path), val)
+
+    def _set_chapter_order_for_folders(
+        self, folder_paths: list[str], *, shelf_ids: list[int] | None = None
+    ) -> None:
+        folder_paths = self._expand_folder_paths_to_subfolders(
+            folder_paths, shelf_ids
+        )
+        affected: list[str] = []
+        comic_count = 0
+        for folder_path in folder_paths:
+            comics = self._comics_for_batch_folder(folder_path, shelf_ids)
+            if len(comics) < 2:
+                continue
+            self._library.set_comics_chapter_order([c.id for c in comics])
+            affected.append(folder_path)
+            comic_count += len(comics)
+        if not affected:
+            QMessageBox.information(
+                self,
+                "Set Chapter Order",
+                "Each folder needs at least 2 comics.",
+            )
+            return
+        self._persist_folder_chapter_sort(affected)
+        self._clear_selection()
+        if self._current_folder in affected:
+            self._apply_sort("chapter", "asc")
+            self._persist_sort()
+        self._nav_transition(self._repopulate)
+        n = len(affected)
+        self.window().statusBar().showMessage(
+            f"Set chapter order in {n} folder{'s' if n != 1 else ''}"
+            f" ({comic_count} comics)",
+            4000,
+        )
+
+    def _group_as_series_for_folders(
+        self, folder_paths: list[str], *, shelf_ids: list[int] | None = None
+    ) -> None:
+        from PyQt6.QtWidgets import QInputDialog
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Link as Reading Series",
+            "Series name (applied separately in each folder):",
+        )
+        if not ok or not name.strip():
+            return
+        folder_paths = self._expand_folder_paths_to_subfolders(
+            folder_paths, shelf_ids
+        )
+        affected: list[str] = []
+        comic_count = 0
+        for folder_path in folder_paths:
+            comics = self._comics_for_batch_folder(folder_path, shelf_ids)
+            if len(comics) < 2:
+                continue
+            self._library.group_comics_as_series(
+                [c.id for c in comics], name.strip()
+            )
+            affected.append(folder_path)
+            comic_count += len(comics)
+        if not affected:
+            QMessageBox.information(
+                self,
+                "Link as Reading Series",
+                "Each folder needs at least 2 comics.",
+            )
+            return
+        self._persist_folder_chapter_sort(affected)
+        self._clear_selection()
+        if self._current_folder in affected:
+            self._apply_sort("chapter", "asc")
+            self._persist_sort()
+        self._nav_transition(self._repopulate)
+        n = len(affected)
+        self.window().statusBar().showMessage(
+            f"Linked {comic_count} comics in {n} folder{'s' if n != 1 else ''}"
+            f" as “{name.strip()}”",
+            4000,
+        )
+
+    def _comics_for_folder_grouping(self, folder_path: str) -> list[Comic]:
+        return self._comics_for_folder_menu(folder_path)
 
     def _show_folder_menu(self, folder_path: str, gx: int, gy: int) -> None:
         menu = themes.make_menu(self)
@@ -2677,19 +3625,25 @@ class BookshelfView(QWidget):
         series_menu.addAction("Scan for series").triggered.connect(
             lambda: self._scan_series_in_folder(folder_path)
         )
-        if len(folder_comics) >= 2:
+        subfolders = self._expand_folder_paths_to_subfolders([folder_path])
+        batch_eligible = [
+            fp
+            for fp in subfolders
+            if len(self._comics_for_batch_folder(fp)) >= 2
+        ]
+        if batch_eligible:
             series_menu.addAction("Set chapter order").triggered.connect(
-                lambda: self._set_chapter_order([c.id for c in folder_comics])
+                lambda: self._set_chapter_order_for_folders([folder_path])
             )
             series_names = {c.series for c in folder_comics if c.series}
-            if len(series_names) == 1 and all(c.series for c in folder_comics):
+            if len(series_names) == 1 and folder_comics and all(c.series for c in folder_comics):
                 series_name = next(iter(series_names))
                 series_menu.addAction("Ungroup series").triggered.connect(
                     lambda: self._remove_series_link(folder_path, series_name)
                 )
             else:
                 series_menu.addAction("Link as reading series…").triggered.connect(
-                    lambda: self._group_as_series([c.id for c in folder_comics])
+                    lambda: self._group_as_series_for_folders([folder_path])
                 )
         series_menu.addSeparator()
         series_menu.addAction("Series reading settings…").triggered.connect(
@@ -3067,10 +4021,18 @@ class BookshelfView(QWidget):
     def _apply_sort(self, sort_by: str, order: str):
         self._sort_by = sort_by
         self._sort_order = order
-        for idx, (_, key, ord_) in enumerate(self._header._SORT_OPTIONS):
-            if key == sort_by and ord_ == order:
-                self._header.set_sort_index(idx)
-                break
+        if sort_by == "custom":
+            self._sync_custom_sort_header()
+        elif sort_by == "chapter":
+            self._active_display_order_id = None
+            self._header.set_custom_sort_label("Chapter order", active=True)
+        else:
+            self._active_display_order_id = None
+            for idx, (_, key, ord_) in enumerate(self._header._SORT_OPTIONS):
+                if key == sort_by and ord_ == order:
+                    self._header.set_sort_index(idx)
+                    break
+            self._header.set_custom_sort_label("", active=False)
 
     def _scan_series_in_folder(self, folder_path: str) -> None:
         linked = self._library.scan_series_in_folder(folder_path)
@@ -3693,8 +4655,35 @@ class BookshelfView(QWidget):
         self._apply_background()
 
     def eventFilter(self, obj, event):
-        if obj is self._scroll.viewport() and event.type() == QEvent.Type.Resize:
-            self._apply_background()
+        if obj is self._scroll.viewport():
+            if event.type() == QEvent.Type.Resize:
+                self._apply_background()
+            elif self._can_reorder_grid():
+                et = event.type()
+                if et == QEvent.Type.DragMove:
+                    mime = event.mimeData()
+                    if mime.hasFormat(_GRID_REORDER_MIME):
+                        global_pos = event.globalPosition().toPoint()
+                        hit = self._hit_test_reorder_insert(global_pos)
+                        self._clear_reorder_drop_hints()
+                        if hit is not None:
+                            idx, insert_after = hit
+                            if 0 <= idx < len(self._ordered_tiles):
+                                side = "right" if insert_after else "left"
+                                _set_reorder_drop_hint(self._ordered_tiles[idx], side)
+                        event.acceptProposedAction()
+                        return True
+                elif et in (QEvent.Type.DragLeave, QEvent.Type.Drop):
+                    if et == QEvent.Type.Drop and event.mimeData().hasFormat(_GRID_REORDER_MIME):
+                        dragged = bytes(
+                            event.mimeData().data(_GRID_REORDER_MIME)
+                        ).decode()
+                        self._reorder_at_global_pos(
+                            dragged, event.globalPosition().toPoint()
+                        )
+                        event.acceptProposedAction()
+                        return True
+                    self._clear_reorder_drop_hints()
         return super().eventFilter(obj, event)
 
     def resizeEvent(self, event):

@@ -31,6 +31,14 @@ class Shelf:
 
 
 @dataclass
+class DisplayOrder:
+    id: int
+    scope_key: str
+    name: str
+    created_at: str
+
+
+@dataclass
 class ReadingSettings:
     """Viewer settings that can be set per series or per folder.
 
@@ -237,12 +245,29 @@ def _sort_comics(comics: list, sort_by: str, order: str) -> list:
 
 def apply_custom_display_order(comics: list[Comic], order_ids: list[int]) -> list[Comic]:
     """Reorder comics by saved positions; unknown comics trail alphabetically."""
-    by_id = {c.id: c for c in comics}
-    ordered = [by_id[i] for i in order_ids if i in by_id]
-    seen = {c.id for c in ordered}
+    order_keys = [f"comic:{i}" for i in order_ids]
+    return apply_custom_display_order_items(
+        comics,
+        order_keys,
+        key_fn=lambda c: f"comic:{c.id}",
+        label_fn=lambda c: c.title or Path(c.file_path).stem,
+    )
+
+
+def apply_custom_display_order_items(
+    items: list,
+    order_keys: list[str],
+    *,
+    key_fn,
+    label_fn,
+) -> list:
+    """Reorder heterogeneous grid items; unknown items trail alphabetically."""
+    by_key = {key_fn(item): item for item in items}
+    ordered = [by_key[k] for k in order_keys if k in by_key]
+    seen = {key_fn(item) for item in ordered}
     extras = sorted(
-        [c for c in comics if c.id not in seen],
-        key=lambda c: (c.title or Path(c.file_path).stem).lower(),
+        [item for item in items if key_fn(item) not in seen],
+        key=lambda item: label_fn(item).lower(),
     )
     return ordered + extras
 
@@ -443,7 +468,32 @@ CREATE INDEX IF NOT EXISTS idx_comic_display_order_scope
     ON comic_display_order(scope_key, position);
 """
 
-_CURRENT_VERSION = 16
+# Named display orders per scope (user-saved presets).
+_SCHEMA_V17_NAMED_DISPLAY_ORDERS = """
+CREATE TABLE IF NOT EXISTS display_orders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope_key   TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    is_primary  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT    NOT NULL,
+    UNIQUE(scope_key, name)
+);
+CREATE INDEX IF NOT EXISTS idx_display_orders_scope
+    ON display_orders(scope_key, is_primary);
+
+CREATE TABLE IF NOT EXISTS comic_display_order_v2 (
+    order_id    INTEGER NOT NULL REFERENCES display_orders(id) ON DELETE CASCADE,
+    comic_id    INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    PRIMARY KEY (order_id, comic_id)
+);
+CREATE INDEX IF NOT EXISTS idx_comic_display_order_v2_order
+    ON comic_display_order_v2(order_id, position);
+"""
+
+_IMPORTED_DISPLAY_ORDER_NAME = "Imported layout"
+
+_CURRENT_VERSION = 20
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
 _CLIENT_SORT_MODES = _VALID_SORT_COLUMNS | {"chapter", "custom"}
@@ -610,6 +660,122 @@ class Library:
             self._conn.execute("PRAGMA user_version = 16")
             self._conn.commit()
             version = 16
+        if version < 17:
+            self._migrate_v17_named_display_orders()
+            self._conn.execute("PRAGMA user_version = 17")
+            self._conn.commit()
+            version = 17
+        if version < 18:
+            self._migrate_v18_display_order_item_keys()
+            self._conn.execute("PRAGMA user_version = 18")
+            self._conn.commit()
+            version = 18
+        if version < 19:
+            self._migrate_v19_display_order_locked()
+            self._conn.execute("PRAGMA user_version = 19")
+            self._conn.commit()
+            version = 19
+        if version < 20:
+            self._migrate_v20_drop_primary_orders()
+            self._conn.execute("PRAGMA user_version = 20")
+            self._conn.commit()
+            version = 20
+
+    def _migrate_v20_drop_primary_orders(self) -> None:
+        """Delete legacy primary-order rows and drop obsolete columns."""
+        legacy_ids = [
+            r["id"]
+            for r in self._conn.execute(
+                "SELECT id FROM display_orders"
+                " WHERE is_primary = 1 OR name = 'Primary order'"
+            ).fetchall()
+        ]
+        for order_id in legacy_ids:
+            self._conn.execute(
+                "DELETE FROM display_order_items WHERE order_id = ?", (order_id,)
+            )
+            self._conn.execute("DELETE FROM display_orders WHERE id = ?", (order_id,))
+        self._conn.executescript("""
+            CREATE TABLE display_orders_new (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope_key   TEXT    NOT NULL,
+                name        TEXT    NOT NULL,
+                created_at  TEXT    NOT NULL,
+                UNIQUE(scope_key, name)
+            );
+            INSERT INTO display_orders_new (id, scope_key, name, created_at)
+                SELECT id, scope_key, name, created_at FROM display_orders;
+            DROP TABLE display_orders;
+            ALTER TABLE display_orders_new RENAME TO display_orders;
+            CREATE INDEX IF NOT EXISTS idx_display_orders_scope
+                ON display_orders(scope_key);
+        """)
+
+    def _migrate_v19_display_order_locked(self) -> None:
+        """Legacy migration — adds is_locked; cleaned up in v20."""
+        self._conn.execute(
+            "ALTER TABLE display_orders ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0"
+        )
+        self._conn.execute(
+            "UPDATE display_orders SET is_locked = 1 WHERE is_primary = 1"
+        )
+        self._conn.execute("UPDATE display_orders SET is_primary = 0")
+
+    def _migrate_v18_display_order_item_keys(self) -> None:
+        """Store grid order as typed item keys (comic/shelf/folder), not comic ids only."""
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS display_order_items (
+                order_id    INTEGER NOT NULL REFERENCES display_orders(id) ON DELETE CASCADE,
+                item_key    TEXT    NOT NULL,
+                position    INTEGER NOT NULL,
+                PRIMARY KEY (order_id, item_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_display_order_items_order
+                ON display_order_items(order_id, position);
+        """)
+        rows = self._conn.execute(
+            "SELECT order_id, comic_id, position FROM comic_display_order"
+        ).fetchall()
+        for row in rows:
+            self._conn.execute(
+                "INSERT INTO display_order_items (order_id, item_key, position)"
+                " VALUES (?, ?, ?)",
+                (row["order_id"], f"comic:{row['comic_id']}", row["position"]),
+            )
+        self._conn.execute("DROP TABLE comic_display_order")
+
+    def _migrate_v17_named_display_orders(self) -> None:
+        """Upgrade single-scope orders to named presets."""
+        self._conn.executescript(_SCHEMA_V17_NAMED_DISPLAY_ORDERS)
+        now = datetime.now(timezone.utc).isoformat()
+        scope_keys = [
+            r["scope_key"]
+            for r in self._conn.execute(
+                "SELECT DISTINCT scope_key FROM comic_display_order"
+            ).fetchall()
+        ]
+        for scope_key in scope_keys:
+            cur = self._conn.execute(
+                "INSERT INTO display_orders (scope_key, name, is_primary, created_at)"
+                " VALUES (?, ?, 0, ?)",
+                (scope_key, _IMPORTED_DISPLAY_ORDER_NAME, now),
+            )
+            order_id = cur.lastrowid
+            rows = self._conn.execute(
+                "SELECT comic_id, position FROM comic_display_order"
+                " WHERE scope_key = ? ORDER BY position",
+                (scope_key,),
+            ).fetchall()
+            for row in rows:
+                self._conn.execute(
+                    "INSERT INTO comic_display_order_v2 (order_id, comic_id, position)"
+                    " VALUES (?, ?, ?)",
+                    (order_id, row["comic_id"], row["position"]),
+                )
+        self._conn.execute("DROP TABLE comic_display_order")
+        self._conn.execute(
+            "ALTER TABLE comic_display_order_v2 RENAME TO comic_display_order"
+        )
 
     def _seed_smart_shelves(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -841,32 +1007,85 @@ class Library:
                     "UPDATE comics SET favorite = ? WHERE id = ?", (val, comic_id)
                 )
 
-    def get_display_order_ids(self, scope_key: str) -> list[int]:
-        """Return comic ids in saved manual order for a scope (may be empty)."""
+    @staticmethod
+    def _row_to_display_order(row: sqlite3.Row) -> DisplayOrder:
+        return DisplayOrder(
+            id=row["id"],
+            scope_key=row["scope_key"],
+            name=row["name"],
+            created_at=row["created_at"],
+        )
+
+    def get_display_orders(self, scope_key: str) -> list[DisplayOrder]:
+        """Return all saved orders for a scope (alphabetical by name)."""
         rows = self._conn.execute(
-            "SELECT comic_id FROM comic_display_order"
-            " WHERE scope_key = ? ORDER BY position",
+            "SELECT * FROM display_orders WHERE scope_key = ?"
+            " ORDER BY name COLLATE NOCASE",
             (scope_key,),
         ).fetchall()
-        return [r["comic_id"] for r in rows]
+        return [self._row_to_display_order(r) for r in rows]
 
-    def set_display_order(self, scope_key: str, comic_ids: list[int]) -> None:
-        """Replace the saved manual order for a scope."""
+    def get_display_order(self, order_id: int) -> DisplayOrder | None:
+        row = self._conn.execute(
+            "SELECT * FROM display_orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        return self._row_to_display_order(row) if row else None
+
+    def create_display_order(
+        self, scope_key: str, name: str, item_keys: list[str]
+    ) -> DisplayOrder:
+        """Create a named saved order with the given item sequence."""
+        name = name.strip()
+        if not name:
+            raise ValueError("Enter a name for this order.")
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self.transaction() as cur:
+                cur.execute(
+                    "INSERT INTO display_orders (scope_key, name, created_at)"
+                    " VALUES (?, ?, ?)",
+                    (scope_key, name, now),
+                )
+                order_id = cur.lastrowid
+                for position, item_key in enumerate(item_keys):
+                    cur.execute(
+                        "INSERT INTO display_order_items (order_id, item_key, position)"
+                        " VALUES (?, ?, ?)",
+                        (order_id, item_key, position),
+                    )
+        except sqlite3.IntegrityError:
+            raise ValueError(f"An order named “{name}” already exists here.") from None
+        row = self._conn.execute(
+            "SELECT * FROM display_orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        return self._row_to_display_order(row)
+
+    def get_display_order_keys(self, order_id: int) -> list[str]:
+        """Return grid item keys in a saved manual order (may be empty)."""
+        rows = self._conn.execute(
+            "SELECT item_key FROM display_order_items"
+            " WHERE order_id = ? ORDER BY position",
+            (order_id,),
+        ).fetchall()
+        return [r["item_key"] for r in rows]
+
+    def set_display_order_keys(self, order_id: int, item_keys: list[str]) -> None:
+        """Replace the saved manual order for a display-order preset."""
         with self.transaction() as cur:
             cur.execute(
-                "DELETE FROM comic_display_order WHERE scope_key = ?", (scope_key,)
+                "DELETE FROM display_order_items WHERE order_id = ?", (order_id,)
             )
-            for position, comic_id in enumerate(comic_ids):
+            for position, item_key in enumerate(item_keys):
                 cur.execute(
-                    "INSERT INTO comic_display_order (scope_key, comic_id, position)"
+                    "INSERT INTO display_order_items (order_id, item_key, position)"
                     " VALUES (?, ?, ?)",
-                    (scope_key, comic_id, position),
+                    (order_id, item_key, position),
                 )
 
-    def clear_display_order(self, scope_key: str) -> None:
+    def clear_display_order(self, order_id: int) -> None:
         with self.transaction() as cur:
             cur.execute(
-                "DELETE FROM comic_display_order WHERE scope_key = ?", (scope_key,)
+                "DELETE FROM display_order_items WHERE order_id = ?", (order_id,)
             )
 
     def hide_folder(self, folder_path: str) -> None:
