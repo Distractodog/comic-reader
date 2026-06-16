@@ -230,7 +230,21 @@ def _sort_comics(comics: list, sort_by: str, order: str) -> list:
     if sort_by == "chapter":
         ordered = sorted(comics, key=_comic_series_sort_key)
         return list(reversed(ordered)) if reverse else ordered
+    if sort_by == "custom":
+        return list(comics)
     return sorted(comics, key=lambda c: (c.title or Path(c.file_path).stem).lower())
+
+
+def apply_custom_display_order(comics: list[Comic], order_ids: list[int]) -> list[Comic]:
+    """Reorder comics by saved positions; unknown comics trail alphabetically."""
+    by_id = {c.id: c for c in comics}
+    ordered = [by_id[i] for i in order_ids if i in by_id]
+    seen = {c.id for c in ordered}
+    extras = sorted(
+        [c for c in comics if c.id not in seen],
+        key=lambda c: (c.title or Path(c.file_path).stem).lower(),
+    )
+    return ordered + extras
 
 
 def compute_content_signature(file_path: str) -> str:
@@ -417,10 +431,22 @@ _SCHEMA_V15_FAVORITES = """
 ALTER TABLE comics ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0;
 """
 
-_CURRENT_VERSION = 15
+# Per-view manual comic order (folder or shelf+folder scope).
+_SCHEMA_V16_DISPLAY_ORDER = """
+CREATE TABLE IF NOT EXISTS comic_display_order (
+    scope_key   TEXT    NOT NULL,
+    comic_id    INTEGER NOT NULL REFERENCES comics(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    PRIMARY KEY (scope_key, comic_id)
+);
+CREATE INDEX IF NOT EXISTS idx_comic_display_order_scope
+    ON comic_display_order(scope_key, position);
+"""
+
+_CURRENT_VERSION = 16
 
 _VALID_SORT_COLUMNS = {"title", "series", "date_added", "last_read"}
-_CLIENT_SORT_MODES = _VALID_SORT_COLUMNS | {"chapter"}
+_CLIENT_SORT_MODES = _VALID_SORT_COLUMNS | {"chapter", "custom"}
 
 
 class Library:
@@ -579,6 +605,11 @@ class Library:
             self._conn.execute("PRAGMA user_version = 15")
             self._conn.commit()
             version = 15
+        if version < 16:
+            self._conn.executescript(_SCHEMA_V16_DISPLAY_ORDER)
+            self._conn.execute("PRAGMA user_version = 16")
+            self._conn.commit()
+            version = 16
 
     def _seed_smart_shelves(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -800,6 +831,43 @@ class Library:
                 "SELECT favorite FROM comics WHERE id = ?", (comic_id,)
             ).fetchone()
             return bool(row["favorite"]) if row else False
+
+    def set_favorites(self, comic_ids: list[int], favorite: bool) -> None:
+        """Set the favorite flag on multiple comics."""
+        val = 1 if favorite else 0
+        with self.transaction() as cur:
+            for comic_id in comic_ids:
+                cur.execute(
+                    "UPDATE comics SET favorite = ? WHERE id = ?", (val, comic_id)
+                )
+
+    def get_display_order_ids(self, scope_key: str) -> list[int]:
+        """Return comic ids in saved manual order for a scope (may be empty)."""
+        rows = self._conn.execute(
+            "SELECT comic_id FROM comic_display_order"
+            " WHERE scope_key = ? ORDER BY position",
+            (scope_key,),
+        ).fetchall()
+        return [r["comic_id"] for r in rows]
+
+    def set_display_order(self, scope_key: str, comic_ids: list[int]) -> None:
+        """Replace the saved manual order for a scope."""
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM comic_display_order WHERE scope_key = ?", (scope_key,)
+            )
+            for position, comic_id in enumerate(comic_ids):
+                cur.execute(
+                    "INSERT INTO comic_display_order (scope_key, comic_id, position)"
+                    " VALUES (?, ?, ?)",
+                    (scope_key, comic_id, position),
+                )
+
+    def clear_display_order(self, scope_key: str) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM comic_display_order WHERE scope_key = ?", (scope_key,)
+            )
 
     def hide_folder(self, folder_path: str) -> None:
         """Hide every comic currently in a folder. Files are left on disk."""
@@ -1598,6 +1666,28 @@ class Library:
                     (comic_id, row["id"]),
                 )
         self._prune_unused_tags()
+
+    def add_tags_to_comics(self, comic_ids: list[int], tag_names: list[str]) -> None:
+        """Add tags to comics without removing their existing tags."""
+        normalized = [n.strip() for n in tag_names if n.strip()]
+        if not normalized:
+            return
+        for comic_id in comic_ids:
+            existing = set(self.get_tags_for_comic(comic_id))
+            merged = sorted(existing | set(normalized), key=str.lower)
+            self.set_tags_for_comic(comic_id, merged)
+
+    def remove_tags_from_comics(self, comic_ids: list[int], tag_names: list[str]) -> None:
+        """Remove specific tags from comics; other tags stay."""
+        normalized = {n.strip().lower() for n in tag_names if n.strip()}
+        if not normalized:
+            return
+        for comic_id in comic_ids:
+            remaining = [
+                t for t in self.get_tags_for_comic(comic_id)
+                if t.lower() not in normalized
+            ]
+            self.set_tags_for_comic(comic_id, remaining)
 
     def _prune_unused_tags(self) -> None:
         with self.transaction() as cur:
