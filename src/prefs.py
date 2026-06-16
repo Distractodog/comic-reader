@@ -26,6 +26,7 @@ DEFAULT_RTL = "reading/rtl"                 # bool — right-to-left (manga)
 CLICK_NAV = "reading/click_nav"             # bool
 PAGE_ANIM = "reading/page_animation"        # bool — page-slide on turn
 PRELOAD = "reading/preload_count"           # int — pages to preload ahead
+WEBTOON_WIDTH = "reading/webtoon_width"     # int — webtoon page width %% (100/80/.../30)
 
 EBOOK_FONT_PT = "ebook_font_pt"             # int (pre-existing key)
 EBOOK_FONT_FAMILY = "ebook/font_family"     # str ('' = app default)
@@ -44,6 +45,7 @@ _DEFAULTS = {
     CLICK_NAV: True,
     PAGE_ANIM: True,
     PRELOAD: 5,
+    WEBTOON_WIDTH: 100,
     EBOOK_FONT_PT: 19,
     EBOOK_FONT_FAMILY: "",
 }

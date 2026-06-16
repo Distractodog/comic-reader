@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QEasingCurve, QEvent, QPropertyAnimation, Qt, QThread, QTimer, pyqtSignal,
+)
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
 
+from viewer import CLICK_ZONE_FRACTION  # center band = same as single-page reader
+
 _BUFFER_PX = 600     # pixels above/below viewport to preload
 _RETAIN_RADIUS = 10  # keep full-res images within ±N pages of the current page
+_CLICK_MOVE_TOL = 6  # max px of movement for a press+release to count as a click
+_EDGE_SCROLL_FRACTION = 0.9   # left/right edge click scrolls down ~a full screen
+                              # (slight overlap so you don't lose your place)
+_EDGE_SCROLL_MS = 520         # smooth-scroll animation duration
 
 
 class _PageLoader(QThread):
@@ -49,6 +57,7 @@ class WebtoonViewer(QScrollArea):
     page_changed = pyqtSignal(int)  # current page at viewport center
     mouse_moved = pyqtSignal(int)   # viewport y — for fullscreen bar reveal
     start_page_rendered = pyqtSignal()  # the page load_comic targeted is on screen
+    center_clicked = pyqtSignal()   # center-band click — toggles reader chrome
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -65,7 +74,7 @@ class WebtoonViewer(QScrollArea):
         self._content = QWidget()
         self._content.setStyleSheet("background-color: #000000;")
         self._layout = QVBoxLayout(self._content)
-        self._layout.setSpacing(8)
+        self._layout.setSpacing(0)  # pages sit flush — no seam line between images
         self._layout.setContentsMargins(0, 0, 0, 0)
         self.setWidget(self._content)
 
@@ -79,6 +88,8 @@ class WebtoonViewer(QScrollArea):
         self._current_page = 0
         self._last_emitted = -1
         self._pending_start: int | None = None
+        self._press_pos = None  # left-button press position, for click detection
+        self._scroll_anim: QPropertyAnimation | None = None  # smooth edge-scroll
 
         # Generation counter: stale loader signals are dropped without blocking
         self._loader: _PageLoader | None = None
@@ -108,8 +119,31 @@ class WebtoonViewer(QScrollArea):
     # ----- Event filter for mouse tracking -----
 
     def eventFilter(self, obj, event):
-        if obj is self.viewport() and event.type() == QEvent.Type.MouseMove:
-            self.mouse_moved.emit(int(event.position().y()))
+        if obj is self.viewport():
+            etype = event.type()
+            if etype == QEvent.Type.MouseMove:
+                self.mouse_moved.emit(int(event.position().y()))
+            elif (etype == QEvent.Type.MouseButtonPress
+                    and event.button() == Qt.MouseButton.LeftButton):
+                self._press_pos = event.position()
+            elif (etype == QEvent.Type.MouseButtonRelease
+                    and event.button() == Qt.MouseButton.LeftButton
+                    and self._press_pos is not None):
+                start = self._press_pos
+                self._press_pos = None
+                pos = event.position()
+                moved = (pos - start).manhattanLength()
+                if moved <= _CLICK_MOVE_TOL:  # a click, not a drag-scroll
+                    w = self.viewport().width()
+                    x = pos.x()
+                    if w * CLICK_ZONE_FRACTION <= x <= w * (1 - CLICK_ZONE_FRACTION):
+                        # Center band toggles the reader chrome — matching the
+                        # single-page reader's dead zone.
+                        self.center_clicked.emit()
+                    else:
+                        # Left/right edges advance the scroll by a fraction of a
+                        # screen (there's no page-flip in continuous scroll).
+                        self._scroll_by_fraction(_EDGE_SCROLL_FRACTION)
         return super().eventFilter(obj, event)
 
     # ----- Public API -----
@@ -149,11 +183,18 @@ class WebtoonViewer(QScrollArea):
             self._labels.append(lbl)
 
         self._rebuild_tops()
+        self._current_page = max(0, start_page)
 
         if start_page > 0:
             QTimer.singleShot(120, lambda: self._scroll_to(start_page))
         else:
-            QTimer.singleShot(50, self._load_visible)
+            # The viewer is reused across comics — pin a fresh comic to the top
+            # so it doesn't inherit the previous comic's scroll offset. Reset now
+            # and again after layout settles, in case the range updates late.
+            self.verticalScrollBar().setValue(0)
+            QTimer.singleShot(50, lambda: (
+                self.verticalScrollBar().setValue(0), self._load_visible()
+            ))
 
     def scroll_to_page(self, page_index: int) -> None:
         self._scroll_to(page_index)
@@ -178,6 +219,27 @@ class WebtoonViewer(QScrollArea):
         for i in range(from_index, len(self._labels)):
             self._tops.append(y)
             y += self._labels[i].height() + spacing
+
+    def _scroll_by_fraction(self, fraction: float) -> None:
+        """Smoothly scroll down by *fraction* of the viewport height."""
+        sb = self.verticalScrollBar()
+        delta = int(self.viewport().height() * fraction)
+        # Stack rapid clicks onto the in-flight animation's destination so each
+        # tap advances another step instead of restarting from the same spot.
+        anim = self._scroll_anim
+        if anim is not None and anim.state() == QPropertyAnimation.State.Running:
+            base = anim.endValue()
+        else:
+            base = sb.value()
+        target = max(sb.minimum(), min(sb.maximum(), base + delta))
+
+        anim = QPropertyAnimation(sb, b"value", self)
+        anim.setDuration(_EDGE_SCROLL_MS)
+        anim.setStartValue(sb.value())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._scroll_anim = anim
+        anim.start()
 
     def _scroll_to(self, page_index: int) -> None:
         if 0 <= page_index < len(self._labels):

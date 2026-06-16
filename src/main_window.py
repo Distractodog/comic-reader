@@ -324,10 +324,10 @@ class _ReaderBar(QWidget):
             f"#ReaderBar {{ background: {bg}; border-bottom: 2px solid {border}; }}"
         )
         self._back_btn.setStyleSheet(
-            f"background: transparent; color: {c['accent']}; border: none; font-size: 24px; padding: 0;"
+            f"background: transparent; color: {c['text']}; border: none; font-size: 24px; padding: 0;"
         )
         btn_style = (
-            f"background: transparent; color: {c['accent']}; border: none;"
+            f"background: transparent; color: {c['text']}; border: none;"
             f" font-size: 26px; padding: 0;"
         )
         for btn in self._tool_buttons:
@@ -1009,7 +1009,8 @@ class MainWindow(QMainWindow):
         self._spread_mode: bool = True
         self._webtoon_mode: bool = False
         self._is_manga: bool = False
-        self._webtoon_width_pct: int = 100  # 100 / 80 / 60 / 50 / 40 / 30
+        # 100 / 80 / 60 / 50 / 40 / 30 — persisted globally so it survives restart.
+        self._webtoon_width_pct: int = prefs.get_int(prefs.WEBTOON_WIDTH)
 
         # Page cache + preloader
         self._cache: PageCache = PageCache()
@@ -1062,6 +1063,7 @@ class MainWindow(QMainWindow):
         self._open_gen = 0
         self._open_worker: _ComicOpenWorker | None = None
         self._opening_path: str | None = None
+        self._opening_start_at_top: bool = False
         self._open_started: float = 0.0
         self._open_min_elapsed = False
         self._open_page_ready = False
@@ -1226,6 +1228,7 @@ class MainWindow(QMainWindow):
         self._thumb_strip.page_selected.connect(self.seek_to_page)
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
         self._webtoon_viewer.start_page_rendered.connect(self._on_webtoon_start_page_rendered)
+        self._webtoon_viewer.center_clicked.connect(self._toggle_reading_chrome)
         self._ebook_viewer.chapter_changed.connect(self._on_ebook_chapter_changed)
         self._ebook_viewer.exit_requested.connect(self._back_to_library)
         self._ebook_viewer.end_reached.connect(self._on_ebook_end)
@@ -1861,6 +1864,7 @@ class MainWindow(QMainWindow):
     def _set_webtoon_width(self, pct: int) -> None:
         self._webtoon_width_pct = pct
         self._webtoon_viewer.set_width_fraction(pct / 100)
+        prefs.set_value(prefs.WEBTOON_WIDTH, pct)  # survive restart
 
     def _toggle_thumb_strip(self) -> None:
         # Only meaningful inside the reader — without a comic the strip is an
@@ -2061,7 +2065,7 @@ class MainWindow(QMainWindow):
         if path:
             self.load_file(path)
 
-    def load_file(self, path: str):
+    def load_file(self, path: str, start_at_top: bool = False):
         if not Path(path).exists():
             QMessageBox.warning(
                 self,
@@ -2102,7 +2106,9 @@ class MainWindow(QMainWindow):
         spread = True  # default for comics not in the library (mirrors below)
         webtoon = False
         if comic is not None:
-            start_page = max(0, comic.current_page)
+            # Advancing forward to the next comic starts at the top, not wherever
+            # that comic was last left (resume only applies to opening directly).
+            start_page = 0 if start_at_top else max(0, comic.current_page)
             rs = self._library.resolve_reading_settings(
                 comic, self._global_reading_defaults()
             )
@@ -2113,6 +2119,7 @@ class MainWindow(QMainWindow):
             spread = prefs.get_bool(prefs.DEFAULT_SPREAD) and not webtoon
         self._open_gen += 1
         self._opening_path = path
+        self._opening_start_at_top = start_at_top
         self._open_started = time.monotonic()
         self._loading_overlay.start(cover)
         worker = _ComicOpenWorker(self._open_gen, path, start_page, spread, webtoon, self)
@@ -2173,7 +2180,10 @@ class MainWindow(QMainWindow):
         default_rtl = prefs.get_bool(prefs.DEFAULT_RTL)
         if comic is not None:
             self._current_comic_id = comic.id
-            self._current_page = comic.current_page if 0 < comic.current_page < self._reader.page_count() else 0
+            if self._opening_start_at_top:
+                self._current_page = 0
+            else:
+                self._current_page = comic.current_page if 0 < comic.current_page < self._reader.page_count() else 0
             rs = self._library.resolve_reading_settings(
                 comic, self._global_reading_defaults()
             )
@@ -2477,7 +2487,7 @@ class MainWindow(QMainWindow):
             next_in_series = self._library.get_next_in_series(self._current_comic_id)
             if next_in_series is not None:
                 title = next_in_series.title or Path(next_in_series.file_path).stem
-                self.load_file(next_in_series.file_path)
+                self.load_file(next_in_series.file_path, start_at_top=True)
                 self.statusBar().showMessage(f"Opened next in series: {title}", 3500)
                 return True
         return False
@@ -2563,7 +2573,9 @@ class MainWindow(QMainWindow):
         )
         target = next_comic if forward else prev_comic
         if target is not None:
-            self.load_file(target.file_path)
+            # Moving forward to the next comic starts at its top; going back to
+            # the previous comic resumes where it was left.
+            self.load_file(target.file_path, start_at_top=forward)
 
     def _open_prev_comic(self) -> None:
         self._open_neighbor_comic(forward=False)
@@ -2573,6 +2585,14 @@ class MainWindow(QMainWindow):
 
     def seek_to_page(self, page: int):
         if not self._reader:
+            return
+        if self._webtoon_mode:
+            # Webtoon shows the continuous-scroll viewer (not self.viewer), so
+            # scroll it to the target page; page_changed syncs the bar/footer.
+            new_page = max(0, min(page, self._reader.page_count() - 1))
+            self._current_page = new_page
+            self._webtoon_viewer.scroll_to_page(new_page)
+            self._save_progress()
             return
         if self._spread_mode:
             page = (page // 2) * 2  # snap to spread boundary
