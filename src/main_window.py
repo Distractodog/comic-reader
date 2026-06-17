@@ -227,6 +227,7 @@ class _ReaderBar(QWidget):
     fit_requested = pyqtSignal()
     page_mode_requested = pyqtSignal()
     manga_requested = pyqtSignal()
+    fullscreen_requested = pyqtSignal()
     HEIGHT = 63
 
     def __init__(self, parent=None):
@@ -279,12 +280,17 @@ class _ReaderBar(QWidget):
         self._manga_btn = _tool_btn("漫", "Reading direction (manga)")
         self._manga_btn.clicked.connect(self.manga_requested)
 
+        # Fullscreen lives outside the comic-only tools so it also shows for
+        # text EPUBs; it stays visible regardless of comic type.
+        self._fullscreen_btn = _tool_btn("⛶", "Fullscreen")
+        self._fullscreen_btn.clicked.connect(self.fullscreen_requested)
+
         self._menu_btn = _tool_btn("⋮", "More")
         self._menu_btn.clicked.connect(self.menu_requested)
 
         self._tool_buttons = [
             self._bookmark_btn, self._fit_btn, self._page_mode_btn,
-            self._manga_btn, self._menu_btn,
+            self._manga_btn, self._fullscreen_btn, self._menu_btn,
         ]
 
         self.hide()
@@ -591,6 +597,7 @@ class _RailButton(QPushButton):
             "search": self._draw_search,
             "menu": self._draw_menu,
             "settings": self._draw_settings,
+            "fullscreen": self._draw_fullscreen,
         }
         drawer = drawers.get(self._kind)
         if drawer is None:
@@ -692,6 +699,19 @@ class _RailButton(QPushButton):
             QPointF(end.x() + 1.4, end.y() - 1.4),
         )
 
+    def _draw_fullscreen(self, painter: QPainter, cx: float, cy: float) -> None:
+        # Four corner brackets — the standard "expand to fullscreen" mark.
+        r = self._icon_rect(cx, cy)
+        painter.setPen(self._icon_pen(1.3))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        arm = 5.0
+        l, t, rt, b = r.left() + 1, r.top() + 1, r.right() - 1, r.bottom() - 1
+        for (px, py, dx, dy) in (
+            (l, t, 1, 1), (rt, t, -1, 1), (l, b, 1, -1), (rt, b, -1, -1),
+        ):
+            painter.drawLine(QPointF(px, py), QPointF(px + dx * arm, py))
+            painter.drawLine(QPointF(px, py), QPointF(px, py + dy * arm))
+
     def _draw_settings(self, painter: QPainter, cx: float, cy: float) -> None:
         r = self._icon_rect(cx, cy)
         painter.setPen(self._icon_pen(1.2))
@@ -728,6 +748,7 @@ class _Sidebar(QWidget):
     search_closed = pyqtSignal()
     app_menu_requested = pyqtSignal()
     settings_clicked = pyqtSignal()
+    fullscreen_clicked = pyqtSignal()
     expanded_changed = pyqtSignal()  # emitted when the rail width changes (overlay re-layout)
 
     COLLAPSED_W = 60
@@ -811,7 +832,11 @@ class _Sidebar(QWidget):
             self._btn_menu.clicked.connect(self.app_menu_requested.emit)
             panel_layout.addWidget(self._btn_menu)
 
-        # Settings sits at the very bottom of the panel.
+        # Fullscreen + Settings sit at the very bottom of the panel.
+        self._btn_fullscreen = self._make_item("", "Fullscreen", kind="fullscreen")
+        self._btn_fullscreen.clicked.connect(self.fullscreen_clicked.emit)
+        panel_layout.addWidget(self._btn_fullscreen)
+
         self._settings_separator = QFrame()
         self._settings_separator.setFrameShape(QFrame.Shape.HLine)
         self._settings_separator.setFixedHeight(1)
@@ -827,6 +852,7 @@ class _Sidebar(QWidget):
         ]
         if self._btn_menu is not None:
             self._panel_buttons.append(self._btn_menu)
+        self._panel_buttons.append(self._btn_fullscreen)
         self._panel_buttons.append(self._btn_settings)
         self._all_buttons = [*self._top_buttons, *self._panel_buttons]
         self._refresh_text()
@@ -1158,6 +1184,7 @@ class MainWindow(QMainWindow):
         self._reader_bar.fit_requested.connect(self._show_fit_menu)
         self._reader_bar.page_mode_requested.connect(self._show_page_mode_menu)
         self._reader_bar.manga_requested.connect(self._show_manga_menu)
+        self._reader_bar.fullscreen_requested.connect(self._toggle_window_fullscreen)
         self._reader_bar_opacity = QGraphicsOpacityEffect(self._reader_bar)
         self._reader_bar.setGraphicsEffect(self._reader_bar_opacity)
         self._reader_bar_opacity.setOpacity(1.0)
@@ -1203,6 +1230,7 @@ class MainWindow(QMainWindow):
         self._sidebar.search_changed.connect(self._bookshelf.search)
         self._sidebar.search_closed.connect(self._bookshelf.clear_search)
         self._sidebar.settings_clicked.connect(self._open_settings)
+        self._sidebar.fullscreen_clicked.connect(self._toggle_window_fullscreen)
 
         container = QWidget()
         self._sidebar_host = container

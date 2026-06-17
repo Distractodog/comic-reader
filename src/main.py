@@ -65,6 +65,11 @@ def main():
     window.activateWindow()
     _activate_macos_app()
 
+    # Force a black title bar on Windows (no-op elsewhere); needs the native
+    # window handle, so this runs after show().
+    from windows_titlebar import apply_dark_titlebar
+    apply_dark_titlebar(window)
+
     # If a file path was passed on the command line, open it
     if len(sys.argv) > 1:
         window.load_file(sys.argv[1])
