@@ -400,6 +400,11 @@ class LibraryPanel(_SettingsPanel):
         self._full(self._btn("Scan for duplicates…", "duplicates"))
         self._full(self._btn("Reading statistics…", "stats"))
 
+        self._divider()
+        self._subheading("Reset (does not delete files on disk)")
+        self._full(self._btn("Remove a folder from library…", "remove_folder"))
+        self._full(self._btn("Reset library — remove everything…", "reset_library"))
+
     def _btn(self, label: str, action: str) -> QPushButton:
         b = QPushButton(label)
         font = b.font()

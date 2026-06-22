@@ -19,6 +19,7 @@ class Folder:
     name: str
     comic_count: int
     cover_path: str | None
+    read_count: int = 0  # comics with read_status == 'read'
 
 
 @dataclass
@@ -932,6 +933,54 @@ class Library:
         with self.transaction() as cur:
             cur.execute("DELETE FROM comics WHERE id = ?", (comic_id,))
 
+    def remove_source_folder(self, source_folder: str) -> int:
+        """Remove every comic added from ``source_folder`` from the library.
+
+        Does NOT touch any files on disk — only the library index and cached
+        cover thumbnails. Comic-linked rows (tags, shelves, bookmarks, etc.)
+        drop via ON DELETE CASCADE. Returns the number of comics removed.
+        """
+        rows = self._conn.execute(
+            "SELECT cover_path FROM comics WHERE source_folder = ?",
+            (source_folder,),
+        ).fetchall()
+        for r in rows:
+            if r["cover_path"]:
+                try:
+                    Path(r["cover_path"]).unlink(missing_ok=True)
+                except OSError:
+                    pass
+        with self.transaction() as cur:
+            cur.execute("DELETE FROM comics WHERE source_folder = ?", (source_folder,))
+        return len(rows)
+
+    def reset_library(self) -> int:
+        """Wipe the whole library — every comic, folder grouping, manual shelf,
+        tag, bookmark, and reading record — WITHOUT deleting any files on disk.
+
+        Smart shelves are kept (they reseed the default views). Returns the
+        number of comics removed.
+        """
+        rows = self._conn.execute(
+            "SELECT cover_path FROM comics WHERE cover_path IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            try:
+                Path(r["cover_path"]).unlink(missing_ok=True)
+            except OSError:
+                pass
+        count = self._conn.execute("SELECT COUNT(*) AS n FROM comics").fetchone()["n"]
+        with self.transaction() as cur:
+            # comic_id-referencing tables cascade off this delete.
+            cur.execute("DELETE FROM comics")
+            for table in (
+                "folder_covers", "folder_reading_settings",
+                "series_reading_settings", "display_orders",
+            ):
+                cur.execute(f"DELETE FROM {table}")
+            cur.execute("DELETE FROM shelves WHERE kind = 'manual'")
+        return count
+
     def delete_comic_from_disk(self, comic_id: int) -> str | None:
         """Delete the comic file from disk and remove its library row.
 
@@ -1137,6 +1186,16 @@ class Library:
                     )
                 cur.execute(
                     "UPDATE folder_covers SET folder_path = ? WHERE folder_path = ?",
+                    (new_path, folder_path),
+                )
+                cur.execute(
+                    "UPDATE folder_reading_settings SET folder_path = ?"
+                    " WHERE folder_path = ?",
+                    (new_path, folder_path),
+                )
+                cur.execute(
+                    "UPDATE series_reading_settings SET folder_path = ?"
+                    " WHERE folder_path = ?",
                     (new_path, folder_path),
                 )
         except Exception:
@@ -1375,7 +1434,9 @@ class Library:
     def get_folders(self) -> list[Folder]:
         """Return one Folder per unique parent directory, sorted alphabetically."""
         rows = self._conn.execute(
-            "SELECT parent_dir, COUNT(*) AS cnt, MAX(cover_path) AS cover"
+            "SELECT parent_dir, COUNT(*) AS cnt,"
+            " SUM(CASE WHEN read_status = 'read' THEN 1 ELSE 0 END) AS read_cnt,"
+            " MAX(cover_path) AS cover"
             " FROM comics WHERE hidden = 0 GROUP BY parent_dir"
         ).fetchall()
         overrides = self._folder_cover_overrides()
@@ -1385,6 +1446,7 @@ class Library:
                 name=Path(row["parent_dir"]).name,
                 comic_count=row["cnt"],
                 cover_path=overrides.get(row["parent_dir"]) or row["cover"] or None,
+                read_count=row["read_cnt"] or 0,
             )
             for row in rows
         ]
@@ -1662,8 +1724,11 @@ class Library:
                     name=Path(parent).name,
                     comic_count=0,
                     cover_path=overrides.get(parent) or c.cover_path or None,
+                    read_count=0,
                 )
             seen[parent].comic_count += 1
+            if c.read_status == "read":
+                seen[parent].read_count += 1
             if seen[parent].cover_path is None and c.cover_path:
                 seen[parent].cover_path = c.cover_path
         return sorted(
@@ -1729,8 +1794,11 @@ class Library:
                     name=Path(parent).name,
                     comic_count=0,
                     cover_path=overrides.get(parent) or c.cover_path or None,
+                    read_count=0,
                 )
             seen[parent].comic_count += 1
+            if c.read_status == "read":
+                seen[parent].read_count += 1
             if seen[parent].cover_path is None and c.cover_path:
                 seen[parent].cover_path = c.cover_path
         return sorted(seen.values(), key=lambda f: f.name.lower())
@@ -2199,6 +2267,21 @@ class Library:
                 " WHERE folder_path = ? AND series_name = ?",
                 (folder_path, series_name),
             )
+
+    def clear_series_reading_settings_for_folder(self, folder_path: str) -> None:
+        """Remove every per-series override in a folder so folder defaults apply."""
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM series_reading_settings WHERE folder_path = ?",
+                (folder_path,),
+            )
+
+    def apply_folder_reading_settings(
+        self, folder_path: str, settings: ReadingSettings
+    ) -> None:
+        """Save folder-wide reading settings and drop stale per-series overrides."""
+        self.set_folder_reading_settings(folder_path, settings)
+        self.clear_series_reading_settings_for_folder(folder_path)
 
     def resolve_reading_settings(
         self, comic: Comic, defaults: ReadingSettings | None = None
@@ -2933,6 +3016,16 @@ if __name__ == "__main__":
     assert lib.resolve_reading_settings(lib.get_comic_by_id(loose)).reading_mode == "single"
     lib.clear_series_reading_settings(rset_dir, "Naruto")
     assert lib.resolve_reading_settings(lib.get_comic_by_id(rs2)).fit_mode == "width"
+    # Apply-to-folder must override stale per-series rows.
+    lib.set_series_reading_settings(
+        rset_dir, "Naruto", ReadingSettings(reading_mode="single", fit_mode="page"),
+    )
+    lib.apply_folder_reading_settings(
+        rset_dir, ReadingSettings(reading_mode="webtoon", fit_mode="width"),
+    )
+    res = lib.resolve_reading_settings(lib.get_comic_by_id(rs2))
+    assert res.reading_mode == "webtoon"
+    assert res.fit_mode == "width"
     defaults_id = lib.add_comic(
         f"{rset_dir}/Defaults.cbz",
         page_count=1,

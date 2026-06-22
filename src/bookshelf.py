@@ -396,6 +396,17 @@ class _Tile(QWidget):
             text,
         )
 
+    def _draw_read_ratio_progress(
+        self, painter: QPainter, read_count: int, total: int
+    ) -> None:
+        """Aggregate progress bar — completed comics out of total."""
+        if total <= 0 or read_count <= 0:
+            return
+        ratio = min(1.0, read_count / total)
+        y = COVER_H - PROGRESS_H
+        painter.fillRect(0, y, TILE_W, PROGRESS_H, _PROGRESS_TRACK)
+        painter.fillRect(0, y, int(TILE_W * ratio), PROGRESS_H, _PROGRESS_FILL)
+
     def enterEvent(self, event):
         self._hovered = True
         self.update()
@@ -440,6 +451,9 @@ class FolderTile(_Tile):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self._draw_cover(painter)
+        self._draw_read_ratio_progress(
+            painter, self._folder.read_count, self._folder.comic_count
+        )
         if self._selected:
             self._draw_selection(painter)
         status_y = self._draw_title(painter, self._folder.name)
@@ -785,6 +799,7 @@ class ShelfTile(_Tile):
         shelf: Shelf,
         cover_path: str | None,
         comic_count: int,
+        read_count: int = 0,
         selected: bool = False,
         parent=None,
     ):
@@ -792,6 +807,7 @@ class ShelfTile(_Tile):
         self._shelf = shelf
         self.cover_path = cover_path
         self._comic_count = comic_count
+        self._read_count = read_count
         self._selection_mode = False
         self._reorder_enabled = False
         self._file_drop_enabled = True
@@ -817,6 +833,9 @@ class ShelfTile(_Tile):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self._draw_cover(painter)
+        self._draw_read_ratio_progress(
+            painter, self._read_count, self._comic_count
+        )
         if self._drop_highlight:
             pen = QPen(_PROGRESS_FILL, 3)
             painter.setPen(pen)
@@ -2793,6 +2812,22 @@ class BookshelfView(QWidget):
         self._folder_comic_ids = [c.id for c in comics]
         return comics, "No comics found in this folder."
 
+    def displayed_comic_order(self) -> list[int]:
+        """Comic IDs in the exact order currently shown in the grid.
+
+        Lets the reader make "next/previous comic" follow the order the user
+        actually sees — their chosen sort or manual drag order — instead of a
+        hardcoded default. Folder, shelf, search and currently-reading views all
+        populate ``_grid_item_keys``; non-comic tiles (folders/shelves) are
+        skipped, and an empty list (e.g. the bookmarks view) means "no opinion,
+        fall back to the library's ordering".
+        """
+        return [
+            int(k.split(":", 1)[1])
+            for k in self._grid_item_keys
+            if k.startswith("comic:")
+        ]
+
     def _sync_header_folder_menu(self) -> None:
         """Allow header right-click folder actions when inside a folder view."""
         enabled = (
@@ -2970,7 +3005,11 @@ class BookshelfView(QWidget):
                 if self._status_filter:
                     shelf_comics = [c for c in shelf_comics if self._passes_filter(c)]
                 cover = self._shelf_tile_cover(item, shelf_comics)
-                tile = ShelfTile(item, cover, len(shelf_comics), selected=item.id in self._selected_shelf_ids)
+                read_count = sum(1 for c in shelf_comics if c.read_status == "read")
+                tile = ShelfTile(
+                    item, cover, len(shelf_comics), read_count,
+                    selected=item.id in self._selected_shelf_ids,
+                )
                 tile.shelf_opened.connect(self.show_shelf)
                 tile.menu_requested.connect(self._on_shelf_context_menu)
                 tile.file_comic_requested.connect(self._file_comic_into_shelf)
@@ -3691,14 +3730,26 @@ class BookshelfView(QWidget):
         menu.exec(QPoint(gx, gy))
 
     def _show_series_reading_settings(self, folder_path: str, folder_comics: list) -> None:
-        series_names = {c.series for c in folder_comics if c.series}
+        series_names = sorted({c.series for c in folder_comics if c.series})
         if not series_names:
             QMessageBox.information(
                 self, "Series Settings",
                 "No series found in this folder. Use Series → Scan for series first."
             )
             return
-        series_name = next(iter(series_names))
+        if len(series_names) == 1:
+            series_name = series_names[0]
+        else:
+            series_name, ok = QInputDialog.getItem(
+                self,
+                "Series Settings",
+                "Choose a series:",
+                series_names,
+                0,
+                False,
+            )
+            if not ok:
+                return
         current = self._library.get_series_reading_settings(folder_path, series_name)
 
         dlg = QDialog(self)

@@ -730,7 +730,7 @@ class ReaderFooter(QWidget):
         self._next_btn.setEnabled(next)
 
     def apply_theme(self, c: dict) -> None:
-        bg = _hex_to_rgba(c["accent"], 218)
+        bg = _hex_to_rgba(c.get("reader_bar_bg", "#000000"), 218)
         border = _hex_to_rgba(c["border"], 190)
         self.setStyleSheet(
             f"#ReaderFooter {{ background: {bg};"

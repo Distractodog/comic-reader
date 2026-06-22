@@ -1057,6 +1057,11 @@ class MainWindow(QMainWindow):
         self._reader: ComicReader | None = None
         self._current_page: int = 0
         self._current_comic_id: int | None = None
+        # Order the reader uses for prev/next comic when a comic isn't in a
+        # series — captured from the bookshelf at open time so navigation follows
+        # the order the user was actually looking at (their chosen sort / manual
+        # order), not a hardcoded title sort.
+        self._nav_order_ids: list[int] = []
         self._settings = app_settings()
         self._library = Library()
         self._scan_thread: QThread | None = None
@@ -1721,9 +1726,11 @@ class MainWindow(QMainWindow):
     # ----- Library / reader navigation -----
 
     def _open_comic_from_bookshelf(self, path: str):
+        self._nav_order_ids = self._bookshelf.displayed_comic_order()
         self.load_file(path)
 
     def _open_bookmark_from_bookshelf(self, path: str, page_index: int):
+        self._nav_order_ids = self._bookshelf.displayed_comic_order()
         self.load_file(path, target_page=page_index)
 
     def _prepare_comics_for_deletion(self, comic_ids: list[int]) -> None:
@@ -1763,7 +1770,7 @@ class MainWindow(QMainWindow):
         # whatever fullscreen state the user chose (Esc still leaves fullscreen).
         if self._webtoon_save_timer.isActive():
             self._webtoon_save_timer.stop()
-            self._save_progress()
+        self._save_progress()
         self._record_reading_session()
         self._session_clock = None
         self._stop_preloader()
@@ -1796,6 +1803,13 @@ class MainWindow(QMainWindow):
 
         apply_folder_act = menu.addAction("Apply settings to folder")
         apply_folder_act.triggered.connect(self._apply_reading_settings_to_folder)
+        if self._current_comic_id is not None:
+            comic = self._library.get_comic_by_id(self._current_comic_id)
+            if comic is not None and comic.series:
+                apply_series_act = menu.addAction("Apply settings to series")
+                apply_series_act.triggered.connect(
+                    self._apply_reading_settings_to_series
+                )
 
         menu.addSeparator()
 
@@ -2209,6 +2223,26 @@ class MainWindow(QMainWindow):
         if path:
             self.load_file(path)
 
+    def _ask_completed_comic_open(self, title: str) -> bool:
+        """Ask how to open a finished comic.
+
+        Returns True to start at the beginning, False to stay on the saved page.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Finished Comic")
+        box.setText(f"You've finished reading \"{title}\".")
+        box.setInformativeText(
+            "Would you like to start over or continue from where you left off?"
+        )
+        stay_btn = box.addButton("Stay where you are", QMessageBox.ButtonRole.AcceptRole)
+        start_btn = box.addButton(
+            "Start at the beginning", QMessageBox.ButtonRole.AcceptRole
+        )
+        box.setDefaultButton(stay_btn)
+        box.exec()
+        return box.clickedButton() is start_btn
+
     def load_file(
         self, path: str, start_at_top: bool = False, target_page: int | None = None
     ):
@@ -2247,6 +2281,14 @@ class MainWindow(QMainWindow):
         # Show the loading screen immediately — faded cover + spinner — and
         # open + decode on a background thread so the UI never freezes.
         comic = self._library.get_comic(path)
+        if (
+            comic is not None
+            and comic.read_status == "read"
+            and target_page is None
+            and not start_at_top
+        ):
+            title = comic.title or Path(path).stem
+            start_at_top = self._ask_completed_comic_open(title)
         cover = comic.cover_path if comic is not None else None
         start_page = 0
         spread = True  # default for comics not in the library (mirrors below)
@@ -2487,9 +2529,16 @@ class MainWindow(QMainWindow):
         comic = self._library.get_comic(path)
         chapters = book.chapter_count()
         font_pt = int(self._settings.value("ebook_font_pt", 19))
+        start_at_top = False
         if comic is not None:
+            if comic.read_status == "read":
+                start_at_top = self._ask_completed_comic_open(title)
             self._current_comic_id = comic.id
-            start_chapter = comic.current_page if 0 <= comic.current_page < chapters else 0
+            start_chapter = (
+                0
+                if start_at_top
+                else (comic.current_page if 0 <= comic.current_page < chapters else 0)
+            )
             # Keep the stored page_count in sync with the real chapter count so
             # the bookshelf progress bar/badges are correct (older scans stored 0).
             if comic.page_count != chapters:
@@ -2709,11 +2758,31 @@ class MainWindow(QMainWindow):
         if self._thumb_strip.isVisible():
             self._thumb_strip.set_preview(page)
 
+    def _comic_neighbors(self, comic_id: int) -> tuple["Comic | None", "Comic | None"]:
+        """Resolve (previous, next) comic for reader navigation.
+
+        A comic that belongs to a series follows its series order. A loose comic
+        follows the order captured from the bookshelf when it was opened (the
+        user's current chapter order) — falling back to the library's folder
+        order only when that captured order doesn't contain this comic.
+        """
+        comic = self._library.get_comic_by_id(comic_id)
+        if comic is not None and not comic.series:
+            ids = self._nav_order_ids
+            if comic_id in ids:
+                i = ids.index(comic_id)
+                prev_id = ids[i - 1] if i > 0 else None
+                next_id = ids[i + 1] if i + 1 < len(ids) else None
+                prev_comic = self._library.get_comic_by_id(prev_id) if prev_id else None
+                next_comic = self._library.get_comic_by_id(next_id) if next_id else None
+                return prev_comic, next_comic
+        return self._library.get_comic_neighbors(comic_id)
+
     def _update_footer_neighbors(self) -> None:
         """Refresh the floating prev/next covers and nav arrows for the open comic."""
         prev_comic = next_comic = None
         if self._current_comic_id is not None:
-            prev_comic, next_comic = self._library.get_comic_neighbors(
+            prev_comic, next_comic = self._comic_neighbors(
                 self._current_comic_id
             )
         self._prev_thumb_ov.set_cover(prev_comic.cover_path if prev_comic else None)
@@ -2725,7 +2794,7 @@ class MainWindow(QMainWindow):
         """Open the previous/next comic in series-or-folder order, if any."""
         if self._current_comic_id is None:
             return
-        prev_comic, next_comic = self._library.get_comic_neighbors(
+        prev_comic, next_comic = self._comic_neighbors(
             self._current_comic_id
         )
         target = next_comic if forward else prev_comic
@@ -2840,11 +2909,26 @@ class MainWindow(QMainWindow):
         if comic is None:
             return
         folder = str(Path(comic.file_path).parent)
-        self._library.set_folder_reading_settings(
+        self._library.apply_folder_reading_settings(
             folder, self._current_reading_settings()
         )
         self.statusBar().showMessage(
             f"Reading settings applied to “{Path(folder).name}”", 4000
+        )
+
+    def _apply_reading_settings_to_series(self) -> None:
+        """Push the current viewer settings to every issue in this series."""
+        if self._current_comic_id is None:
+            return
+        comic = self._library.get_comic_by_id(self._current_comic_id)
+        if comic is None or not comic.series:
+            return
+        folder = str(Path(comic.file_path).parent)
+        self._library.set_series_reading_settings(
+            folder, comic.series, self._current_reading_settings()
+        )
+        self.statusBar().showMessage(
+            f"Reading settings applied to “{comic.series}”", 4000
         )
 
     # ----- Window helpers -----
@@ -2968,10 +3052,65 @@ class MainWindow(QMainWindow):
             "import_shelf": self.import_shelf,
             "duplicates": self.scan_for_duplicates,
             "stats": self.show_statistics,
+            "remove_folder": self._remove_library_folder,
+            "reset_library": self._reset_library,
         }
         fn = handlers.get(action)
         if fn is not None:
             fn()
+
+    def _remove_library_folder(self) -> None:
+        """Let the user drop every comic added from one source folder."""
+        folders = self._library.get_source_folders()
+        if not folders:
+            QMessageBox.information(
+                self, "Remove Folder", "No library folders to remove."
+            )
+            return
+        folder, ok = QInputDialog.getItem(
+            self, "Remove Folder",
+            "Remove all comics added from this folder?\n"
+            "(Your files on disk are NOT touched.)",
+            folders, 0, False,
+        )
+        if not ok or not folder:
+            return
+        confirm = QMessageBox.question(
+            self, "Remove Folder",
+            f"Remove every comic added from:\n\n{folder}\n\n"
+            "This only clears them from the library — no files on disk are deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        n = self._library.remove_source_folder(folder)
+        self._bookshelf.refresh()
+        QMessageBox.information(
+            self, "Remove Folder", f"Removed {n} comic(s) from the library."
+        )
+
+    def _reset_library(self) -> None:
+        """Wipe the whole library so the user can re-point it from scratch."""
+        confirm = QMessageBox.warning(
+            self, "Reset Library",
+            "This removes EVERYTHING from the library — every comic, folder, "
+            "shelf, tag, bookmark, and reading progress.\n\n"
+            "Your actual comic files on disk are NOT deleted. You'll get an "
+            "empty library and can re-add the folders you want.\n\n"
+            "Reset the library now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._library.reset_library()
+        self._clear_thumbnail_cache(announce=False)
+        self._bookshelf.refresh()
+        QMessageBox.information(
+            self, "Reset Library",
+            "Library cleared. Use “Add folder to library…” to start fresh.",
+        )
 
     def _export_shelf_from_settings(self) -> None:
         shelves = self._library.get_shelves()
