@@ -112,6 +112,10 @@ class Comic:
     zoom: float = 1.0
     cover_override: bool = False  # cover set manually; skip auto-regeneration
     favorite: bool = False
+    # Webtoon-only: fraction (0..1) into `current_page` where the viewport top
+    # sat. Lets continuous-scroll comics resume at the exact pixel offset, not
+    # just the page top. Always 0 for paged (single/spread) readers.
+    current_page_fraction: float = 0.0
 
 
 def _default_db_path() -> Path:
@@ -156,6 +160,7 @@ def _row_to_comic(row: sqlite3.Row) -> Comic:
         zoom=float(row["zoom"]),
         cover_override=bool(row["cover_override"]),
         favorite=bool(row["favorite"]),
+        current_page_fraction=float(row["current_page_fraction"]),
     )
 
 
@@ -681,6 +686,29 @@ class Library:
             self._conn.execute("PRAGMA user_version = 20")
             self._conn.commit()
             version = 20
+        # NOTE: v21 was an abandoned attempt at webtoon scroll persistence
+        # (`webtoon_scroll_offset`, absolute pixels). Its code was reverted, but
+        # the column survives in any DB whose app already ran that migration.
+        # v22 is the canonical version: it adds the fraction-based column and
+        # drops the orphaned pixel column. Written idempotently so it heals DBs
+        # at v20 (fresh), v21 (ran the abandoned attempt), or v21-with-fraction.
+        if version < 22:
+            self._migrate_v22_webtoon_fraction()
+            self._conn.execute("PRAGMA user_version = 22")
+            self._conn.commit()
+            version = 22
+
+    def _migrate_v22_webtoon_fraction(self) -> None:
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(comics)")}
+        if "current_page_fraction" not in cols:
+            self._conn.execute(
+                "ALTER TABLE comics ADD COLUMN"
+                " current_page_fraction REAL NOT NULL DEFAULT 0"
+            )
+        if "webtoon_scroll_offset" in cols:
+            self._conn.execute(
+                "ALTER TABLE comics DROP COLUMN webtoon_scroll_offset"
+            )
 
     def _migrate_v20_drop_primary_orders(self) -> None:
         """Delete legacy primary-order rows and drop obsolete columns."""
@@ -1244,21 +1272,29 @@ class Library:
 
     # ----- Comic updates -----
 
-    def update_progress(self, comic_id: int, current_page: int) -> None:
-        """Update current page, auto-derive read_status, and stamp last_read."""
+    def update_progress(
+        self, comic_id: int, current_page: int, page_fraction: float = 0.0
+    ) -> None:
+        """Update current page, auto-derive read_status, and stamp last_read.
+
+        `page_fraction` (0..1) is the webtoon scroll offset into `current_page`;
+        paged readers leave it at 0.
+        """
         comic = self.get_comic_by_id(comic_id)
         if comic is None:
             return
         status = _derive_status(current_page, comic.page_count)
+        frac = max(0.0, min(1.0, page_fraction))
         now = datetime.now(timezone.utc).isoformat()
         with self.transaction() as cur:
             cur.execute(
                 """
                 UPDATE comics
-                SET current_page = ?, read_status = ?, last_read = ?
+                SET current_page = ?, current_page_fraction = ?,
+                    read_status = ?, last_read = ?
                 WHERE id = ?
                 """,
-                (current_page, status, now, comic_id),
+                (current_page, frac, status, now, comic_id),
             )
 
     def set_read_status(self, comic_id: int, status: str) -> None:

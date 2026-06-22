@@ -5,7 +5,7 @@ from __future__ import annotations
 from PyQt6.QtCore import (
     QEasingCurve, QEvent, QPropertyAnimation, Qt, QThread, QTimer, pyqtSignal,
 )
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import QLabel, QScrollArea, QVBoxLayout, QWidget
 
 from viewer import CLICK_ZONE_FRACTION  # center band = same as single-page reader
@@ -16,6 +16,49 @@ _CLICK_MOVE_TOL = 6  # max px of movement for a press+release to count as a clic
 _EDGE_SCROLL_FRACTION = 0.9   # left/right edge click scrolls down ~a full screen
                               # (slight overlap so you don't lose your place)
 _EDGE_SCROLL_MS = 520         # smooth-scroll animation duration
+
+
+class _Spinner(QWidget):
+    """Small rotating arc floated over the viewport while visible pages decode.
+
+    Matches the main loading overlay's spinner so the app reads consistently.
+    Transparent to mouse events so click-zone paging still works underneath."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(60, 60)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._angle = 0.0
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self.hide()
+
+    def _tick(self):
+        self._angle = (self._angle + 6.5) % 360  # one turn ≈ 0.9s
+        self.update()
+
+    def start(self):
+        if not self._timer.isActive():
+            self._timer.start()
+        if not self.isVisible():
+            self.show()
+            self.raise_()
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor(235, 230, 230, 235), 3.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        r = 18
+        cx, cy = self.width() // 2, self.height() // 2
+        p.drawArc(cx - r, cy - r, 2 * r, 2 * r, int(-self._angle * 16), 100 * 16)
 
 
 class _PageLoader(QThread):
@@ -54,10 +97,11 @@ class _PageLoader(QThread):
 class WebtoonViewer(QScrollArea):
     """Vertically scrolling viewer that loads pages lazily as the user scrolls."""
 
-    page_changed = pyqtSignal(int)  # current page at viewport center
+    page_changed = pyqtSignal(int)  # current page at viewport top
     mouse_moved = pyqtSignal(int)   # viewport y — for fullscreen bar reveal
     start_page_rendered = pyqtSignal()  # the page load_comic targeted is on screen
     center_clicked = pyqtSignal()   # center-band click — toggles reader chrome
+    scrolled = pyqtSignal()         # any scroll — drives debounced progress save
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -68,6 +112,11 @@ class WebtoonViewer(QScrollArea):
 
         self.viewport().setMouseTracking(True)
         self.viewport().installEventFilter(self)
+
+        # Spinner shown over the viewport whenever the page(s) in view haven't
+        # decoded yet (resume reload, scrolling into not-yet-loaded territory) —
+        # avoids staring at blank placeholder boxes.
+        self._spinner = _Spinner(self.viewport())
 
         self._width_fraction: float = 1.0
 
@@ -88,6 +137,7 @@ class WebtoonViewer(QScrollArea):
         self._current_page = 0
         self._last_emitted = -1
         self._pending_start: int | None = None
+        self._pending_fraction: float = 0.0  # offset into _pending_start to restore
         self._press_pos = None  # left-button press position, for click detection
         self._scroll_anim: QPropertyAnimation | None = None  # smooth edge-scroll
 
@@ -152,7 +202,9 @@ class WebtoonViewer(QScrollArea):
         self._width_fraction = max(0.3, min(1.0, fraction))
         self._rerender_all()
 
-    def load_comic(self, reader, start_page: int = 0) -> None:
+    def load_comic(
+        self, reader, start_page: int = 0, start_fraction: float = 0.0
+    ) -> None:
         self._abort_loader()
         self._reader = reader
         self._page_count = reader.page_count()
@@ -161,6 +213,8 @@ class WebtoonViewer(QScrollArea):
         self._pending_start: int | None = (
             min(max(start_page, 0), self._page_count - 1) if self._page_count > 0 else None
         )
+        # Exact scroll offset within the start page, applied once it renders.
+        self._pending_fraction = max(0.0, min(1.0, start_fraction))
         self._loaded.clear()
         self._loading.clear()
         self._originals.clear()
@@ -185,7 +239,7 @@ class WebtoonViewer(QScrollArea):
         self._rebuild_tops()
         self._current_page = max(0, start_page)
 
-        if start_page > 0:
+        if start_page > 0 or self._pending_fraction > 0:
             QTimer.singleShot(120, lambda: self._scroll_to(start_page))
         else:
             # The viewer is reused across comics — pin a fresh comic to the top
@@ -196,11 +250,17 @@ class WebtoonViewer(QScrollArea):
                 self.verticalScrollBar().setValue(0), self._load_visible()
             ))
 
+        self._update_spinner()  # show immediately; cleared once pages decode
+
     def scroll_to_page(self, page_index: int) -> None:
         self._scroll_to(page_index)
 
     def current_page(self) -> int:
         return self._current_page
+
+    def scroll_anchor(self) -> tuple[int, float]:
+        """Current resume point: (page at viewport top, fraction 0..1 into it)."""
+        return self._top_anchor()
 
     # ----- Internal -----
 
@@ -249,23 +309,69 @@ class WebtoonViewer(QScrollArea):
     def _on_scroll(self) -> None:
         self._update_current_page()
         self._load_timer.start()
+        self._update_spinner()
+        self.scrolled.emit()
 
-    def _update_current_page(self) -> None:
+    # ----- Loading spinner -----
+
+    def _visible_pages_loaded(self) -> bool:
+        """True when every page intersecting the viewport has decoded."""
+        if not self._reader or not self._labels or not self._tops:
+            return True
+        scroll_top = self.verticalScrollBar().value()
+        scroll_bot = scroll_top + self.viewport().height()
+        for i, lbl in enumerate(self._labels):
+            top = self._tops[i]
+            bot = top + lbl.height()
+            if bot >= scroll_top and top <= scroll_bot and i not in self._loaded:
+                return False
+        return True
+
+    def _update_spinner(self) -> None:
+        if self._reader and not self._visible_pages_loaded():
+            vp = self.viewport()
+            self._spinner.move(
+                (vp.width() - self._spinner.width()) // 2,
+                (vp.height() - self._spinner.height()) // 2,
+            )
+            self._spinner.start()
+        else:
+            self._spinner.stop()
+
+    def _top_anchor(self) -> tuple[int, float]:
+        """The page occupying the viewport top, and how far (0..1) into it.
+
+        Anchored on the top edge — not the center — because manhwa pages are
+        often taller than the viewport, so a center anchor reports the previous
+        page while you're reading the top of the current one (the "pushed back a
+        page" bug). The fraction lets us resume at the exact pixel offset."""
         if not self._labels or not self._tops:
-            return
-        vp_center = self.verticalScrollBar().value() + self.viewport().height() // 2
+            return (0, 0.0)
+        sb = self.verticalScrollBar()
+        scroll_top = sb.value()
+        # At the very bottom, call it the last page so finishing marks the comic
+        # read (a tall final page would otherwise never reach the top edge).
+        if scroll_top >= sb.maximum() - 2:
+            return (len(self._labels) - 1, 0.0)
 
         lo, hi = 0, len(self._labels) - 1
         best = 0
         while lo <= hi:
             mid = (lo + hi) // 2
-            lbl_center = self._tops[mid] + self._labels[mid].height() // 2
-            if lbl_center <= vp_center:
+            if self._tops[mid] <= scroll_top:
                 best = mid
                 lo = mid + 1
             else:
                 hi = mid - 1
 
+        height = self._labels[best].height()
+        frac = 0.0 if height <= 0 else (scroll_top - self._tops[best]) / height
+        return (best, max(0.0, min(1.0, frac)))
+
+    def _update_current_page(self) -> None:
+        if not self._labels or not self._tops:
+            return
+        best, _ = self._top_anchor()
         if best != self._last_emitted:
             self._current_page = best
             self._last_emitted = best
@@ -309,6 +415,8 @@ class WebtoonViewer(QScrollArea):
                     near.append(i)
                 else:
                     far.append(i)
+
+        self._update_spinner()
 
         to_load = near + far
         if not to_load:
@@ -360,8 +468,26 @@ class WebtoonViewer(QScrollArea):
         if self._pending_start is not None and any(
             index == self._pending_start for index, _ in queue
         ):
+            page = self._pending_start
             self._pending_start = None
+            self._apply_pending_fraction(page)
             self.start_page_rendered.emit()
+
+        self._update_spinner()
+
+    def _apply_pending_fraction(self, page: int) -> None:
+        """Now that `page` has its real rendered height, nudge the scroll to the
+        exact within-page offset we saved last session."""
+        frac = self._pending_fraction
+        self._pending_fraction = 0.0
+        if frac <= 0 or not (0 <= page < len(self._labels)):
+            return
+        self._rebuild_tops()
+        height = self._labels[page].height()
+        sb = self.verticalScrollBar()
+        target = int(self._tops[page] + frac * height)
+        sb.setValue(max(sb.minimum(), min(sb.maximum(), target)))
+        self._load_visible()
 
     def _render(self, index: int) -> None:
         img = self._originals.get(index)
@@ -394,3 +520,4 @@ class WebtoonViewer(QScrollArea):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._resize_timer.start()
+        self._update_spinner()  # keep the spinner centered on resize

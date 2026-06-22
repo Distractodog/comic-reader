@@ -1316,6 +1316,10 @@ class MainWindow(QMainWindow):
         self._webtoon_viewer.page_changed.connect(self._on_webtoon_page_changed)
         self._webtoon_viewer.start_page_rendered.connect(self._on_webtoon_start_page_rendered)
         self._webtoon_viewer.center_clicked.connect(self._toggle_reading_chrome)
+        # Scrolling within a single (tall) page never crosses a page boundary, so
+        # page_changed won't fire — hook raw scrolls too so the exact offset still
+        # gets saved (debounced) once you stop scrolling.
+        self._webtoon_viewer.scrolled.connect(self._on_webtoon_scrolled)
         self._ebook_viewer.chapter_changed.connect(self._on_ebook_chapter_changed)
         self._ebook_viewer.exit_requested.connect(self._back_to_library)
         self._ebook_viewer.end_reached.connect(self._on_ebook_end)
@@ -2143,6 +2147,10 @@ class MainWindow(QMainWindow):
         self._reader_footer.set_current(page + 1)
         self._webtoon_save_timer.start()
 
+    def _on_webtoon_scrolled(self) -> None:
+        if self._webtoon_mode and self._current_comic_id is not None:
+            self._webtoon_save_timer.start()
+
     # ----- Shortcuts dialog -----
 
     def _open_shortcuts_dialog(self) -> None:
@@ -2441,7 +2449,19 @@ class MainWindow(QMainWindow):
             self._thumb_strip.setVisible(False)
             self._seek_bar.set_page_count(page_count)
             self._webtoon_viewer.set_width_fraction(self._webtoon_width_pct / 100)
-            self._webtoon_viewer.load_comic(self._reader, self._current_page)
+            # Resume at the exact scroll offset, but only when actually resuming
+            # (not when jumping to a specific page or restarting from the top).
+            start_fraction = 0.0
+            if (
+                comic is not None
+                and self._opening_target_page is None
+                and not self._opening_start_at_top
+                and self._current_page == comic.current_page
+            ):
+                start_fraction = comic.current_page_fraction
+            self._webtoon_viewer.load_comic(
+                self._reader, self._current_page, start_fraction
+            )
             target_index = 2
         else:
             if self._spread_mode:
@@ -2835,11 +2855,17 @@ class MainWindow(QMainWindow):
 
     def _save_progress(self):
         if self._current_comic_id is not None:
-            self._library.update_progress(
-                self._current_comic_id, self._effective_progress_page()
-            )
+            page, fraction = self._effective_progress_anchor()
+            self._library.update_progress(self._current_comic_id, page, fraction)
             self._persist_reading_settings()
             self._record_reading_session()
+
+    def _effective_progress_anchor(self) -> tuple[int, float]:
+        """(page, within-page fraction) to persist. Webtoon resumes at the exact
+        scroll offset; paged readers store the page with a 0 fraction."""
+        if self._webtoon_mode and self._reader:
+            return self._webtoon_viewer.scroll_anchor()
+        return self._effective_progress_page(), 0.0
 
     def _current_reading_settings(self) -> ReadingSettings:
         return ReadingSettings(
